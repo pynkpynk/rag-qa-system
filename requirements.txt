@@ -1,0 +1,15 @@
+fastapi>=0.110,<0.120
+uvicorn[standard]>=0.30,<0.33
+
+sqlalchemy>=2.0,<2.1
+alembic>=1.13,<1.15
+
+pydantic-settings>=2.2,<3
+
+openai>=1.0,<2
+
+pgvector>=0.3,<0.4
+psycopg[binary]>=3.1,<4
+
+pypdf>=4.0,<6
+python-multipart>=0.0.10,<0.1
