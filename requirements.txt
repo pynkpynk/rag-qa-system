@@ -1,15 +1,16 @@
-fastapi>=0.110,<0.120
-uvicorn[standard]>=0.30,<0.33
+fastapi>=0.110,<1.0
+uvicorn[standard]>=0.27,<1.0
 
-sqlalchemy>=2.0,<2.1
-alembic>=1.13,<1.15
+pydantic-settings>=2.2,<3.0
 
-pydantic-settings>=2.2,<3
+SQLAlchemy>=2.0,<3.0
+psycopg[binary]>=3.1,<4.0
+pgvector>=0.2,<1.0
 
-openai>=1.0,<2
+alembic>=1.13,<2.0
 
-pgvector>=0.3,<0.4
-psycopg[binary]>=3.1,<4
+python-multipart>=0.0.9,<1.0
+pypdf>=4.0,<6.0
 
-pypdf>=4.0,<6
-python-multipart>=0.0.10,<0.1
+openai>=1.0,<2.0
+python-dotenv>=1.0,<2.0
