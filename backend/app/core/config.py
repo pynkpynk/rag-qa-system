@@ -1,14 +1,21 @@
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    # ローカルは .env から読める（無ければ env var のみ）
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    """
+    - Render: env vars が本番の正。DATABASE_URL が必須。
+    - Local: .env があれば読む（無くても env var で動く）
+    """
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        extra="ignore",
+        case_sensitive=False,
+    )
 
-    # Render では環境変数で必ず渡す（必須）
-    database_url: str
+    # 明示的に env 名を指定（Renderでの事故を減らす）
+    database_url: str = Field(validation_alias="DATABASE_URL")
 
-    # 無いときはローカル開発のデフォルトに倒す
     cors_origins: str = "http://localhost:5173"
 
 
