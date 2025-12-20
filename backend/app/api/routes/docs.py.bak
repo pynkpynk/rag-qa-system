@@ -1,0 +1,83 @@
+import os
+from pathlib import Path
+import shutil
+
+from fastapi import APIRouter, Depends, UploadFile, File, BackgroundTasks
+from sqlalchemy.orm import Session
+
+from app.db.session import get_db, SessionLocal
+from app.db.models import Document, Chunk
+from app.services.indexing import extract_pdf_pages, simple_chunk, embed_texts
+
+router = APIRouter()
+
+UPLOAD_DIR = Path("data/uploads")
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+def index_document(doc_id: str, file_path: str):
+    db = SessionLocal()
+    try:
+        doc = db.get(Document, doc_id)
+        doc.status = "indexing"
+        db.commit()
+
+        pages = extract_pdf_pages(file_path)
+
+        texts = []
+        metas = []  # (page, chunk_index, text)
+        for page_no, page_text in pages:
+            chunks = simple_chunk(page_text)
+            for idx, ch in enumerate(chunks):
+                texts.append(ch)
+                metas.append((page_no, idx, ch))
+
+        if not texts:
+            raise RuntimeError("No extractable text found in PDF.")
+
+        vecs = embed_texts(texts)
+
+        for (page_no, idx, ch), vec in zip(metas, vecs):
+            db.add(Chunk(
+                document_id=doc_id,
+                page=page_no,
+                chunk_index=idx,
+                text=ch,
+                embedding=vec
+            ))
+
+        doc.status = "indexed"
+        db.commit()
+
+    except Exception as e:
+        doc = db.get(Document, doc_id)
+        doc.status = "failed"
+        doc.error = str(e)
+        db.commit()
+    finally:
+        db.close()
+
+@router.post("/docs/upload")
+def upload_doc(
+    background: BackgroundTasks,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
+    filename = file.filename or "uploaded.pdf"
+    save_path = UPLOAD_DIR / filename
+
+    with save_path.open("wb") as f:
+        shutil.copyfileobj(file.file, f)
+
+    doc = Document(filename=filename, status="uploaded", meta={"path": str(save_path)})
+    db.add(doc)
+    db.commit()
+    db.refresh(doc)
+
+    background.add_task(index_document, doc.id, str(save_path))
+
+    return {"document_id": doc.id, "filename": doc.filename, "status": doc.status}
+
+@router.get("/docs")
+def list_docs(db: Session = Depends(get_db)):
+    docs = db.query(Document).order_by(Document.created_at.desc()).all()
+    return [{"document_id": d.id, "filename": d.filename, "status": d.status, "error": d.error} for d in docs]

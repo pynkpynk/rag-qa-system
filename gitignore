@@ -1,0 +1,112 @@
+# =========================
+# OS / Editor junk
+# =========================
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+__MACOSX/
+*.swp
+*.swo
+*~
+*.tmp
+
+# VSCode / JetBrains
+.vscode/
+.idea/
+*.iml
+
+# =========================
+# Secrets / env files
+# =========================
+.env
+.env.*
+!.env.example
+
+# Vercel / Render local metadata
+.vercel/
+.render/
+
+# Keys / certs
+*.pem
+*.key
+*.p12
+
+# =========================
+# Logs / runtime artifacts
+# =========================
+*.log
+*.pid
+
+# =========================
+# Python (backend)
+# =========================
+# Bytecode / cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual envs
+.venv/
+venv/
+ENV/
+env/
+backend/.venv/
+
+# Test / tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# =========================
+# Backend local data (PDF storage, scratch)
+# =========================
+backend/data/
+backend/tmp/
+backend/.cache/
+
+# If you store uploads at repo root (just in case)
+uploads/
+storage/
+tmp/
+
+# =========================
+# Node / Vite (frontend)
+# =========================
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/.cache/
+frontend/coverage/
+
+# npm/yarn/pnpm debug logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# =========================
+# PDFs: generally ignore, but allow curated fixtures
+# =========================
+*.pdf
+!datasets/**/*.pdf
+!frontend/public/**/*.pdf
+
+# =========================
+# Optional: DB dumps / local compose volumes
+# =========================
+*.sql
+*.dump
+*.bak
+*.sqlite
+*.db
