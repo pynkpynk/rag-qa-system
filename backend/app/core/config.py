@@ -1,22 +1,40 @@
-from pydantic import Field
+from __future__ import annotations
+
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    """
-    - Render: env vars が本番の正。DATABASE_URL が必須。
-    - Local: .env があれば読む（無くても env var で動く）
-    """
-    model_config = SettingsConfigDict(
-        env_file=".env",
-        extra="ignore",
-        case_sensitive=False,
-    )
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
-    # 明示的に env 名を指定（Renderでの事故を減らす）
-    database_url: str = Field(validation_alias="DATABASE_URL")
+    openai_api_key: str = Field(...)
+    database_url: str = Field(...)
+    cors_origin: str = Field(...)
+    upload_dir: str = Field("data/uploads")
 
-    cors_origins: str = "http://localhost:5173"
+    @field_validator("database_url", mode="before")
+    @classmethod
+    def _normalize_database_url(cls, v: object) -> object:
+        """
+        Accept common Postgres URL forms and normalize to psycopg(v3) for SQLAlchemy.
+
+        - postgres://...            -> postgresql+psycopg://...
+        - postgresql://...          -> postgresql+psycopg://...
+        - postgresql+psycopg://...  -> keep as-is
+        """
+        if not isinstance(v, str):
+            return v
+
+        if v.startswith("postgresql+psycopg://"):
+            return v
+
+        if v.startswith("postgres://"):
+            return "postgresql+psycopg://" + v.split("://", 1)[1]
+
+        if v.startswith("postgresql://"):
+            return "postgresql+psycopg://" + v.split("://", 1)[1]
+
+        return v
 
 
 settings = Settings()
