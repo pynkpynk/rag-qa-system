@@ -2,73 +2,105 @@ from __future__ import annotations
 
 import os
 import pathlib
-import secrets
+import tempfile
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import BinaryIO, Tuple
+from typing import Iterator, Optional
+
+import boto3
+from botocore.config import Config as BotoConfig
+from botocore.exceptions import ClientError
+
 
 @dataclass(frozen=True)
 class StoredFile:
-    storage_key: str         # 例: "pdfs/<doc_id>/<random>.pdf"
-    abs_path: str            # 例: "/var/data/ragqa/pdfs/<doc_id>/<random>.pdf"
+    storage_key: str
     size_bytes: int
 
-class FileStorage:
-    """
-    Render Disk の mount path 配下に書き込む。
-    mount path 以外はデプロイ/再起動で消えるので注意。
-    """
-    def __init__(self, base_dir: str, pdf_subdir: str = "pdfs") -> None:
-        self.base_dir = os.path.abspath(base_dir)
-        self.pdf_root = os.path.join(self.base_dir, pdf_subdir)
 
-    def ensure_dirs(self) -> None:
-        os.makedirs(self.pdf_root, exist_ok=True)
+def _safe_filename(name: str) -> str:
+    base = pathlib.Path(name or "").name
+    base = base.replace("\x00", "").strip()
+    return base or "uploaded.pdf"
 
-    def save_pdf_stream(
-        self,
-        doc_id: str,
-        src: BinaryIO,
-        original_filename: str,
-        max_bytes: int
-    ) -> StoredFile:
-        self.ensure_dirs()
 
-        safe_name = (pathlib.Path(original_filename).name or "upload.pdf").replace("\x00", "")
-        ext = pathlib.Path(safe_name).suffix.lower()
-        if ext != ".pdf":
-            # ここは要件次第。PDF限定なら弾く方が安全
-            raise ValueError("Only .pdf is allowed")
+class S3Storage:
+    def __init__(self) -> None:
+        self.bucket = os.environ["S3_BUCKET"]
+        self.prefix = os.environ.get("S3_PREFIX", "uploads").strip("/")
 
-        # doc別ディレクトリ
-        doc_dir = os.path.join(self.pdf_root, doc_id)
-        os.makedirs(doc_dir, exist_ok=True)
+        self.region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "ap-southeast-1"
+        self.presign_expires = int(os.environ.get("S3_PRESIGN_EXPIRES", "900"))
 
-        rand = secrets.token_urlsafe(16)
-        storage_key = f"pdfs/{doc_id}/{rand}.pdf"
-        abs_path = os.path.join(doc_dir, f"{rand}.pdf")
+        # 署名URLはclock skewに弱いので、リトライ/タイムアウトはやや優しめ
+        self._client = boto3.client(
+            "s3",
+            region_name=self.region,
+            config=BotoConfig(
+                retries={"max_attempts": 5, "mode": "standard"},
+                connect_timeout=5,
+                read_timeout=60,
+            ),
+        )
 
-        # 原子的に書く（途中失敗で壊れたファイルを残しにくい）
-        tmp_path = abs_path + ".tmp"
+    def make_pdf_key(self, content_hash: str, filename: str) -> str:
+        fn = _safe_filename(filename)
+        # prefix分散
+        return f"{self.prefix}/{content_hash[:2]}/{content_hash}/{fn}"
 
-        size = 0
-        with open(tmp_path, "wb") as f:
-            while True:
-                chunk = src.read(1024 * 1024)
-                if not chunk:
-                    break
-                size += len(chunk)
-                if size > max_bytes:
-                    try:
-                        f.close()
-                    finally:
-                        if os.path.exists(tmp_path):
-                            os.remove(tmp_path)
-                    raise ValueError(f"File too large (>{max_bytes} bytes)")
-                f.write(chunk)
+    def exists(self, key: str) -> bool:
+        try:
+            self._client.head_object(Bucket=self.bucket, Key=key)
+            return True
+        except ClientError as e:
+            code = (e.response.get("Error") or {}).get("Code")
+            if code in {"404", "NoSuchKey", "NotFound"}:
+                return False
+            raise
 
-        os.replace(tmp_path, abs_path)
-        return StoredFile(storage_key=storage_key, abs_path=abs_path, size_bytes=size)
+    def upload_file(self, local_path: str, key: str) -> int:
+        # サイズ計測
+        size = os.stat(local_path).st_size
+        self._client.upload_file(
+            Filename=local_path,
+            Bucket=self.bucket,
+            Key=key,
+            ExtraArgs={
+                "ContentType": "application/pdf",
+            },
+        )
+        return size
 
-    def open_for_read(self, abs_path: str) -> Tuple[BinaryIO, int]:
-        st = os.stat(abs_path)
-        return open(abs_path, "rb"), st.st_size
+    @contextmanager
+    def download_to_temp(self, key: str) -> Iterator[str]:
+        fd, tmp_path = tempfile.mkstemp(prefix="ragqa_", suffix=".pdf")
+        os.close(fd)
+        try:
+            self._client.download_file(self.bucket, key, tmp_path)
+            yield tmp_path
+        finally:
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+    def presign_get_url(self, key: str, filename: str, inline: bool) -> str:
+        safe = _safe_filename(filename)
+        dispo = "inline" if inline else "attachment"
+        return self._client.generate_presigned_url(
+            ClientMethod="get_object",
+            Params={
+                "Bucket": self.bucket,
+                "Key": key,
+                "ResponseContentType": "application/pdf",
+                "ResponseContentDisposition": f'{dispo}; filename="{safe}"',
+            },
+            ExpiresIn=self.presign_expires,
+        )
+
+
+def get_storage_backend() -> Optional[S3Storage]:
+    backend = (os.environ.get("STORAGE_BACKEND") or "").lower().strip()
+    if backend == "s3":
+        return S3Storage()
+    return None

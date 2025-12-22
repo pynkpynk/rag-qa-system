@@ -50,28 +50,20 @@ run_documents = Table(
 # =========================
 
 class Run(Base):
-    """
-    Experiment / evaluation run entity.
-    A Run can be associated with multiple documents (document set for that run).
-    """
     __tablename__ = "runs"
 
     id = Column(String, primary_key=True, default=gen_uuid)
     created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
 
-    # Example config:
-    # {"model":"gpt-5-mini","chunk":{"size":800,"overlap":120},"retriever":{"k":8}}
-    # Optionally: {"gen": {"max_tokens": 600, ...}}
     config = Column(JSON, nullable=False)
 
     status = Column(String, default="created", nullable=False)
     error = Column(String, nullable=True)
 
-    # Optional timing markers (latest /chat/ask instrumentation)
-    t0 = Column(DateTime(timezone=True), nullable=True)  # request received
-    t1 = Column(DateTime(timezone=True), nullable=True)  # LLM started
-    t2 = Column(DateTime(timezone=True), nullable=True)  # LLM finished
-    t3 = Column(DateTime(timezone=True), nullable=True)  # response returned
+    t0 = Column(DateTime(timezone=True), nullable=True)
+    t1 = Column(DateTime(timezone=True), nullable=True)
+    t2 = Column(DateTime(timezone=True), nullable=True)
+    t3 = Column(DateTime(timezone=True), nullable=True)
 
     documents = relationship(
         "Document",
@@ -82,10 +74,6 @@ class Run(Base):
 
 
 class Document(Base):
-    """
-    Uploaded document entity.
-    A Document can be linked to many runs.
-    """
     __tablename__ = "documents"
 
     id = Column(String, primary_key=True, default=gen_uuid)
@@ -94,10 +82,12 @@ class Document(Base):
     status = Column(String, default="uploaded", nullable=False)
     error = Column(String, nullable=True)
 
-    # SHA256 hex digest (64 chars).
     content_hash = Column(String(64), unique=True, index=True, nullable=True)
 
-    # e.g. {"path": "/abs/path/to/file.pdf"}
+    # ✅ NEW: S3 object key を入れる（例: "uploads/<doc_id>/<hash>_file.pdf"）
+    storage_key = Column(Text, nullable=True)
+
+    # 既存互換：ローカルパス等（必要なら残す）
     meta = Column(JSON, nullable=True)
 
     created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
@@ -118,9 +108,6 @@ class Document(Base):
 
 
 class Chunk(Base):
-    """
-    Chunk entity extracted from a document.
-    """
     __tablename__ = "chunks"
 
     id = Column(String, primary_key=True, default=gen_uuid)
