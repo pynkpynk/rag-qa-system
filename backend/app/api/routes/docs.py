@@ -2,16 +2,17 @@ from __future__ import annotations
 
 import hashlib
 import os
+import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import boto3
 from botocore.exceptions import ClientError
 
-from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, UploadFile, Query
-from fastapi.responses import FileResponse, RedirectResponse
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Header, HTTPException, UploadFile, Query
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 from sqlalchemy import text as sql_text
 from sqlalchemy.exc import IntegrityError
@@ -27,7 +28,22 @@ router = APIRouter()
 # Config
 # =========================
 
-UPLOAD_DIR = Path(os.environ.get("UPLOAD_DIR", "data/uploads")).resolve()
+# S3 ONLY (local backend disabled)
+STORAGE_BACKEND = os.environ.get("STORAGE_BACKEND", "s3").lower()
+if STORAGE_BACKEND != "s3":
+    # fail-fast: avoid accidental disk persistence
+    raise RuntimeError("This service is configured as S3-only. Set STORAGE_BACKEND=s3.")
+
+AWS_REGION = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
+S3_BUCKET = os.environ.get("S3_BUCKET")
+S3_PREFIX = (os.environ.get("S3_PREFIX") or "uploads").strip("/")
+S3_PRESIGN_EXPIRES = int(os.environ.get("S3_PRESIGN_EXPIRES", "900"))
+
+# Admin delete protection (required)
+ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN")
+
+# Temp upload dir (ephemeral OK)
+UPLOAD_DIR = Path(os.environ.get("UPLOAD_DIR", "/tmp/rag-qa-uploads")).resolve()
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "25"))
@@ -45,18 +61,7 @@ SELECT EXISTS(
 
 ERROR_MAX_LEN = 900
 
-# --- S3 config ---
-STORAGE_BACKEND = os.environ.get("STORAGE_BACKEND", "local").lower()  # "local" or "s3"
-AWS_REGION = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
-S3_BUCKET = os.environ.get("S3_BUCKET")
-S3_PREFIX = (os.environ.get("S3_PREFIX") or "uploads").strip("/")
-S3_PRESIGN_EXPIRES = int(os.environ.get("S3_PRESIGN_EXPIRES", "900"))
-
 _s3_client = None
-
-
-def _is_s3_enabled() -> bool:
-    return STORAGE_BACKEND == "s3"
 
 
 def _require_s3_settings() -> None:
@@ -78,6 +83,16 @@ def _get_s3():
 # Helpers
 # =========================
 
+def _log(event: str, **fields: Any) -> None:
+    # simple structured log
+    payload = {"event": event, **fields}
+    try:
+        import json
+        print(json.dumps(payload, ensure_ascii=False))
+    except Exception:
+        print(payload)
+
+
 def _safe_filename(name: str) -> str:
     base = os.path.basename(name or "")
     return base or "uploaded.pdf"
@@ -90,22 +105,6 @@ def _safe_cd_filename(name: str) -> str:
 def _require_pdf_extension(filename: str) -> None:
     if not filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are supported.")
-
-
-def _final_path(content_hash: str, filename: str) -> Path:
-    return UPLOAD_DIR / f"{content_hash[:12]}_{filename}"
-
-
-def _get_doc_path(doc: Document) -> Path | None:
-    if not doc.meta or not isinstance(doc.meta, dict):
-        return None
-    p = doc.meta.get("path")
-    if not p:
-        return None
-    path = Path(str(p))
-    if not path.is_absolute():
-        path = (Path.cwd() / path).resolve()
-    return path
 
 
 def _cleanup_file(path: Path | None) -> None:
@@ -125,6 +124,10 @@ def _truncate_err(e: Exception) -> str:
 
 
 def _sha256_and_save_tmp(upload: UploadFile, tmp_path: Path) -> str:
+    """
+    Read upload stream, validate PDF magic header, enforce size limit,
+    compute sha256, and write to tmp_path.
+    """
     hasher = hashlib.sha256()
     total = 0
     first = True
@@ -170,6 +173,14 @@ def _enforce_run_access_if_needed(db: Session, run_id: str | None, document_id: 
         raise HTTPException(status_code=403, detail="document not accessible for this run_id")
 
 
+def _require_admin_token(x_admin_token: str | None) -> None:
+    # fail-closed: if not set, endpoint behaves as Not Found
+    if not ADMIN_TOKEN:
+        raise HTTPException(status_code=404, detail="Not Found")
+    if not x_admin_token or x_admin_token != ADMIN_TOKEN:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+
 # =========================
 # S3 helpers
 # =========================
@@ -179,19 +190,35 @@ def _s3_key_for(doc_id: str, content_hash: str, filename: str) -> str:
     return f"{S3_PREFIX}/{doc_id}/{content_hash[:12]}_{safe}"
 
 
+def _with_retry(fn, *, tries: int = 2, sleep_sec: float = 0.4):
+    last = None
+    for i in range(tries):
+        try:
+            return fn()
+        except Exception as e:
+            last = e
+            if i < tries - 1:
+                time.sleep(sleep_sec * (2 ** i))
+    raise last  # type: ignore[misc]
+
+
 def _s3_upload_file(local_path: Path, key: str) -> None:
     _require_s3_settings()
     s3 = _get_s3()
-    s3.upload_file(
-        Filename=str(local_path),
-        Bucket=S3_BUCKET,
-        Key=key,
-        ExtraArgs={"ContentType": "application/pdf"},
-    )
+
+    def _do():
+        s3.upload_file(
+            Filename=str(local_path),
+            Bucket=S3_BUCKET,
+            Key=key,
+            ExtraArgs={"ContentType": "application/pdf"},
+        )
+        return None
+
+    _with_retry(_do, tries=2)
 
 
-def _s3_delete_object(key: str) -> None:
-    # best-effort cleanup（失敗しても本筋は止めない）
+def _s3_delete_object_best_effort(key: str) -> None:
     try:
         _require_s3_settings()
         s3 = _get_s3()
@@ -221,7 +248,12 @@ def _s3_download_to_tmp(key: str, suffix: str = ".pdf") -> Path:
     _require_s3_settings()
     s3 = _get_s3()
     tmp = Path("/tmp") / f"ragqa_{uuid.uuid4().hex}{suffix}"
-    s3.download_file(Bucket=S3_BUCKET, Key=key, Filename=str(tmp))
+
+    def _do():
+        s3.download_file(Bucket=S3_BUCKET, Key=key, Filename=str(tmp))
+        return None
+
+    _with_retry(_do, tries=2)
     return tmp
 
 
@@ -260,6 +292,13 @@ class DocPageChunkItem(BaseModel):
     text: str
 
 
+class DocDeleteResponse(BaseModel):
+    document_id: str
+    deleted: bool
+    storage_deleted: bool
+    storage_key: str | None = None
+
+
 # =========================
 # Background Task
 # =========================
@@ -267,6 +306,7 @@ class DocPageChunkItem(BaseModel):
 def index_document(doc_id: str) -> None:
     db = SessionLocal()
     tmp_download: Path | None = None
+
     try:
         doc = db.get(Document, doc_id)
         if not doc:
@@ -276,20 +316,15 @@ def index_document(doc_id: str) -> None:
         doc.error = None
         db.commit()
 
-        # ---- choose source ----
-        if doc.storage_key:
-            try:
-                tmp_download = _s3_download_to_tmp(doc.storage_key, suffix=".pdf")
-                path = tmp_download
-            except ClientError as e:
-                raise RuntimeError(f"S3 download failed: {e}")
-        else:
-            file_path = _get_doc_path(doc)
-            if not file_path:
-                raise RuntimeError("document file path not found")
-            if not file_path.exists():
-                raise RuntimeError("PDF file not found on disk.")
-            path = file_path
+        if not doc.storage_key:
+            # S3-only運用なのでここに来たらデータ不整合
+            raise RuntimeError("storage_key missing for S3-only backend")
+
+        try:
+            tmp_download = _s3_download_to_tmp(doc.storage_key, suffix=".pdf")
+            path = tmp_download
+        except ClientError as e:
+            raise RuntimeError(f"S3 download failed: {e}")
 
         pages = extract_pdf_pages(str(path))
 
@@ -323,6 +358,8 @@ def index_document(doc_id: str) -> None:
         doc.error = None
         db.commit()
 
+        _log("index_ok", document_id=doc_id)
+
     except Exception as e:
         try:
             db.rollback()
@@ -337,6 +374,9 @@ def index_document(doc_id: str) -> None:
                 db.commit()
             except Exception:
                 pass
+
+        _log("index_failed", document_id=doc_id, error=_truncate_err(e))
+
     finally:
         if tmp_download:
             _cleanup_file(tmp_download)
@@ -357,15 +397,14 @@ def upload_doc(
     _require_pdf_extension(filename)
 
     tmp_path = UPLOAD_DIR / f"tmp_{uuid.uuid4().hex}_{filename}"
-    final_path: Path | None = None
 
     try:
         content_hash = _sha256_and_save_tmp(file, tmp_path)
 
         existing = db.query(Document).filter(Document.content_hash == content_hash).first()
         if existing:
-            # ✅ dedupだけど、S3運用なのに storage_key が空ならここで埋める（バックフィル）
-            if _is_s3_enabled() and not existing.storage_key:
+            # dedup: S3-only運用でも storage_key が空なら埋める（バックフィル）
+            if not existing.storage_key:
                 key = _s3_key_for(existing.id, content_hash, existing.filename)
                 _s3_upload_file(tmp_path, key)
                 existing.storage_key = key
@@ -387,86 +426,50 @@ def upload_doc(
 
         # new document id（先に作ってS3 keyに使う）
         doc_id = str(uuid.uuid4())
+        key = _s3_key_for(doc_id, content_hash, filename)
 
-        if _is_s3_enabled():
-            key = _s3_key_for(doc_id, content_hash, filename)
-            _s3_upload_file(tmp_path, key)
-            _cleanup_file(tmp_path)
+        # 1) upload to S3
+        t0 = time.time()
+        _s3_upload_file(tmp_path, key)
+        _cleanup_file(tmp_path)
+        _log("s3_upload_ok", document_id=doc_id, storage_key=key, ms=int((time.time() - t0) * 1000))
 
-            doc = Document(
-                id=doc_id,
-                filename=filename,
-                status="uploaded",
-                content_hash=content_hash,
-                storage_key=key,
-                meta={"storage": "s3", "bucket": S3_BUCKET, "key": key, "region": AWS_REGION},
-            )
-            db.add(doc)
-
-            try:
-                db.commit()
-            except IntegrityError:
-                # raceでDB側が重複した場合 → 既存を返す & アップ済みS3オブジェクトは掃除
-                db.rollback()
-                _s3_delete_object(key)
-
-                existing2 = db.query(Document).filter(Document.content_hash == content_hash).first()
-                if existing2:
-                    return DocUploadResponse(
-                        document_id=existing2.id,
-                        filename=existing2.filename,
-                        status=existing2.status,
-                        dedup=True,
-                    )
-                raise
-
-            db.refresh(doc)
-
-            # indexingへ
-            doc.status = "indexing"
-            doc.error = None
-            db.commit()
-            db.refresh(doc)
-
-            background.add_task(index_document, doc.id)
-
-            return DocUploadResponse(
-                document_id=doc.id,
-                filename=doc.filename,
-                status=doc.status,
-                dedup=False,
-            )
-
-        # ---- local/disk backend (既存挙動) ----
-        final_path = _final_path(content_hash, filename)
-        os.replace(tmp_path, final_path)
-
+        # 2) write DB
         doc = Document(
             id=doc_id,
             filename=filename,
             status="uploaded",
             content_hash=content_hash,
-            meta={"path": str(final_path)},
+            storage_key=key,
+            meta={"storage": "s3", "bucket": S3_BUCKET, "key": key, "region": AWS_REGION},
         )
         db.add(doc)
 
         try:
             db.commit()
         except IntegrityError:
+            # race: if another request inserted same hash, clean up the uploaded object
             db.rollback()
-            _cleanup_file(final_path)
-            existing3 = db.query(Document).filter(Document.content_hash == content_hash).first()
-            if existing3:
+            _s3_delete_object_best_effort(key)
+
+            existing2 = db.query(Document).filter(Document.content_hash == content_hash).first()
+            if existing2:
                 return DocUploadResponse(
-                    document_id=existing3.id,
-                    filename=existing3.filename,
-                    status=existing3.status,
+                    document_id=existing2.id,
+                    filename=existing2.filename,
+                    status=existing2.status,
                     dedup=True,
                 )
             raise
+        except Exception as e:
+            # DB failure -> best-effort cleanup S3 to avoid orphan
+            db.rollback()
+            _s3_delete_object_best_effort(key)
+            raise HTTPException(status_code=500, detail=f"DB commit failed: {_truncate_err(e)}")
 
         db.refresh(doc)
 
+        # 3) queue indexing
         doc.status = "indexing"
         doc.error = None
         db.commit()
@@ -483,11 +486,10 @@ def upload_doc(
 
     except HTTPException:
         _cleanup_file(tmp_path)
-        _cleanup_file(final_path)
         raise
-    except Exception:
+    except Exception as e:
         _cleanup_file(tmp_path)
-        _cleanup_file(final_path)
+        _log("upload_failed", error=_truncate_err(e))
         raise
     finally:
         try:
@@ -583,26 +585,11 @@ def download_doc(
 
     _enforce_run_access_if_needed(db, run_id, document_id)
 
-    if doc.storage_key:
-        url = _s3_presign_get(doc.storage_key, inline=False, filename=doc.filename)
-        return RedirectResponse(url, status_code=307)
+    if not doc.storage_key:
+        raise HTTPException(status_code=500, detail="storage_key missing (S3-only backend)")
 
-    file_path = _get_doc_path(doc)
-    if not file_path:
-        raise HTTPException(status_code=404, detail="document file path not found")
-    if not file_path.exists():
-        raise HTTPException(status_code=404, detail="file not found on disk")
-
-    safe_name = _safe_cd_filename(doc.filename)
-    return FileResponse(
-        path=str(file_path),
-        media_type="application/pdf",
-        filename=safe_name,
-        headers={
-            "Cache-Control": "no-store",
-            "Content-Disposition": f'attachment; filename="{safe_name}"',
-        },
-    )
+    url = _s3_presign_get(doc.storage_key, inline=False, filename=doc.filename)
+    return RedirectResponse(url, status_code=307)
 
 
 @router.get("/docs/{document_id}/view")
@@ -617,23 +604,63 @@ def view_pdf(
 
     _enforce_run_access_if_needed(db, run_id, document_id)
 
-    if doc.storage_key:
-        url = _s3_presign_get(doc.storage_key, inline=True, filename=doc.filename)
-        return RedirectResponse(url, status_code=307)
+    if not doc.storage_key:
+        raise HTTPException(status_code=500, detail="storage_key missing (S3-only backend)")
 
-    file_path = _get_doc_path(doc)
-    if not file_path:
-        raise HTTPException(status_code=404, detail="document file path not found")
-    if not file_path.exists():
-        raise HTTPException(status_code=404, detail="file not found on disk")
+    url = _s3_presign_get(doc.storage_key, inline=True, filename=doc.filename)
+    return RedirectResponse(url, status_code=307)
 
-    safe_name = _safe_cd_filename(doc.filename or os.path.basename(str(file_path)))
 
-    return FileResponse(
-        path=str(file_path),
-        media_type="application/pdf",
-        headers={
-            "Content-Disposition": f'inline; filename="{safe_name}"',
-            "Cache-Control": "no-store",
-        },
+@router.delete("/docs/{document_id}", response_model=DocDeleteResponse)
+def delete_doc(
+    document_id: str,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+    db: Session = Depends(get_db),
+):
+    _require_admin_token(x_admin_token)
+
+    doc = db.get(Document, document_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="document not found")
+
+    # capture before delete
+    storage_key = getattr(doc, "storage_key", None) or (doc.meta.get("key") if isinstance(doc.meta, dict) else None)
+
+    # ---- DB delete first (avoid deleting S3 while DB fails) ----
+    try:
+        # detach from runs
+        db.execute(
+            sql_text("DELETE FROM run_documents WHERE document_id = :document_id"),
+            {"document_id": document_id},
+        )
+
+        # delete chunks
+        db.query(Chunk).filter(Chunk.document_id == document_id).delete(synchronize_session=False)
+
+        # delete document row
+        db.delete(doc)
+        db.commit()
+    except Exception as e:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail=f"delete failed: {_truncate_err(e)}")
+
+    # ---- storage delete (best-effort) ----
+    storage_deleted = False
+    if storage_key:
+        try:
+            _s3_delete_object_best_effort(storage_key)
+            storage_deleted = True
+        except Exception:
+            storage_deleted = False
+
+    _log("doc_deleted", document_id=document_id, storage_key=storage_key, storage_deleted=storage_deleted)
+
+    return DocDeleteResponse(
+        document_id=document_id,
+        deleted=True,
+        storage_deleted=storage_deleted,
+        storage_key=storage_key,
     )
