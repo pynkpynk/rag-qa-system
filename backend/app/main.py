@@ -17,6 +17,8 @@ from app.api.routes.runs import router as runs_router
 from app.api.routes.docs import router as docs_router
 from app.api.routes.chat import router as chat_router
 from app.api.routes.chunks import router as chunks_router
+from app.api.routes.debug import router as debug_router
+from app.api.routes.search import router as search_router
 
 
 def _error_payload(code: str, message: str, details: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -24,6 +26,20 @@ def _error_payload(code: str, message: str, details: Optional[Dict[str, Any]] = 
     if details is not None:
         payload["error"]["details"] = details
     return payload
+
+def normalize_http_exception_detail(detail: Any) -> Dict[str, Any] | None:
+    if not isinstance(detail, dict):
+        return None
+    if "error" in detail and isinstance(detail["error"], dict):
+        err = detail["error"]
+        if isinstance(err.get("code"), str) and isinstance(err.get("message"), str):
+            return detail
+    if "code" in detail and "message" in detail:
+        code = detail.get("code")
+        message = detail.get("message")
+        if isinstance(code, str) and isinstance(message, str):
+            return {"error": {"code": code, "message": message}}
+    return None
 
 
 def create_app() -> FastAPI:
@@ -44,12 +60,10 @@ def create_app() -> FastAPI:
         try:
             response = await call_next(request)
         except Exception as e:
-            # 例外は exception_handler 側でJSON化されるが、
-            # middlewareで握りつぶさないようにそのまま投げる
+            # middlewareで握りつぶさず、ハンドラに投げる
             raise e
         finally:
             t3 = time.time()
-            # JSONログ（Render logsで追いやすい）
             log = {
                 "event": "request_done",
                 "request_id": request_id,
@@ -65,12 +79,14 @@ def create_app() -> FastAPI:
     # ---- Exception handlers (unified error JSON) ----
     @app.exception_handler(StarletteHTTPException)
     async def http_exception_handler(request: Request, exc: StarletteHTTPException):
-        # すでに detail が {code,message,details} 形式なら尊重
-        if isinstance(exc.detail, dict) and "code" in exc.detail and "message" in exc.detail:
-            payload = {"error": exc.detail}
-            return JSONResponse(status_code=exc.status_code, content=payload)
+        normalized = normalize_http_exception_detail(exc.detail)
+        if normalized is not None:
+            return JSONResponse(
+                status_code=exc.status_code,
+                content=normalized,
+                headers={"x-request-id": getattr(request.state, "request_id", "")},
+            )
 
-        # statusから最低限のcodeを割り当て（UI側で説明しやすくする）
         code = "HTTP_ERROR"
         if exc.status_code == 403:
             code = "RUN_FORBIDDEN"
@@ -99,7 +115,6 @@ def create_app() -> FastAPI:
 
     @app.exception_handler(Exception)
     async def unhandled_exception_handler(request: Request, exc: Exception):
-        # ここでは詳細を返しすぎない（ログで追う）
         rid = getattr(request.state, "request_id", "")
         print(json.dumps({"event": "unhandled_exception", "request_id": rid, "error": repr(exc)}, ensure_ascii=False))
         return JSONResponse(
@@ -124,7 +139,7 @@ def create_app() -> FastAPI:
 
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=origins,  # 空だとCORS許可なし（Vercel rewriteで同一オリジンなら問題なし）
+        allow_origins=origins,
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
@@ -136,6 +151,8 @@ def create_app() -> FastAPI:
     app.include_router(docs_router, prefix=api_prefix, tags=["docs"])
     app.include_router(chat_router, prefix=api_prefix, tags=["chat"])
     app.include_router(chunks_router, prefix=api_prefix, tags=["chunks"])
+    app.include_router(search_router, prefix=api_prefix, tags=["search"])  # ✅ ここで統一して追加
+    app.include_router(debug_router, prefix=api_prefix, tags=["_debug"])
 
     return app
 

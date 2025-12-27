@@ -1,23 +1,41 @@
 from __future__ import annotations
 
+import logging
+from uuid import UUID
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy import text as sql_text
 from sqlalchemy.orm import Session
 
+from app.core.authz import Principal, require_permissions, is_admin
+from app.core.run_access import ensure_run_access
 from app.db.models import Chunk, Document, Run
 from app.db.session import get_db
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter()
+__all__ = ["router"]  # import事故の保険
+
 
 # ------------------------------------------------------------
 # SQL helpers (run scoping)
+#   run_documents/run_id/document_id が varchar の前提で "文字列比較" に統一
 # ------------------------------------------------------------
 
-SQL_RUN_DOC_COUNT = """
-SELECT COUNT(*) AS cnt
+SQL_RUN_DOC_COUNT_ADMIN = """
+SELECT COUNT(*)::int AS cnt
 FROM run_documents
 WHERE run_id = :run_id
+"""
+
+SQL_RUN_DOC_COUNT_USER = """
+SELECT COUNT(*)::int AS cnt
+FROM run_documents rd
+JOIN documents d ON d.id = rd.document_id
+WHERE rd.run_id = :run_id
+  AND d.owner_sub = :owner_sub
 """
 
 SQL_DOC_ATTACHED_TO_RUN = """
@@ -30,7 +48,7 @@ SELECT EXISTS(
 
 
 # ------------------------------------------------------------
-# Response model (固定スキーマで返す)
+# Response model
 # ------------------------------------------------------------
 
 class ChunkResponse(BaseModel):
@@ -46,64 +64,145 @@ class ChunkResponse(BaseModel):
 # Internal helpers
 # ------------------------------------------------------------
 
-def _ensure_run_exists(db: Session, run_id: str) -> None:
-    run = db.get(Run, run_id)
-    if not run:
-        raise HTTPException(status_code=404, detail="run not found")
+def _not_found() -> None:
+    raise HTTPException(status_code=404, detail="not found")
 
-def _ensure_run_has_docs(db: Session, run_id: str) -> None:
-    row = db.execute(sql_text(SQL_RUN_DOC_COUNT), {"run_id": run_id}).mappings().first()
-    if not row or int(row["cnt"]) == 0:
+
+def _db_get_flexible(db: Session, model, key):
+    """
+    PKが uuid 型でも varchar 型でも取り逃しにくくする。
+    """
+    obj = None
+    try:
+        obj = db.get(model, key)
+        if obj is not None:
+            return obj
+    except Exception:
+        pass
+
+    # UUID -> str, str -> UUID の両方向を試す
+    try:
+        if isinstance(key, UUID):
+            obj = db.get(model, str(key))
+        else:
+            obj = db.get(model, UUID(str(key)))
+    except Exception:
+        obj = None
+    return obj
+
+
+def _ensure_run_exists(db: Session, run_id: UUID) -> Run:
+    run = _db_get_flexible(db, Run, run_id)
+    if not run:
+        _not_found()
+    return run
+
+
+def _ensure_run_has_docs(db: Session, run_id: UUID, p: Principal) -> None:
+    run_id_s = str(run_id)
+
+    try:
+        if is_admin(p):
+            cnt = db.execute(sql_text(SQL_RUN_DOC_COUNT_ADMIN), {"run_id": run_id_s}).scalar_one()
+        else:
+            cnt = db.execute(
+                sql_text(SQL_RUN_DOC_COUNT_USER),
+                {"run_id": run_id_s, "owner_sub": p.sub},
+            ).scalar_one()
+    except Exception:
+        logger.exception("failed to count run_documents")
+        raise HTTPException(status_code=500, detail="failed to count run_documents")
+
+    if int(cnt) == 0:
         raise HTTPException(
             status_code=400,
             detail="This run_id has no attached documents. Attach docs first via /api/runs/{run_id}/attach_docs.",
         )
 
-def _ensure_chunk_accessible_for_run(db: Session, run_id: str, document_id: str) -> None:
+
+def _ensure_doc_readable(db: Session, document_id, p: Principal) -> Document:
+    """
+    - admin: 任意doc OK（legacy含む）
+    - non-admin: owner_sub == p.sub のdocのみ
+    - legacy(owner_sub NULL) は admin のみ（non-adminは404）
+    """
+    # document_id は Chunk.document_id の型に依存（uuid/strどちらでも来る）
+    doc_id_s = str(document_id)
+
+    if is_admin(p):
+        doc = _db_get_flexible(db, Document, document_id)
+        if not doc:
+            doc = _db_get_flexible(db, Document, doc_id_s)
+        if not doc:
+            _not_found()
+        return doc
+
+    doc = (
+        db.query(Document)
+        .filter(Document.id == doc_id_s, Document.owner_sub == p.sub)
+        .first()
+    )
+    if not doc:
+        _not_found()
+    return doc
+
+
+def _ensure_chunk_accessible_for_run(db: Session, run_id: UUID, document_id, p: Principal) -> None:
+    run_id_s = str(run_id)
+    doc_id_s = str(document_id)
+
+    # ① run_id 自体が自分のものか（非ownerは404）
+    ensure_run_access(db, run_id_s, p)
+
+    # ② run_documentsに紐づいてるか
     row = db.execute(
         sql_text(SQL_DOC_ATTACHED_TO_RUN),
-        {"run_id": run_id, "document_id": document_id},
+        {"run_id": run_id_s, "document_id": doc_id_s},
     ).mappings().first()
 
     ok = bool(row and row.get("ok"))
     if not ok:
-        raise HTTPException(status_code=403, detail="chunk not accessible for this run_id")
+        _not_found()
 
 
 # ------------------------------------------------------------
 # Route
 # ------------------------------------------------------------
 
+@router.get("/chunks/health")
+def chunks_health(
+    p: Principal = Depends(require_permissions("read:docs")),
+) -> dict:
+    return {"ok": True, "principal_sub": getattr(p, "sub", None)}
+
+
 @router.get("/chunks/{chunk_id}", response_model=ChunkResponse)
 def get_chunk(
-    chunk_id: str,
-    run_id: str | None = Query(
+    chunk_id: UUID,
+    run_id: UUID | None = Query(
         default=None,
         description="Optional: restrict access to chunks attached to this run",
     ),
     db: Session = Depends(get_db),
-):
-    """
-    Fetch a chunk for citation drill-down (front-end: click citation).
-    If run_id is provided, enforce that the chunk's document is attached to the run.
-    """
-    chunk = db.get(Chunk, chunk_id)
+    p: Principal = Depends(require_permissions("read:docs")),
+) -> ChunkResponse:
+    chunk = _db_get_flexible(db, Chunk, chunk_id)
     if not chunk:
-        raise HTTPException(status_code=404, detail="chunk not found")
+        _not_found()
 
-    if run_id:
+    # doc所有権チェック（run_idの有無に関わらず defense-in-depth）
+    doc = _ensure_doc_readable(db, chunk.document_id, p)
+
+    if run_id is not None:
         _ensure_run_exists(db, run_id)
-        _ensure_run_has_docs(db, run_id)
-        _ensure_chunk_accessible_for_run(db, run_id, chunk.document_id)
-
-    doc = db.get(Document, chunk.document_id)
-    filename = doc.filename if doc else None
+        _ensure_run_has_docs(db, run_id, p)
+        _ensure_chunk_accessible_for_run(db, run_id, chunk.document_id, p)
 
     return ChunkResponse(
-        chunk_id=chunk.id,
-        document_id=chunk.document_id,
-        filename=filename,
-        page=chunk.page,
-        chunk_index=chunk.chunk_index,
-        text=chunk.text,
+        chunk_id=str(chunk.id),
+        document_id=str(chunk.document_id),
+        filename=getattr(doc, "filename", None),
+        page=getattr(chunk, "page", None),
+        chunk_index=int(getattr(chunk, "chunk_index", 0)),
+        text=str(getattr(chunk, "text", "")),
     )
