@@ -41,6 +41,7 @@ jobs:
           AUTH_MODE: dev
           MAX_REQUEST_BYTES: '1024'
           RATE_LIMIT_ENABLED: '0'
+          ADMIN_SUBS: smoke-ci-dummy-sub
         run: |
           . .venv/bin/activate
           cd backend

@@ -5,6 +5,7 @@ SCRIPT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BACKEND_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 DEV_UP_SCRIPT="${SCRIPT_DIR}/dev_up.sh"
 DEV_DOWN_SCRIPT="${SCRIPT_DIR}/dev_down.sh"
+export ADMIN_SUBS="${ADMIN_SUBS:-ci-admin}"
 
 log() { printf '[smoke] %s\n' "$*"; }
 require_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "Missing required command: $1" >&2; exit 1; }; }
