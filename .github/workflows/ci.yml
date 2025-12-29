@@ -4,32 +4,43 @@ on:
   push:
     branches:
       - main
+      - develop
+      - feat/**
   pull_request:
+  workflow_dispatch:
 
 jobs:
   backend-tests:
     runs-on: ubuntu-latest
     env:
-      OPENAI_OFFLINE: '1'
+      OPENAI_OFFLINE: "1"
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.13"
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r backend/requirements.txt
           python -m pip install -r backend/requirements-dev.txt
+
       - name: Dev scripts syntax
         run: python -m pytest -q backend/tests/test_dev_scripts_syntax.py
+
       - name: Dotenv runtime
         run: python -m pytest -q backend/tests/test_dotenv_runtime.py
+
       - name: Guardrail tests
         run: python -m pytest -q backend/tests/test_chat_guardrails.py
+
       - name: Eval regression
         run: python -m pytest -q backend/tests/test_eval_regression.py
+
       - name: Safety and message tests
         run: python -m pytest -q backend/tests/test_safety_and_message.py
