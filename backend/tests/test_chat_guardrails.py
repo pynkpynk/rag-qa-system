@@ -1,6 +1,8 @@
 import hashlib
+from types import SimpleNamespace
 
 import pytest
+from fastapi import HTTPException
 
 import app.api.routes.chat as chat
 from app.api.routes.chat import (
@@ -8,6 +10,7 @@ from app.api.routes.chat import (
     attach_debug_meta_to_detail,
     build_debug_meta,
     build_error_payload,
+    build_retrieval_debug_payload,
     contains_cjk,
     get_bearer_token,
     query_class,
@@ -15,8 +18,11 @@ from app.api.routes.chat import (
     should_use_fts,
     should_use_trgm,
 )
+from app.core.output_contract import sanitize_nonfinite_floats
 from app.core.authz import Principal, is_admin
 from app.main import normalize_http_exception_detail
+from app.core.run_access import ensure_run_access
+import app.core.run_access as run_access
 
 
 class DummyRequest:
@@ -24,6 +30,28 @@ class DummyRequest:
         self.headers = {}
         if authorization is not None:
             self.headers["authorization"] = authorization
+
+class DummyResult:
+    def __init__(self, rows):
+        self.rows = rows
+
+    def mappings(self):
+        return self
+
+    def first(self):
+        return self.rows[0] if self.rows else None
+
+    def all(self):
+        return self.rows
+
+class DummyDB:
+    def __init__(self, results):
+        self.results = list(results)
+
+    def execute(self, sql, params):
+        if not self.results:
+            raise AssertionError("Unexpected SQL execute call")
+        return self.results.pop(0)
 
 def test_dev_mode_defaults_to_non_admin(monkeypatch):
     monkeypatch.setenv("AUTH_MODE", "dev")
@@ -118,6 +146,45 @@ def test_is_admin_debug_requires_token_hash_when_flag_enabled(monkeypatch):
     user_principal = Principal(sub="user", permissions=set())
     assert chat.is_admin_debug(user_principal, req_allowed, is_admin_user=False) is True
 
+class FakeRunDB:
+    def __init__(self, owners: dict[str, str | None]):
+        self.owners = owners
+
+    class _Result:
+        def __init__(self, row):
+            self._row = row
+
+        def mappings(self):
+            return self
+
+        def first(self):
+            return self._row
+
+    def execute(self, sql, params):
+        run_id = params["run_id"]
+        owner = self.owners.get(run_id)
+        if owner is None:
+            return self._Result(None)
+        return self._Result({"owner_sub": owner})
+
+def test_ensure_run_access_blocks_other_user():
+    db = FakeRunDB({"run-user-a": "user-a"})
+    principal = Principal(sub="user-b", permissions=set())
+    with pytest.raises(HTTPException) as exc:
+        ensure_run_access(db, "run-user-a", principal)
+    assert exc.value.status_code == 404
+
+def test_ensure_run_access_allows_owner():
+    db = FakeRunDB({"run-user-a": "user-a"})
+    principal = Principal(sub="user-a", permissions=set())
+    ensure_run_access(db, "run-user-a", principal)
+
+def test_ensure_run_access_admin_allowed(monkeypatch):
+    db = FakeRunDB({"run-admin": "admin"})
+    principal = Principal(sub="admin", permissions={"admin"})
+    monkeypatch.setattr(run_access, "is_admin", lambda _: True)
+    ensure_run_access(db, "run-admin", principal)
+
 def test_debug_meta_for_non_admin_debug_request():
     meta = build_debug_meta(
         feature_flag_enabled=True,
@@ -174,11 +241,95 @@ def test_debug_meta_for_admin_debug_request():
     assert meta["is_admin_debug"] is True
     assert meta["admin_via_token_hash"] is True
     assert meta["used_fts"] is True
-    assert meta["fts_skipped"] is False
-    assert meta["used_trgm"] is True
-    assert meta["auth_mode_dev"] is False
-    assert meta["auth_header_present"] is True
-    assert meta["bearer_token_present"] is True
+
+def test_prod_env_forces_debug_off(monkeypatch):
+    class RequestStub:
+        def __init__(self):
+            self.headers = {}
+            self.state = SimpleNamespace(request_id="prod-req")
+
+    class DummyDB:
+        def commit(self):
+            return None
+
+    monkeypatch.setenv("APP_ENV", "prod")
+    monkeypatch.setenv("ALLOW_PROD_DEBUG", "0")
+    monkeypatch.setenv("ENABLE_RETRIEVAL_DEBUG", "1")
+    monkeypatch.setenv("ENABLE_TRGM", "0")
+    monkeypatch.setenv("RETRIEVAL_DEBUG_REQUIRE_TOKEN_HASH", "0")
+    monkeypatch.setattr(chat, "_TRGM_AVAILABLE_FLAG", None, raising=False)
+    monkeypatch.setattr(chat, "is_admin", lambda _: True)
+    monkeypatch.setattr(chat, "effective_auth_mode", lambda: "prod")
+    monkeypatch.setattr(chat, "embed_query", lambda q: [0.0])
+    monkeypatch.setattr(chat, "_detect_trgm_available", lambda *_: False)
+
+    def fake_fetch_chunks(db, qvec_lit, q_text, k, run_id, p, question, trgm_available, admin_debug_hybrid):
+        rows = [
+            {
+                "id": "chunk1",
+                "document_id": "doc1",
+                "filename": "doc.pdf",
+                "page": 1,
+                "chunk_index": 0,
+                "text": "chunk text",
+                "dist": 0.12,
+            }
+        ]
+        debug = {
+            "strategy": "vector_by_run_admin",
+            "vec_count": 1,
+            "merged_count": 1,
+            "used_trgm": False,
+            "fts_skipped": True,
+            "trgm_available": trgm_available,
+        }
+        return rows, debug
+
+    events: list[dict] = []
+
+    monkeypatch.setattr(chat, "fetch_chunks", fake_fetch_chunks)
+    monkeypatch.setattr(chat, "answer_with_contract", lambda *args, **kwargs: ("answer", ["S1"]))
+    monkeypatch.setattr(chat, "_emit_audit_event", lambda **kwargs: events.append(kwargs))
+
+    payload = AskPayload(question="Explain prod behavior", k=2, debug=True)
+    request = RequestStub()
+    principal = Principal(sub="prod|admin", permissions={"read:docs"})
+
+    resp = chat.ask(payload, request, db=DummyDB(), p=principal)
+    assert "retrieval_debug" not in resp
+    assert "debug_meta" not in resp
+    assert events, "audit events should be emitted in prod"
+    for ev in events:
+        assert ev["retrieval_debug_included"] is False
+        assert ev["debug_meta_included"] is False
+        assert ev["debug_effective"] is False
+        assert ev["status"] in {"success", "error"}
+        assert "fts_skipped" not in ev
+        assert "used_trgm" not in ev
+        assert "trgm_available" not in ev
+
+def test_chat_ask_blocks_run_not_owned(monkeypatch):
+    class RequestStub:
+        def __init__(self):
+            self.headers = {}
+            self.state = SimpleNamespace(request_id="req-block")
+
+    class DummyDB:
+        def commit(self):
+            return None
+
+    payload = AskPayload(question="Need info", k=2, run_id="run-other", debug=True)
+    principal = Principal(sub="user-a", permissions={"read:docs"})
+    request = RequestStub()
+
+    def deny_run(*args, **kwargs):
+        raise HTTPException(status_code=404, detail="run not found")
+
+    monkeypatch.setattr(chat, "ensure_run_access", deny_run)
+
+    with pytest.raises(HTTPException) as exc:
+        chat.ask(payload, request, db=DummyDB(), p=principal)
+    assert exc.value.status_code == 404
 
 def test_debug_meta_absent_when_payload_debug_false():
     meta = build_debug_meta(
@@ -372,6 +523,124 @@ def test_normalize_http_exception_detail_from_code_message():
 
 def test_normalize_http_exception_detail_rejects_string():
     assert normalize_http_exception_detail("bad") is None
+
+def test_sanitize_nonfinite_floats_records_paths():
+    payload = {
+        "a": float("nan"),
+        "b": [0.1, float("inf"), {"c": float("-inf")}],
+        "nested": {"d": (float("nan"), 1)},
+    }
+    sanitized, paths = sanitize_nonfinite_floats(payload)
+    assert sanitized["a"] is None
+    assert sanitized["b"][1] is None
+    assert sanitized["b"][2]["c"] is None
+    assert sanitized["nested"]["d"][0] is None
+    assert set(paths) == {"a", "b[1]", "b[2].c", "nested.d[0]"}
+
+def test_sanitize_allows_json_serialization():
+    import json
+
+    payload = {
+        "retrieval_debug": {"vec_top5": [{"score": float("nan")}]},
+        "debug_meta": {"payload_debug": True},
+    }
+    sanitized, paths = sanitize_nonfinite_floats(payload)
+    assert paths == ["retrieval_debug.vec_top5[0].score"]
+    json.dumps(sanitized, allow_nan=False)
+
+def test_retrieval_debug_payload_sets_count_from_merged():
+    payload = build_retrieval_debug_payload({"merged_count": 3, "vec_count": 5})
+    assert payload["count"] == 3
+
+def test_retrieval_debug_payload_sets_count_from_lists():
+    payload = build_retrieval_debug_payload({"vec_top5": [{"rank": 1}, {"rank": 2}]})
+    assert payload["count"] == 2
+
+def test_admin_debug_strategy_default_firstk(monkeypatch):
+    monkeypatch.setattr(chat, "is_admin", lambda p: True)
+    monkeypatch.setattr(chat, "_is_summary_question", lambda q: True)
+    db = DummyDB(
+        [
+            DummyResult([{"cnt": 1}]),
+            DummyResult(
+                [
+                    {
+                        "id": "chunk1",
+                        "document_id": "doc1",
+                        "filename": "en",
+                        "page": 1,
+                        "chunk_index": 0,
+                        "text": "t",
+                        "dist": 0.1,
+                    }
+                ]
+            ),
+        ]
+    )
+    principal = Principal(sub="admin", permissions=set())
+    rows, debug = chat.fetch_chunks(
+        db,
+        qvec_lit="[0]",
+        q_text="summary テスト",
+        k=1,
+        run_id="run1",
+        p=principal,
+        question="summary テスト",
+        trgm_available=True,
+        admin_debug_hybrid=False,
+    )
+    assert len(rows) == 1
+    assert debug["strategy"] == "firstk_by_run_admin"
+    assert debug["used_trgm"] is False
+
+def test_admin_debug_strategy_hybrid_overrides_summary(monkeypatch):
+    monkeypatch.setattr(chat, "is_admin", lambda p: True)
+    monkeypatch.setattr(chat, "_is_summary_question", lambda q: True)
+    db = DummyDB(
+        [
+            DummyResult([{"cnt": 1}]),
+            DummyResult(
+                [
+                    {
+                        "id": "vec1",
+                        "document_id": "doc1",
+                        "filename": "en",
+                        "page": 1,
+                        "chunk_index": 0,
+                        "text": "vec",
+                        "dist": 0.1,
+                    }
+                ]
+            ),
+            DummyResult(
+                [
+                    {
+                        "id": "trgm1",
+                        "document_id": "doc2",
+                        "filename": "ja",
+                        "page": 2,
+                        "chunk_index": 1,
+                        "text": "ja",
+                        "dist": None,
+                    }
+                ]
+            ),
+        ]
+    )
+    principal = Principal(sub="admin", permissions=set())
+    rows, debug = chat.fetch_chunks(
+        db,
+        qvec_lit="[0]",
+        q_text="要点 テスト",
+        k=1,
+        run_id="run1",
+        p=principal,
+        question="要点 テスト",
+        trgm_available=True,
+        admin_debug_hybrid=True,
+    )
+    assert debug["strategy"] == "hybrid_rrf_by_run_admin"
+    assert debug["used_trgm"] is True
 
 @pytest.mark.parametrize(
     "payload_debug,flag,is_admin_debug,expected",

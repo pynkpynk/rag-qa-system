@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import logging
+import json
 import os
 import re
+import math
 from datetime import datetime, timezone
 import hashlib
 import hmac
@@ -10,17 +12,19 @@ from typing import Any, Iterable, Literal, Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from openai import OpenAI
-from pydantic import BaseModel, Field, AliasChoices, model_validator
+from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import text as sql_text
 from sqlalchemy.orm import Session
 
 from app.core.authz import Principal, is_admin, require_permissions, effective_auth_mode
 from app.core.run_access import ensure_run_access
+from app.core.output_contract import sanitize_nonfinite_floats
 from app.db.models import Run
 from app.db.session import get_db
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+audit_logger = logging.getLogger("audit")
 
 # ============================================================
 # Request model
@@ -32,7 +36,6 @@ class AskPayload(BaseModel):
         Field(
             ...,
             min_length=1,
-            validation_alias=AliasChoices("question", "message"),
         ),
     ]
     k: int = Field(6, ge=1, le=50)
@@ -110,8 +113,20 @@ VEC_MAX_COS_DIST = float(os.getenv("VEC_MAX_COS_DIST", "0.45"))
 # ★ NEW: deictic/ambiguous reference gate
 REJECT_AMBIGUOUS_REFERENCE_WITHOUT_RUN = os.getenv("REJECT_AMBIGUOUS_REFERENCE_WITHOUT_RUN", "1") == "1"
 AMBIGUOUS_REF_RE = re.compile(
-    r"(この|その|上記|本)\s*(pdf|PDF|文書|資料|ファイル)"
-    r"|(^|\s)(これ|それ|上記)(\s|$)",
+    r"(この|その|上記|上述|前述|本)\s*(pdf|PDF|文書|資料|ファイル)"
+    r"|(?:上記|上述|前述)(?:の(?:内容|文章))?"
+    r"|上の(内容|文章)"
+    r"|(^|[\s　])(これ|それ)(の内容)?([\s　]|$)",
+    re.IGNORECASE,
+)
+_DEICTIC_FOLLOWUP_RE = re.compile(
+    r"(?:^|[\s　])(それ|これ|あれ)(?!ぞれ|から|まで|でも|なら|ほど|だけ)"
+    r"(?:を|について|に|は|が)?(説明|解説|教えて|要約|まとめ|詳しく|述べて|話して)(?:て|ください|下さい|。|！|ろ|よ)?",
+    re.IGNORECASE,
+)
+# ★ Additional guard: phrases like "この問題/この件/この課題" have no explicit run_id target.
+_DEICTIC_ABSTRACT_RE = re.compile(
+    r"(?:^|[\s　])この(問題|件|課題|トラブル|エラー|バグ|質問|内容|文章|話|点)(?:を|について|に|は|が)?",
     re.IGNORECASE,
 )
 
@@ -124,7 +139,15 @@ def is_generic_query(q: str) -> bool:
     return False
 
 def has_ambiguous_reference(q: str) -> bool:
-    return bool(AMBIGUOUS_REF_RE.search((q or "").strip()))
+    text = (q or "").strip()
+    if not text:
+        return False
+    if AMBIGUOUS_REF_RE.search(text):
+        return True
+    normalized = text.replace("　", " ")
+    if _DEICTIC_FOLLOWUP_RE.search(normalized):
+        return True
+    return bool(_DEICTIC_ABSTRACT_RE.search(normalized))
 
 def normalize_bullets(text: str) -> str:
     """
@@ -153,6 +176,8 @@ ENABLE_RETRIEVAL_DEBUG = os.getenv("ENABLE_RETRIEVAL_DEBUG", "1") == "1"
 RETRIEVAL_DEBUG_REQUIRE_TOKEN_HASH = os.getenv("RETRIEVAL_DEBUG_REQUIRE_TOKEN_HASH", "0") == "1"
 ENABLE_TRGM = os.getenv("ENABLE_TRGM", "1") == "1"
 TRGM_K = max(1, int(os.getenv("TRGM_K", "30") or "30"))
+APP_ENV = (os.getenv("APP_ENV", "dev") or "dev").strip().lower()
+_ALLOW_PROD_DEBUG = os.getenv("ALLOW_PROD_DEBUG", "0") == "1"
 _TRGM_AVAILABLE_FLAG: bool | None = None
 
 def _parse_admin_debug_token_hashes(raw: str | None) -> set[str]:
@@ -164,6 +189,71 @@ def _parse_admin_debug_token_hashes(raw: str | None) -> set[str]:
     return hashes
 
 _ADMIN_DEBUG_TOKEN_HASHES = _parse_admin_debug_token_hashes(os.getenv("ADMIN_DEBUG_TOKEN_SHA256_LIST"))
+ADMIN_DEBUG_STRATEGY = (os.getenv("ADMIN_DEBUG_STRATEGY", "firstk") or "firstk").strip().lower()
+
+
+def _refresh_retrieval_debug_flags() -> None:
+    global ENABLE_RETRIEVAL_DEBUG, RETRIEVAL_DEBUG_REQUIRE_TOKEN_HASH, ADMIN_DEBUG_STRATEGY, _ADMIN_DEBUG_TOKEN_HASHES, APP_ENV, _ALLOW_PROD_DEBUG
+    ENABLE_RETRIEVAL_DEBUG = os.getenv("ENABLE_RETRIEVAL_DEBUG", "1") == "1"
+    RETRIEVAL_DEBUG_REQUIRE_TOKEN_HASH = os.getenv("RETRIEVAL_DEBUG_REQUIRE_TOKEN_HASH", "0") == "1"
+    ADMIN_DEBUG_STRATEGY = (os.getenv("ADMIN_DEBUG_STRATEGY", "firstk") or "firstk").strip().lower()
+    _ADMIN_DEBUG_TOKEN_HASHES = _parse_admin_debug_token_hashes(os.getenv("ADMIN_DEBUG_TOKEN_SHA256_LIST"))
+    APP_ENV = (os.getenv("APP_ENV", "dev") or "dev").strip().lower()
+    _ALLOW_PROD_DEBUG = os.getenv("ALLOW_PROD_DEBUG", "0") == "1"
+
+def _is_prod_env() -> bool:
+    return APP_ENV == "prod"
+
+def _debug_allowed_in_env() -> bool:
+    return (not _is_prod_env()) or _ALLOW_PROD_DEBUG
+
+def _safe_hash_identifier(value: str | None) -> str | None:
+    if not value:
+        return None
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
+    return digest[:12]
+
+def _extract_error_code(detail: Any) -> str | None:
+    if isinstance(detail, dict):
+        err = detail.get("error")
+        if isinstance(err, dict):
+            val = err.get("code")
+            if isinstance(val, str):
+                return val
+    return None
+
+def _emit_audit_event(
+    *,
+    request_id: str | None,
+    run_id: str | None,
+    principal_hash: str | None,
+    is_admin_user: bool,
+    debug_requested: bool,
+    debug_effective: bool,
+    retrieval_debug_included: bool,
+    debug_meta_included: bool,
+    strategy: str | None,
+    chunk_count: int,
+    status: str,
+    error_code: str | None = None,
+) -> None:
+    event = {
+        "request_id": request_id,
+        "run_id": run_id,
+        "principal_hash": principal_hash,
+        "is_admin": bool(is_admin_user),
+        "debug_requested": bool(debug_requested),
+        "debug_effective": bool(debug_effective),
+        "retrieval_debug_included": bool(retrieval_debug_included),
+        "debug_meta_included": bool(debug_meta_included),
+        "strategy": strategy,
+        "chunk_count": int(chunk_count),
+        "status": status,
+        "error_code": error_code,
+        "app_env": APP_ENV,
+    }
+    line = json.dumps(event, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    audit_logger.info(line)
 
 _FTS_CONFIG_RAW = os.getenv("FTS_CONFIG", "simple")
 FTS_CONFIG = _FTS_CONFIG_RAW if re.fullmatch(r"[A-Za-z_]+", _FTS_CONFIG_RAW or "") else "simple"
@@ -527,6 +617,7 @@ def fetch_chunks(
     question: str,
     *,
     trgm_available: bool,
+    admin_debug_hybrid: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
     q_text = (q_text or "").strip()
 
@@ -535,6 +626,8 @@ def fetch_chunks(
     use_fts = should_use_fts(q_text)
     use_trgm = should_use_trgm(q_text, trgm_available=trgm_available)
     debug: dict[str, Any] | None = None
+    force_admin_hybrid = bool(admin_debug_hybrid and is_admin(p))
+
     if ENABLE_RETRIEVAL_DEBUG:
         debug = {
             "strategy": None,
@@ -556,7 +649,11 @@ def fetch_chunks(
             if not cnt_row or int(cnt_row["cnt"]) == 0:
                 raise HTTPException(status_code=400, detail="This run_id has no attached documents. Attach docs first.")
 
-            if _is_summary_question(question):
+            is_summary = _is_summary_question(question)
+            if force_admin_hybrid:
+                is_summary = False
+
+            if is_summary:
                 k_eff = min(max(k, 20), 50)
                 rows = [dict(r) for r in db.execute(sql_text(SQL_FIRSTK_BY_RUN_ADMIN), {"run_id": run_id, "k": k_eff}).mappings().all()]
                 if debug is not None:
@@ -564,7 +661,7 @@ def fetch_chunks(
                     debug["count"] = len(rows)
                 return rows, debug
 
-            if q_text and (ENABLE_HYBRID or use_trgm):
+            if q_text and (ENABLE_HYBRID or use_trgm or force_admin_hybrid):
                 vec_k = HYBRID_VEC_K if ENABLE_HYBRID else k
                 vec = [dict(r) for r in db.execute(sql_text(SQL_TOPK_BY_RUN_ADMIN), {"qvec": qvec_lit, "k": vec_k, "run_id": run_id}).mappings().all()]
                 aux_rows: list[dict[str, Any]] = []
@@ -654,7 +751,11 @@ def fetch_chunks(
             debug["top5"] = _preview(rows)
         return rows, debug
 
-    if _is_summary_question(question):
+    is_summary = _is_summary_question(question)
+    if force_admin_hybrid:
+        is_summary = False
+
+    if is_summary:
         k_eff = min(max(k, 20), 50)
         if is_admin(p):
             rows = [dict(r) for r in db.execute(sql_text(SQL_FIRSTK_ALL_DOCS_ADMIN), {"k": k_eff}).mappings().all()]
@@ -670,7 +771,7 @@ def fetch_chunks(
         return rows, debug
 
     if is_admin(p):
-        if q_text and (ENABLE_HYBRID or use_trgm):
+        if q_text and (ENABLE_HYBRID or use_trgm or force_admin_hybrid):
             vec_k = HYBRID_VEC_K if ENABLE_HYBRID else k
             vec = [dict(r) for r in db.execute(sql_text(SQL_TOPK_ALL_DOCS_ADMIN), {"qvec": qvec_lit, "k": vec_k}).mappings().all()]
             aux_rows: list[dict[str, Any]] = []
@@ -1113,6 +1214,7 @@ def build_error_payload(
     payload: dict[str, Any] = {"error": {"code": code, "message": message}}
     if debug_meta is not None:
         payload["debug_meta"] = debug_meta
+    payload, _ = sanitize_nonfinite_floats(payload)
     return payload
 
 def attach_debug_meta_to_detail(detail: Any, debug_meta: dict[str, bool] | None) -> Any:
@@ -1123,7 +1225,8 @@ def attach_debug_meta_to_detail(detail: Any, debug_meta: dict[str, bool] | None)
             return detail
         updated = dict(detail)
         updated["debug_meta"] = debug_meta
-        return updated
+        sanitized, _ = sanitize_nonfinite_floats(updated)
+        return sanitized
     message = detail if isinstance(detail, str) else ""
     return build_error_payload("http_exception", message or "error", debug_meta=debug_meta)
 
@@ -1159,6 +1262,33 @@ def sanitize_retrieval_debug(data: dict[str, Any] | None) -> dict[str, Any] | No
             cleaned[key] = data[key]
     return cleaned or None
 
+def _ensure_debug_count(data: dict[str, Any]) -> None:
+    if "count" in data and isinstance(data.get("count"), (int, float)):
+        value = data.get("count")
+        if isinstance(value, (int, float)) and math.isfinite(value):
+            data["count"] = int(value)
+            return
+    candidates = [
+        data.get("merged_count"),
+        data.get("vec_count"),
+        data.get("fts_count"),
+        data.get("trgm_count"),
+    ]
+    for cand in candidates:
+        if isinstance(cand, (int, float)) and math.isfinite(cand):
+            data["count"] = int(cand)
+            return
+    for key in ("merged_top5", "vec_top5", "fts_top5", "trgm_top5", "top5"):
+        seq = data.get(key)
+        if isinstance(seq, list):
+            data["count"] = len(seq)
+            return
+    requested = data.get("requested_k")
+    if isinstance(requested, (int, float)) and math.isfinite(requested):
+        data["count"] = int(requested)
+    else:
+        data["count"] = 0
+
 def build_retrieval_debug_payload(
     raw: dict[str, Any] | None,
     extra: dict[str, Any] | None = None,
@@ -1170,6 +1300,7 @@ def build_retrieval_debug_payload(
         merged.update(raw)
     if extra:
         merged.update(extra)
+    _ensure_debug_count(merged)
     return sanitize_retrieval_debug(merged)
 
 @router.post("/chat/ask")
@@ -1181,10 +1312,14 @@ def ask(
 ):
     req_id = getattr(request.state, "request_id", None) or request.headers.get("X-Request-ID")
 
+    _refresh_retrieval_debug_flags()
+
     auth_mode_dev = effective_auth_mode() == "dev"
     feature_flag_enabled = bool(ENABLE_RETRIEVAL_DEBUG)
-    payload_debug_flag = bool(payload.debug)
+    payload_debug_requested = bool(payload.debug)
+    payload_debug_flag = bool(payload_debug_requested and _debug_allowed_in_env())
     principal_sub = getattr(p, "sub", None)
+    principal_hash = _safe_hash_identifier(principal_sub)
     is_admin_user = bool(principal_sub) and is_admin(p)
     auth_header_value = request.headers.get("authorization") or request.headers.get("Authorization")
     auth_header_present = bool((auth_header_value or "").strip())
@@ -1201,11 +1336,13 @@ def ask(
         payload_debug_flag,
         is_admin_debug=is_admin_debug_user,
     )
+    force_admin_hybrid = bool(auth_mode_dev and is_admin_debug_user and ADMIN_DEBUG_STRATEGY == "hybrid")
     trgm_enabled_flag = bool(ENABLE_TRGM)
     trgm_available_flag = _detect_trgm_available(db) if trgm_enabled_flag else False
     debug_meta: dict[str, bool] | None = None
     debug_meta_for_errors: dict[str, bool] | None = None
-
+    rows: list[dict[str, Any]] = []
+    retrieval_debug_raw: dict[str, Any] | None = None
     run: Run | None = None
 
     try:
@@ -1283,6 +1420,7 @@ def ask(
             p=p,
             question=payload.question,
             trgm_available=trgm_available_flag,
+            admin_debug_hybrid=force_admin_hybrid,
         )
         used_fts_flag = bool((retrieval_debug_raw or {}).get("used_fts"))
         used_trgm_flag = bool((retrieval_debug_raw or {}).get("used_trgm"))
@@ -1322,6 +1460,8 @@ def ask(
                     "run_id": payload.run_id,
                     "request_id": req_id,
                 }
+                included_retrieval_debug = False
+                included_debug_meta = False
                 if include_debug:
                     debug_payload = build_retrieval_debug_payload(
                         retrieval_debug_raw,
@@ -1329,8 +1469,29 @@ def ask(
                     )
                     if debug_payload:
                         resp["retrieval_debug"] = debug_payload
+                        included_retrieval_debug = True
                 if debug_meta is not None:
                     resp["debug_meta"] = debug_meta
+                    included_debug_meta = True
+                resp, sanitized_paths = sanitize_nonfinite_floats(resp)
+                if sanitized_paths and payload_debug_flag:
+                    logger.info(
+                        "sanitized non-finite floats",
+                        extra={"request_id": req_id, "paths": sanitized_paths},
+                    )
+                _emit_audit_event(
+                    request_id=req_id,
+                    run_id=payload.run_id,
+                    principal_hash=principal_hash,
+                    is_admin_user=is_admin_user,
+                    debug_requested=payload_debug_requested,
+                    debug_effective=payload_debug_flag,
+                    retrieval_debug_included=included_retrieval_debug,
+                    debug_meta_included=included_debug_meta,
+                    strategy=(retrieval_debug_raw or {}).get("strategy"),
+                    chunk_count=len(rows),
+                    status="success",
+                )
                 return resp
 
         if not rows:
@@ -1343,12 +1504,35 @@ def ask(
                 "run_id": payload.run_id,
                 "request_id": req_id,
             }
+            included_retrieval_debug = False
+            included_debug_meta = False
             if include_debug:
                 debug_payload = build_retrieval_debug_payload(retrieval_debug_raw)
                 if debug_payload:
                     resp["retrieval_debug"] = debug_payload
+                    included_retrieval_debug = True
             if debug_meta is not None:
                 resp["debug_meta"] = debug_meta
+                included_debug_meta = True
+            resp, sanitized_paths = sanitize_nonfinite_floats(resp)
+            if sanitized_paths and payload_debug_flag:
+                logger.info(
+                    "sanitized non-finite floats",
+                    extra={"request_id": req_id, "paths": sanitized_paths},
+                )
+            _emit_audit_event(
+                request_id=req_id,
+                run_id=payload.run_id,
+                principal_hash=principal_hash,
+                is_admin_user=is_admin_user,
+                debug_requested=payload_debug_requested,
+                debug_effective=payload_debug_flag,
+                retrieval_debug_included=included_retrieval_debug,
+                debug_meta_included=included_debug_meta,
+                strategy=(retrieval_debug_raw or {}).get("strategy"),
+                chunk_count=len(rows),
+                status="success",
+            )
             return resp
 
         context, sources = build_sources(rows)
@@ -1386,22 +1570,81 @@ def ask(
             "run_id": payload.run_id,
             "request_id": req_id,
         }
+        included_retrieval_debug = False
+        included_debug_meta = False
         if include_debug:
             debug_payload = build_retrieval_debug_payload(retrieval_debug_raw)
             if debug_payload:
                 resp["retrieval_debug"] = debug_payload
+                included_retrieval_debug = True
         if debug_meta is not None:
             resp["debug_meta"] = debug_meta
+            included_debug_meta = True
+        resp, sanitized_paths = sanitize_nonfinite_floats(resp)
+        if sanitized_paths and payload_debug_flag:
+            logger.info(
+                "sanitized non-finite floats",
+                extra={"request_id": req_id, "paths": sanitized_paths},
+            )
+        _emit_audit_event(
+            request_id=req_id,
+            run_id=payload.run_id,
+            principal_hash=principal_hash,
+            is_admin_user=is_admin_user,
+            debug_requested=payload_debug_requested,
+            debug_effective=payload_debug_flag,
+            retrieval_debug_included=included_retrieval_debug,
+            debug_meta_included=included_debug_meta,
+            strategy=(retrieval_debug_raw or {}).get("strategy"),
+            chunk_count=len(rows),
+            status="success",
+        )
         return resp
 
     except HTTPException as exc:
         if debug_meta_for_errors is not None:
             exc.detail = attach_debug_meta_to_detail(exc.detail, debug_meta_for_errors)
+            detail_sanitized, paths = sanitize_nonfinite_floats(exc.detail)
+            if paths and payload_debug_flag:
+                logger.info(
+                    "sanitized non-finite floats",
+                    extra={"request_id": req_id, "paths": paths},
+                )
+            exc.detail = detail_sanitized
+        _emit_audit_event(
+            request_id=req_id,
+            run_id=payload.run_id,
+            principal_hash=principal_hash,
+            is_admin_user=is_admin_user,
+            debug_requested=payload_debug_requested,
+            debug_effective=payload_debug_flag,
+            retrieval_debug_included=False,
+            debug_meta_included=False,
+            strategy=(retrieval_debug_raw or {}).get("strategy"),
+            chunk_count=len(rows),
+            status="error",
+            error_code=_extract_error_code(exc.detail),
+        )
         raise
     except Exception as e:
         logger.exception("ask failed", extra={"request_id": req_id, "run_id": payload.run_id})
         message = str(e) if include_debug else "internal server error"
+        detail = build_error_payload("internal_error", message, debug_meta=debug_meta_for_errors)
+        _emit_audit_event(
+            request_id=req_id,
+            run_id=payload.run_id,
+            principal_hash=principal_hash,
+            is_admin_user=is_admin_user,
+            debug_requested=payload_debug_requested,
+            debug_effective=payload_debug_flag,
+            retrieval_debug_included=False,
+            debug_meta_included=False,
+            strategy=(retrieval_debug_raw or {}).get("strategy"),
+            chunk_count=len(rows),
+            status="error",
+            error_code="internal_error",
+        )
         raise HTTPException(
             status_code=500,
-            detail=build_error_payload("internal_error", message, debug_meta=debug_meta_for_errors),
+            detail=detail,
         )

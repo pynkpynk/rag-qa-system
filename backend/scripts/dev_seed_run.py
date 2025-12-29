@@ -56,13 +56,12 @@ def _ensure_chunk(db: Session, document_id: str, text: str) -> None:
 def _ensure_seed_document(db: Session, owner_sub: str, spec: dict[str, str]) -> Document:
     doc = (
         db.query(Document)
-        .filter(
-            Document.owner_sub == owner_sub,
-            Document.content_hash == spec["content_hash"],
-        )
+        .filter(Document.content_hash == spec["content_hash"])
         .first()
     )
     if doc:
+        if doc.owner_sub != owner_sub:
+            doc.owner_sub = owner_sub
         _ensure_chunk(db, doc.id, spec["text"])
         return doc
 

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 import uuid
 from datetime import datetime, timezone
+from typing import Any, Dict, Optional
+
 from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, Request
@@ -11,14 +14,31 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from pydantic import BaseModel
 
 from app.core.config import settings
+from app.middleware.security import (
+    RequestIdMiddleware,
+    SecurityHeadersMiddleware,
+    BodySizeLimitMiddleware,
+    RateLimitMiddleware,
+)
 from app.api.routes.runs import router as runs_router
 from app.api.routes.docs import router as docs_router
 from app.api.routes.chat import router as chat_router
 from app.api.routes.chunks import router as chunks_router
 from app.api.routes.debug import router as debug_router
 from app.api.routes.search import router as search_router
+
+
+def smoke_endpoint_enabled() -> bool:
+    env = os.getenv("APP_ENV", "dev").lower()
+    return env in {"dev", "test"} and os.getenv("ENABLE_SMOKE_ENDPOINT", "0") == "1"
+
+
+class SmokeEchoPayload(BaseModel):
+    question: str
+    run_id: Optional[str] = None
 
 
 def _error_payload(code: str, message: str, details: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -49,19 +69,21 @@ def create_app() -> FastAPI:
     - Makes future testing and extension easier.
     """
     app = FastAPI(title="RAG QA System", version="0.1.0")
+    app.add_middleware(RequestIdMiddleware)
+    app.add_middleware(BodySizeLimitMiddleware)
+    app.add_middleware(RateLimitMiddleware)
+    app.add_middleware(SecurityHeadersMiddleware)
 
     # ---- Request tracing / request_id ----
     @app.middleware("http")
     async def request_trace(request: Request, call_next):
-        request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
-        request.state.request_id = request_id
+        request_id = getattr(request.state, "request_id", None) or str(uuid.uuid4())
 
         t0 = time.time()
         try:
             response = await call_next(request)
-        except Exception as e:
-            # middlewareで握りつぶさず、ハンドラに投げる
-            raise e
+        except Exception:
+            raise
         finally:
             t3 = time.time()
             log = {
@@ -73,7 +95,6 @@ def create_app() -> FastAPI:
             }
             print(json.dumps(log, ensure_ascii=False))
 
-        response.headers["x-request-id"] = request_id
         return response
 
     # ---- Exception handlers (unified error JSON) ----
@@ -153,6 +174,11 @@ def create_app() -> FastAPI:
     app.include_router(chunks_router, prefix=api_prefix, tags=["chunks"])
     app.include_router(search_router, prefix=api_prefix, tags=["search"])  # ✅ ここで統一して追加
     app.include_router(debug_router, prefix=api_prefix, tags=["_debug"])
+
+    if smoke_endpoint_enabled():
+        @app.post("/api/_smoke/echo")
+        async def smoke_echo(payload: SmokeEchoPayload):
+            return {"ok": True, "echo_length": len(payload.question)}
 
     return app
 

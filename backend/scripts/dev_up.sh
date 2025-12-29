@@ -3,44 +3,69 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BACKEND_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+REPO_ROOT="$(cd "${BACKEND_DIR}/.." && pwd)"
 ENV_FILE="${BACKEND_DIR}/.env.local"
 PID_FILE="${BACKEND_DIR}/.devserver.pid"
-PORT="${DEV_SERVER_PORT:-8000}"
-HOST="${DEV_SERVER_HOST:-127.0.0.1}"
+LOG_FILE="${BACKEND_DIR}/.devserver.log"
+DOTENV_HELPER="${SCRIPT_DIR}/_dotenv.sh"
 
-if [[ ! -f "${ENV_FILE}" ]]; then
-    echo "[dev_up] ${ENV_FILE} not found. Copy backend/.env.example to .env.local and populate it." >&2
-    exit 1
+if [[ -f "${DOTENV_HELPER}" ]]; then
+    # shellcheck disable=SC1090
+    source "${DOTENV_HELPER}"
 fi
+
+if [[ -f "${ENV_FILE}" ]]; then
+    dotenv_load_preserve_existing "${ENV_FILE}"
+fi
+
+HOST="${DEV_SERVER_HOST:-127.0.0.1}"
+PORT="${DEV_SERVER_PORT:-8000}"
 
 if [[ -f "${PID_FILE}" ]]; then
     if pid=$(cat "${PID_FILE}" 2>/dev/null) && ps -p "${pid}" >/dev/null 2>&1; then
         echo "[dev_up] Dev server already running (pid ${pid}). Run backend/scripts/dev_down.sh first." >&2
         exit 1
+    fi
+    rm -f "${PID_FILE}"
+fi
+
+CHOSEN_PY="${PYTHON_BIN:-}"
+if [[ -n "${CHOSEN_PY}" && ! -x "${CHOSEN_PY}" ]]; then
+    echo "[dev_up] PYTHON_BIN is set but not executable: ${CHOSEN_PY}" >&2
+    exit 1
+fi
+if [[ -z "${CHOSEN_PY}" ]]; then
+    if [[ -x "${REPO_ROOT}/.venv/bin/python" ]]; then
+        CHOSEN_PY="${REPO_ROOT}/.venv/bin/python"
+    elif command -v python3 >/dev/null 2>&1; then
+        CHOSEN_PY="$(command -v python3)"
+    elif command -v python >/dev/null 2>&1; then
+        CHOSEN_PY="$(command -v python)"
     else
-        rm -f "${PID_FILE}"
+        echo "[dev_up] Could not find python interpreter." >&2
+        exit 1
     fi
 fi
+PYTHON_BIN="${CHOSEN_PY}"
+echo "[dev_up] Using python: ${PYTHON_BIN} ($("${PYTHON_BIN}" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")'))"
 
-set -a
-# shellcheck disable=SC1090
-source "${ENV_FILE}"
-set +a
-
-PYTHON_BIN="${BACKEND_DIR}/.venv/bin/python"
-if [[ ! -x "${PYTHON_BIN}" ]]; then
-    PYTHON_BIN="$(command -v python3 || command -v python)"
-fi
-
-if [[ -z "${PYTHON_BIN}" ]]; then
-    echo "[dev_up] Could not find python interpreter." >&2
+if ! "${PYTHON_BIN}" - <<'PY'
+import importlib
+for mod in ("jose", "fastapi"):
+    importlib.import_module(mod)
+PY
+then
+    cat >&2 <<'EOF'
+[dev_up] Python environment missing required packages (e.g., jose, fastapi).
+[dev_up] Activate the repo venv (.venv) and run: pip install -r backend/requirements.txt -r backend/requirements-dev.txt
+EOF
     exit 1
 fi
 
 REQUIRED_VARS=("ADMIN_SUBS" "AUTH0_DOMAIN" "AUTH0_AUDIENCE")
 for key in "${REQUIRED_VARS[@]}"; do
     if [[ -z "${!key:-}" ]]; then
-        echo "[dev_up] Required env ${key} is missing. Update ${ENV_FILE}." >&2
+        echo "[dev_up] Required env ${key} is missing. Check ${ENV_FILE}." >&2
         exit 1
     fi
 done
@@ -60,16 +85,46 @@ export ENABLE_HYBRID="${ENABLE_HYBRID:-1}"
 export ENABLE_TRGM="${ENABLE_TRGM:-1}"
 export TRGM_K="${TRGM_K:-30}"
 export RETRIEVAL_DEBUG_REQUIRE_TOKEN_HASH="${RETRIEVAL_DEBUG_REQUIRE_TOKEN_HASH:-0}"
+export ADMIN_DEBUG_STRATEGY="${ADMIN_DEBUG_STRATEGY:-firstk}"
 
 cd "${BACKEND_DIR}"
-echo "[dev_up] Starting uvicorn on ${HOST}:${PORT} via ${PYTHON_BIN} (reload enabled)"
+RELOAD_FLAG="enabled"
+if [[ "${DEV_RELOAD:-1}" == "0" ]]; then
+    RELOAD_FLAG="disabled"
+fi
+echo "[dev_up] Starting uvicorn on ${HOST}:${PORT} via ${PYTHON_BIN} (reload ${RELOAD_FLAG})"
+echo "[dev_up] Flags: AUTH_MODE=${AUTH_MODE:-auth0} ADMIN_DEBUG_STRATEGY=${ADMIN_DEBUG_STRATEGY} ENABLE_RETRIEVAL_DEBUG=${ENABLE_RETRIEVAL_DEBUG} RETRIEVAL_DEBUG_REQUIRE_TOKEN_HASH=${RETRIEVAL_DEBUG_REQUIRE_TOKEN_HASH} MAX_REQUEST_BYTES=${MAX_REQUEST_BYTES:-unset} RATE_LIMIT_ENABLED=${RATE_LIMIT_ENABLED:-0}"
+echo "[dev_up] Logs: ${LOG_FILE}"
 
-cleanup() {
-    rm -f "${PID_FILE}"
-}
-trap cleanup EXIT INT TERM
+touch "${LOG_FILE}"
+: > "${LOG_FILE}"
 
-"${PYTHON_BIN}" -m uvicorn app.main:app --host "${HOST}" --port "${PORT}" --reload &
+UVICORN_CMD=("${PYTHON_BIN}" -m uvicorn app.main:app --host "${HOST}" --port "${PORT}")
+if [[ "${DEV_RELOAD:-1}" != "0" ]]; then
+    UVICORN_CMD+=(--reload)
+fi
+SETSID_BIN="$(command -v setsid || true)"
+if [[ -n "${SETSID_BIN}" ]]; then
+    "${SETSID_BIN}" "${UVICORN_CMD[@]}" >> "${LOG_FILE}" 2>&1 &
+else
+    nohup "${UVICORN_CMD[@]}" >> "${LOG_FILE}" 2>&1 &
+fi
 UVICORN_PID=$!
 echo "${UVICORN_PID}" > "${PID_FILE}"
-wait "${UVICORN_PID}"
+
+HEALTH_URL="http://${HOST}:${PORT}/api/health"
+for attempt in {1..10}; do
+    if curl -sf "${HEALTH_URL}" >/dev/null 2>&1; then
+        echo "[dev_up] Dev server is healthy at ${HEALTH_URL}"
+        exit 0
+    fi
+    sleep 0.5
+done
+
+echo "[dev_up] Server failed to start. Showing last 200 log lines:"
+tail -n 200 "${LOG_FILE}" || true
+if ps -p "${UVICORN_PID}" >/dev/null 2>&1; then
+    kill -TERM "${UVICORN_PID}" >/dev/null 2>&1 || true
+fi
+rm -f "${PID_FILE}"
+exit 1

@@ -1,0 +1,412 @@
+[
+  {
+    "name": "english_admin_firstk",
+    "env": {
+      "AUTH_MODE": "dev",
+      "DEV_ADMIN_SUBS": "dev|admin",
+      "ADMIN_DEBUG_STRATEGY": "firstk"
+    },
+    "principal_sub": "dev|admin",
+    "payload": {
+      "question": "Summaries please in English",
+      "debug": true,
+      "run_id": "run-firstk",
+      "k": 4
+    },
+    "run": {
+      "exists": true,
+      "id": "run-firstk"
+    },
+    "fetch": {
+      "rows": [
+        {
+          "id": "chunk-en-1",
+          "document_id": "doc-en",
+          "filename": "en.pdf",
+          "page": 1,
+          "chunk_index": 0,
+          "text": "English example",
+          "dist": 0.12
+        }
+      ],
+      "debug": {
+        "strategy": "vector_by_run_admin",
+        "vec_count": 1,
+        "merged_count": 1,
+        "used_trgm": false
+      }
+    },
+    "answer": {
+      "text": "English answer",
+      "citations": [
+        "doc-en"
+      ]
+    },
+    "expect": {
+      "status": 200,
+      "retrieval_debug": {
+        "present": true,
+        "strategy": "vector_by_run_admin",
+        "min_count": 1,
+        "used_trgm": false
+      }
+    }
+  },
+  {
+    "name": "cjk_admin_hybrid_trgm",
+    "env": {
+      "AUTH_MODE": "dev",
+      "DEV_ADMIN_SUBS": "dev|admin",
+      "ADMIN_DEBUG_STRATEGY": "hybrid"
+    },
+    "principal_sub": "dev|admin",
+    "payload": {
+      "question": "利害関係者の違いを要点でまとめてください",
+      "debug": true,
+      "run_id": "run-hybrid",
+      "k": 5
+    },
+    "run": {
+      "exists": true,
+      "id": "run-hybrid"
+    },
+    "fetch": {
+      "rows": [
+        {
+          "id": "chunk-ja-1",
+          "document_id": "doc-ja",
+          "filename": "ja.pdf",
+          "page": 2,
+          "chunk_index": 1,
+          "text": "CJK text",
+          "dist": 0.08
+        }
+      ],
+      "debug": {
+        "strategy": "hybrid_rrf_by_run_admin",
+        "vec_count": 1,
+        "merged_count": 2,
+        "trgm_count": 1,
+        "used_trgm": true
+      }
+    },
+    "answer": {
+      "text": "Japanese answer",
+      "citations": [
+        "doc-ja"
+      ]
+    },
+    "expect": {
+      "status": 200,
+      "retrieval_debug": {
+        "present": true,
+        "strategy": "hybrid_rrf_by_run_admin",
+        "min_count": 2,
+        "used_trgm": true
+      }
+    }
+  },
+  {
+    "name": "english_nonadmin_debug_false",
+    "env": {
+      "AUTH_MODE": "dev",
+      "DEV_ADMIN_SUBS": ""
+    },
+    "principal_sub": "dev|user",
+    "payload": {
+      "question": "Provide highlights in English",
+      "debug": false,
+      "run_id": "run-user",
+      "k": 3
+    },
+    "run": {
+      "exists": true,
+      "id": "run-user"
+    },
+    "fetch": {
+      "rows": [
+        {
+          "id": "chunk-user-1",
+          "document_id": "doc-user",
+          "filename": "user.pdf",
+          "page": 1,
+          "chunk_index": 0,
+          "text": "User text",
+          "dist": 0.2
+        }
+      ],
+      "debug": {
+        "strategy": "vector_by_run_user",
+        "vec_count": 1,
+        "merged_count": 1,
+        "used_trgm": false
+      }
+    },
+    "answer": {
+      "text": "User answer",
+      "citations": [
+        "doc-user"
+      ]
+    },
+    "expect": {
+      "status": 200,
+      "retrieval_debug": {
+        "present": false
+      }
+    }
+  },
+  {
+    "name": "generic_query_error",
+    "env": {
+      "AUTH_MODE": "dev",
+      "DEV_ADMIN_SUBS": "dev|admin"
+    },
+    "principal_sub": "dev|admin",
+    "payload": {
+      "question": "テスト",
+      "debug": true,
+      "run_id": "run-generic",
+      "k": 3
+    },
+    "run": {
+      "exists": true,
+      "id": "run-generic"
+    },
+    "expect": {
+      "status": 422,
+      "error_code": "generic_query"
+    }
+  },
+  {
+    "name": "run_not_found_error",
+    "env": {
+      "AUTH_MODE": "dev",
+      "DEV_ADMIN_SUBS": "dev|admin"
+    },
+    "principal_sub": "dev|admin",
+    "payload": {
+      "question": "Explain missing run",
+      "debug": true,
+      "run_id": "run-missing",
+      "k": 2
+    },
+    "run": {
+      "exists": false
+    },
+    "expect": {
+      "status": 404,
+      "error_code": "run_not_found"
+    }
+  },
+  {
+    "name": "ambiguous_reference_error",
+    "env": {
+      "AUTH_MODE": "dev",
+      "DEV_ADMIN_SUBS": "dev|admin"
+    },
+    "principal_sub": "dev|admin",
+    "payload": {
+      "question": "このPDFについて教えて",
+      "debug": true,
+      "k": 2
+    },
+    "expect": {
+      "status": 422,
+      "error_code": "ambiguous_reference"
+    }
+  },
+  {
+    "name": "cjk_user_debug_true_no_admin",
+    "env": {
+      "AUTH_MODE": "dev",
+      "DEV_ADMIN_SUBS": ""
+    },
+    "principal_sub": "dev|user",
+    "payload": {
+      "question": "要点を3つ教えて",
+      "debug": true,
+      "run_id": "run-user-cjk",
+      "k": 3
+    },
+    "run": {
+      "exists": true,
+      "id": "run-user-cjk"
+    },
+    "fetch": {
+      "rows": [
+        {
+          "id": "chunk-uja-1",
+          "document_id": "doc-uja",
+          "filename": "uja.pdf",
+          "page": 1,
+          "chunk_index": 0,
+          "text": "User cjk text",
+          "dist": 0.3
+        }
+      ],
+      "debug": {
+        "strategy": "vector_by_run_user",
+        "vec_count": 1,
+        "merged_count": 1,
+        "used_trgm": false
+      }
+    },
+    "answer": {
+      "text": "User cjk answer",
+      "citations": [
+        "doc-uja"
+      ]
+    },
+    "expect": {
+      "status": 200,
+      "retrieval_debug": {
+        "present": false
+      }
+    }
+  },
+  {
+    "name": "english_admin_no_run",
+    "env": {
+      "AUTH_MODE": "dev",
+      "DEV_ADMIN_SUBS": "dev|admin",
+      "ADMIN_DEBUG_STRATEGY": "firstk"
+    },
+    "principal_sub": "dev|admin",
+    "payload": {
+      "question": "List key points",
+      "debug": true,
+      "k": 2
+    },
+    "fetch": {
+      "rows": [
+        {
+          "id": "chunk-nr-1",
+          "document_id": "doc-nr",
+          "filename": "nr.pdf",
+          "page": 1,
+          "chunk_index": 0,
+          "text": "No run text",
+          "dist": 0.15
+        }
+      ],
+      "debug": {
+        "strategy": "hybrid_rrf_all_docs_admin",
+        "vec_count": 1,
+        "merged_count": 1,
+        "used_trgm": false
+      }
+    },
+    "answer": {
+      "text": "Admin answer no run",
+      "citations": [
+        "doc-nr"
+      ]
+    },
+    "expect": {
+      "status": 200,
+      "retrieval_debug": {
+        "present": true,
+        "strategy": "hybrid_rrf_all_docs_admin",
+        "min_count": 1,
+        "used_trgm": false
+      }
+    }
+  },
+  {
+    "name": "english_user_debug_true_no_include",
+    "env": {
+      "AUTH_MODE": "dev",
+      "DEV_ADMIN_SUBS": ""
+    },
+    "principal_sub": "dev|user",
+    "payload": {
+      "question": "Provide analysis",
+      "debug": true,
+      "k": 2
+    },
+    "fetch": {
+      "rows": [
+        {
+          "id": "chunk-an-1",
+          "document_id": "doc-an",
+          "filename": "an.pdf",
+          "page": 1,
+          "chunk_index": 0,
+          "text": "Analysis text",
+          "dist": 0.22
+        }
+      ],
+      "debug": {
+        "strategy": "hybrid_rrf_all_docs_user",
+        "vec_count": 1,
+        "merged_count": 1,
+        "used_trgm": false
+      }
+    },
+    "answer": {
+      "text": "User analysis answer",
+      "citations": [
+        "doc-an"
+      ]
+    },
+    "expect": {
+      "status": 200,
+      "retrieval_debug": {
+        "present": false
+      }
+    }
+  },
+  {
+    "name": "english_admin_hybrid_min_count",
+    "env": {
+      "AUTH_MODE": "dev",
+      "DEV_ADMIN_SUBS": "dev|admin",
+      "ADMIN_DEBUG_STRATEGY": "hybrid"
+    },
+    "principal_sub": "dev|admin",
+    "payload": {
+      "question": "Summarize improvements",
+      "debug": true,
+      "run_id": "run-min-count",
+      "k": 5
+    },
+    "run": {
+      "exists": true,
+      "id": "run-min-count"
+    },
+    "fetch": {
+      "rows": [
+        {
+          "id": "chunk-mc-1",
+          "document_id": "doc-mc",
+          "filename": "mc.pdf",
+          "page": 1,
+          "chunk_index": 0,
+          "text": "Hybrid text",
+          "dist": 0.18
+        }
+      ],
+      "debug": {
+        "strategy": "hybrid_rrf_by_run_admin",
+        "vec_count": 2,
+        "merged_count": 3,
+        "used_trgm": false
+      }
+    },
+    "answer": {
+      "text": "Hybrid answer",
+      "citations": [
+        "doc-mc"
+      ]
+    },
+    "expect": {
+      "status": 200,
+      "retrieval_debug": {
+        "present": true,
+        "strategy": "hybrid_rrf_by_run_admin",
+        "min_count": 3,
+        "used_trgm": false
+      }
+    }
+  }
+]
