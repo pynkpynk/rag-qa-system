@@ -10,6 +10,8 @@ import hashlib
 import hmac
 from typing import Any, Iterable, Literal, Annotated
 
+import sys
+
 from fastapi import APIRouter, Depends, HTTPException, Request
 from openai import OpenAI
 from pydantic import BaseModel, Field, model_validator
@@ -17,6 +19,7 @@ from sqlalchemy import text as sql_text
 from sqlalchemy.orm import Session
 
 from app.core.authz import Principal, is_admin, require_permissions, effective_auth_mode
+from app.core.config import settings
 from app.core.run_access import ensure_run_access
 from app.core.output_contract import sanitize_nonfinite_floats
 from app.db.models import Run
@@ -854,15 +857,62 @@ def fetch_chunks(
 # Embedding helpers (lazy init)
 # ============================================================
 
+EMBED_DIM = int(os.getenv("EMBED_DIM", "1536") or "1536")
+
+
+def _truthy(value: str | None) -> bool:
+    return (value or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _is_pytest() -> bool:
+    return bool(os.getenv("PYTEST_CURRENT_TEST")) or "pytest" in sys.modules
+
+
+def _is_offline() -> bool:
+    override = os.getenv("OPENAI_OFFLINE")
+    if override is not None:
+        return _truthy(override)
+    if getattr(settings, "openai_offline", False):
+        return True
+    auto = _is_pytest() or _truthy(os.getenv("CI")) or _truthy(os.getenv("GITHUB_ACTIONS"))
+    if auto:
+        os.environ["OPENAI_OFFLINE"] = "1"
+    return auto
+
+
+def _openai_offline() -> bool:
+    return _is_offline()
+
+
 _openai_client: OpenAI | None = None
+
+def _offline_embedding(text: str) -> list[float]:
+    digest = hashlib.sha256(text.encode("utf-8")).digest()
+    vec = [(b / 255.0) * 2 - 1 for b in digest]
+    while len(vec) < EMBED_DIM:
+        vec.extend(vec[: EMBED_DIM - len(vec)])
+    return vec[:EMBED_DIM]
+
+
+def _offline_answer(question: str, sources_context: str) -> tuple[str, list[str]]:
+    return "OFFLINE_MODE: stub response", []
+
 
 def _get_openai_client() -> OpenAI:
     global _openai_client
+    if _is_offline():
+        raise RuntimeError("OpenAI client disabled in offline mode")
     if _openai_client is None:
-        _openai_client = OpenAI()
+        api_key = settings.openai_api_key.get_secret_value()
+        if not api_key:
+            raise RuntimeError("OPENAI_API_KEY is required when OPENAI_OFFLINE=0")
+        _openai_client = OpenAI(api_key=api_key)
     return _openai_client
 
+
 def embed_query(question: str) -> list[float]:
+    if _is_offline():
+        return _offline_embedding(question)
     r = _get_openai_client().embeddings.create(model=EMBED_MODEL, input=question)
     return r.data[0].embedding
 
@@ -1122,6 +1172,8 @@ def build_chat_kwargs(
     return kwargs
 
 def call_llm(model: str, gen: dict[str, Any], question: str, sources_context: str, repair_note: str | None) -> str:
+    if _is_offline():
+        return _offline_answer(question, sources_context)[0]
     kwargs = build_chat_kwargs(model, gen, question, sources_context, repair_note)
     return _chat_create_with_fallback(_get_openai_client(), kwargs)
 
@@ -1132,6 +1184,8 @@ def answer_with_contract(
     sources_context: str,
     allowed_ids: set[str],
 ) -> tuple[str, list[str]]:
+    if _is_offline():
+        return _offline_answer(question, sources_context)
     repair_note: str | None = None
 
     for attempt in range(CONTRACT_RETRIES + 1):

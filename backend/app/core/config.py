@@ -8,6 +8,7 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     openai_api_key: str = Field(...)
+    openai_offline: bool = Field(False, alias="OPENAI_OFFLINE")
     database_url: str = Field(...)
     cors_origin: str = Field(...)
     upload_dir: str = Field("data/uploads")

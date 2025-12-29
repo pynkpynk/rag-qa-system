@@ -44,6 +44,7 @@ jobs:
           MAX_REQUEST_BYTES: '1024'
           RATE_LIMIT_ENABLED: '0'
           ADMIN_SUBS: smoke-ci-dummy-sub
+          OPENAI_OFFLINE: '1'
         run: |
           . .venv/bin/activate
           cd backend
@@ -56,6 +57,7 @@ jobs:
           DATABASE_URL: postgresql://user:pass@localhost:5432/devdb
           OPENAI_API_KEY: sk-fake-REDACTED
           CORS_ORIGIN: http://localhost:5173
+          OPENAI_OFFLINE: '1'
         run: |
           . .venv/bin/activate
           cd backend

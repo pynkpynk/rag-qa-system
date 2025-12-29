@@ -2,6 +2,8 @@ import logging
 import os
 from pathlib import Path
 
+os.environ.setdefault("OPENAI_OFFLINE", "1")
+
 import pytest
 
 from app.core.log_leak_scan import scan_file, format_report

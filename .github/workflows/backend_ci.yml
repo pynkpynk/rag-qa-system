@@ -1,4 +1,4 @@
-name: Backend CI
+name: Backend Tests
 
 on:
   push:
@@ -7,6 +7,8 @@ on:
       - develop
       - feat/**
   pull_request:
+  workflow_dispatch:
+
 
 jobs:
   tests:
@@ -31,17 +33,19 @@ jobs:
           if [ -f requirements-dev.txt ]; then python -m pip install -r requirements-dev.txt; fi
 
       - name: Run pytest
+        env:
+          OPENAI_OFFLINE: '1'
         run: python -m pytest -q
 
       - name: Check smoke scripts syntax
         run: |
           bash -n scripts/smoke.sh
-          bash -n backend/scripts/smoke.sh
+          bash -n ../scripts/smoke.sh
 
       - name: Validate env (dev mode)
         env:
           DATABASE_URL: postgresql://user:pass@localhost:5432/devdb
-          OPENAI_API_KEY: sk-test-REDACTED
+          OPENAI_API_KEY: sk-fake-REDACTED
           AUTH_MODE: dev
           APP_ENV: dev
         run: python scripts/validate_env.py
@@ -49,7 +53,7 @@ jobs:
       - name: Validate env (prod strict)
         env:
           DATABASE_URL: postgresql://user:pass@localhost:5432/proddb
-          OPENAI_API_KEY: sk-test-REDACTED
+          OPENAI_API_KEY: sk-fake-REDACTED
           AUTH_MODE: dev
           APP_ENV: prod
           ALLOW_PROD_DEBUG: "0"
@@ -59,7 +63,7 @@ jobs:
       - name: Validate env (auth0 mode)
         env:
           DATABASE_URL: postgresql://user:pass@localhost:5432/auth0db
-          OPENAI_API_KEY: sk-test-REDACTED
+          OPENAI_API_KEY: sk-fake-REDACTED
           AUTH_MODE: auth0
           AUTH0_DOMAIN: demo-tenant.us.auth0.com
           AUTH0_AUDIENCE: https://api.example.com
