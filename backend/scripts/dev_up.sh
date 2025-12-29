@@ -62,13 +62,26 @@ EOF
     exit 1
 fi
 
-REQUIRED_VARS=("ADMIN_SUBS" "AUTH0_DOMAIN" "AUTH0_AUDIENCE")
-for key in "${REQUIRED_VARS[@]}"; do
-    if [[ -z "${!key:-}" ]]; then
-        echo "[dev_up] Required env ${key} is missing. Check ${ENV_FILE}." >&2
-        exit 1
-    fi
-done
+# -------------------------------
+# Env validation (mode-aware)
+# -------------------------------
+AUTH_MODE_EFFECTIVE="${AUTH_MODE:-auth0}"
+
+if [[ "${AUTH_MODE_EFFECTIVE}" != "dev" ]]; then
+    # Auth0 mode requires these to be present (CI doesn't have .env.local)
+    REQUIRED_VARS=("AUTH0_DOMAIN" "AUTH0_AUDIENCE" "AUTH0_ISSUER")
+    for key in "${REQUIRED_VARS[@]}"; do
+        if [[ -z "${!key:-}" ]]; then
+            echo "[dev_up] Required env ${key} is missing. Check ${ENV_FILE}." >&2
+            exit 1
+        fi
+    done
+fi
+
+# ADMIN_SUBS is optional, but show a hint if empty (especially useful in CI)
+if [[ -z "${ADMIN_SUBS:-}" ]]; then
+    echo "[dev_up] Note: ADMIN_SUBS is empty. Admin debug features may be unavailable." >&2
+fi
 
 if [[ -n "${ADMIN_TOKEN:-}" ]]; then
     ADMIN_DEBUG_TOKEN_SHA256_LIST="$("${PYTHON_BIN}" - <<'PY'
@@ -92,8 +105,9 @@ RELOAD_FLAG="enabled"
 if [[ "${DEV_RELOAD:-1}" == "0" ]]; then
     RELOAD_FLAG="disabled"
 fi
+
 echo "[dev_up] Starting uvicorn on ${HOST}:${PORT} via ${PYTHON_BIN} (reload ${RELOAD_FLAG})"
-echo "[dev_up] Flags: AUTH_MODE=${AUTH_MODE:-auth0} ADMIN_DEBUG_STRATEGY=${ADMIN_DEBUG_STRATEGY} ENABLE_RETRIEVAL_DEBUG=${ENABLE_RETRIEVAL_DEBUG} RETRIEVAL_DEBUG_REQUIRE_TOKEN_HASH=${RETRIEVAL_DEBUG_REQUIRE_TOKEN_HASH} MAX_REQUEST_BYTES=${MAX_REQUEST_BYTES:-unset} RATE_LIMIT_ENABLED=${RATE_LIMIT_ENABLED:-0}"
+echo "[dev_up] Flags: AUTH_MODE=${AUTH_MODE_EFFECTIVE} ADMIN_DEBUG_STRATEGY=${ADMIN_DEBUG_STRATEGY} ENABLE_RETRIEVAL_DEBUG=${ENABLE_RETRIEVAL_DEBUG} RETRIEVAL_DEBUG_REQUIRE_TOKEN_HASH=${RETRIEVAL_DEBUG_REQUIRE_TOKEN_HASH} MAX_REQUEST_BYTES=${MAX_REQUEST_BYTES:-unset} RATE_LIMIT_ENABLED=${RATE_LIMIT_ENABLED:-0}"
 echo "[dev_up] Logs: ${LOG_FILE}"
 
 touch "${LOG_FILE}"
@@ -103,6 +117,7 @@ UVICORN_CMD=("${PYTHON_BIN}" -m uvicorn app.main:app --host "${HOST}" --port "${
 if [[ "${DEV_RELOAD:-1}" != "0" ]]; then
     UVICORN_CMD+=(--reload)
 fi
+
 SETSID_BIN="$(command -v setsid || true)"
 if [[ -n "${SETSID_BIN}" ]]; then
     "${SETSID_BIN}" "${UVICORN_CMD[@]}" >> "${LOG_FILE}" 2>&1 &
