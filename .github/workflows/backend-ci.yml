@@ -7,6 +7,8 @@ on:
       - develop
       - feat/**
   pull_request:
+  workflow_dispatch:
+
 
 jobs:
   smoke:
@@ -48,6 +50,12 @@ jobs:
           bash scripts/smoke.sh
 
       - name: Run pytest
+        env:
+          APP_ENV: dev
+          AUTH_MODE: dev
+          DATABASE_URL: postgresql://user:pass@localhost:5432/devdb
+          OPENAI_API_KEY: sk-fake-REDACTED
+          CORS_ORIGIN: http://localhost:5173
         run: |
           . .venv/bin/activate
           cd backend
