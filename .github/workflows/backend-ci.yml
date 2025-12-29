@@ -1,0 +1,53 @@
+name: Backend Smoke
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+      - feat/**
+  pull_request:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Create venv and install deps
+        run: |
+          python -m venv .venv
+          . .venv/bin/activate
+          python -m pip install --upgrade pip
+          python -m pip install -r backend/requirements.txt
+          if [ -f backend/requirements-dev.txt ]; then python -m pip install -r backend/requirements-dev.txt; fi
+
+      - name: Script syntax checks
+        run: |
+          . .venv/bin/activate
+          bash -n backend/scripts/smoke.sh
+          bash -n backend/scripts/dev_up.sh
+          bash -n backend/scripts/dev_down.sh
+
+      - name: Run backend smoke
+        env:
+          APP_ENV: dev
+          AUTH_MODE: dev
+          MAX_REQUEST_BYTES: '1024'
+          RATE_LIMIT_ENABLED: '0'
+        run: |
+          . .venv/bin/activate
+          cd backend
+          bash scripts/smoke.sh
+
+      - name: Run pytest
+        run: |
+          . .venv/bin/activate
+          cd backend
+          python -m pytest -q
