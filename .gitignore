@@ -25,6 +25,8 @@ __MACOSX/
 .env
 .env.*
 !.env.example
+backend/.env.local
+backend/.devserver.pid
 
 # Vercel / Render local metadata
 .vercel/
@@ -81,13 +83,25 @@ storage/
 tmp/
 
 # =========================
-# Node / Vite (frontend)
+# Node / Frontend (Next.js)
 # =========================
+# node_modules (safety for monorepo/future packages)
+node_modules/
+
+# Frontend specific
 frontend/node_modules/
 frontend/dist/
 frontend/.vite/
 frontend/.cache/
 frontend/coverage/
+
+# Next.js build artifacts
+frontend/.next/
+frontend/.turbo/
+frontend/out/
+
+# Frontend secrets
+frontend/.env.local
 
 # npm/yarn/pnpm debug logs
 npm-debug.log*

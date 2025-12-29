@@ -55,6 +55,9 @@ class Run(Base):
     id = Column(String, primary_key=True, default=gen_uuid)
     created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
 
+    # ✅ NEW: runs の所有者（Auth0 sub）
+    owner_sub = Column(String, index=True, nullable=True)
+
     config = Column(JSON, nullable=False)
 
     status = Column(String, default="created", nullable=False)
@@ -83,6 +86,8 @@ class Document(Base):
     error = Column(String, nullable=True)
 
     content_hash = Column(String(64), unique=True, index=True, nullable=True)
+
+    owner_sub = Column(String, index=True, nullable=True)
 
     # ✅ NEW: S3 object key を入れる（例: "uploads/<doc_id>/<hash>_file.pdf"）
     storage_key = Column(Text, nullable=True)
