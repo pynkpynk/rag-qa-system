@@ -2,6 +2,9 @@ import logging
 import os
 from pathlib import Path
 
+os.environ.setdefault("APP_ENV", "dev")
+os.environ.setdefault("AUTH_MODE", "dev")
+os.environ.setdefault("DEV_SUB", "test-user")
 os.environ.setdefault("OPENAI_OFFLINE", "1")
 
 import pytest

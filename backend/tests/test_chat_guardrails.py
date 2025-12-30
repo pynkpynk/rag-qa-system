@@ -30,6 +30,7 @@ class DummyRequest:
         self.headers = {}
         if authorization is not None:
             self.headers["authorization"] = authorization
+        self.state = SimpleNamespace(request_id=None)
 
 class DummyResult:
     def __init__(self, rows):
@@ -243,11 +244,6 @@ def test_debug_meta_for_admin_debug_request():
     assert meta["used_fts"] is True
 
 def test_prod_env_forces_debug_off(monkeypatch):
-    class RequestStub:
-        def __init__(self):
-            self.headers = {}
-            self.state = SimpleNamespace(request_id="prod-req")
-
     class DummyDB:
         def commit(self):
             return None
@@ -292,7 +288,8 @@ def test_prod_env_forces_debug_off(monkeypatch):
     monkeypatch.setattr(chat, "_emit_audit_event", lambda **kwargs: events.append(kwargs))
 
     payload = AskPayload(question="Explain prod behavior", k=2, debug=True)
-    request = RequestStub()
+    request = DummyRequest(None)
+    request.state.request_id = "prod-req"
     principal = Principal(sub="prod|admin", permissions={"read:docs"})
 
     resp = chat.ask(payload, request, db=DummyDB(), p=principal)
@@ -308,6 +305,26 @@ def test_prod_env_forces_debug_off(monkeypatch):
         assert "used_trgm" not in ev
         assert "trgm_available" not in ev
 
+
+def test_debug_meta_disabled_when_auth_mode_not_dev(monkeypatch):
+    class DummyDB:
+        def commit(self):
+            return None
+
+    monkeypatch.setenv("APP_ENV", "dev")
+    monkeypatch.setenv("ALLOW_PROD_DEBUG", "1")
+    monkeypatch.setattr(chat, "effective_auth_mode", lambda: "auth0")
+    monkeypatch.setattr(chat, "embed_query", lambda q: [0.0])
+    monkeypatch.setattr(chat, "fetch_chunks", lambda *args, **kwargs: ([], {}))
+    monkeypatch.setattr(chat, "answer_with_contract", lambda *args, **kwargs: ("answer", []))
+
+    payload = AskPayload(question="Explain dev auth", k=2, debug=True)
+    request = DummyRequest(None)
+    principal = Principal(sub="user|auth0", permissions={"read:docs"})
+
+    resp = chat.ask(payload, request, db=DummyDB(), p=principal)
+    assert "debug_meta" not in resp
+    assert "retrieval_debug" not in resp
 def test_chat_ask_blocks_run_not_owned(monkeypatch):
     class RequestStub:
         def __init__(self):
