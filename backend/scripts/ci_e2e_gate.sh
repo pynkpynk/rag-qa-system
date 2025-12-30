@@ -118,6 +118,8 @@ docker exec "${DB_CONTAINER}" psql -U postgres -d ragqa_ci -c "CREATE EXTENSION 
 
 export DATABASE_URL="postgresql+psycopg://postgres:postgres@127.0.0.1:${DB_PORT}/ragqa_ci"
 export OPENAI_OFFLINE="${OPENAI_OFFLINE:-1}"
+export OPENAI_API_KEY="${OPENAI_API_KEY:-sk-ci-dummy}"
+export CORS_ORIGIN="${CORS_ORIGIN:-http://localhost:5173}"
 export AUTH_MODE="dev"
 export DEV_SUB="${DEV_SUB:-ci-user}"
 export ADMIN_SUBS="${ADMIN_SUBS:-ci-user}"
