@@ -1,7 +1,7 @@
 """run_documents created_at default now
 
 Revision ID: c8655eb58bc8
-Revises: c8655eb58bc8
+Revises: 98b5063e46c8
 Create Date: 2025-12-26
 
 """
@@ -51,4 +51,3 @@ def downgrade() -> None:
         nullable=False,
         server_default=None,
     )
-

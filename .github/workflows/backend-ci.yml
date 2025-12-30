@@ -12,8 +12,26 @@ on:
 jobs:
   smoke:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     env:
+      PYTHONPATH: backend
       OPENAI_OFFLINE: "1"
+      OPENAI_API_KEY: dummy
+      CORS_ORIGIN: http://localhost:5173
+      DATABASE_URL: postgresql+psycopg://postgres:postgres@localhost:5432/postgres
 
     steps:
       - name: Checkout
@@ -31,6 +49,23 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r backend/requirements.txt
           if [ -f backend/requirements-dev.txt ]; then python -m pip install -r backend/requirements-dev.txt; fi
+
+      - name: Wait for Postgres
+        run: |
+          for i in {1..30}; do
+            if nc -z localhost 5432; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Postgres did not become ready" >&2
+          exit 1
+
+      - name: Run Alembic migrations
+        run: |
+          . .venv/bin/activate
+          cd backend
+          alembic upgrade head
 
       - name: Script syntax checks
         run: |
@@ -55,10 +90,45 @@ jobs:
         env:
           APP_ENV: dev
           AUTH_MODE: dev
-          DATABASE_URL: postgresql://user:pass@localhost:5432/devdb
-          OPENAI_API_KEY: sk-fake-REDACTED
-          CORS_ORIGIN: http://localhost:5173
+          DATABASE_URL: ${{ env.DATABASE_URL }}
+          OPENAI_API_KEY: ${{ env.OPENAI_API_KEY }}
+          CORS_ORIGIN: ${{ env.CORS_ORIGIN }}
         run: |
           . .venv/bin/activate
           cd backend
           python -m pytest -q
+
+  e2e:
+    needs: smoke
+    runs-on: ubuntu-latest
+    env:
+      OPENAI_OFFLINE: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Create venv and install deps
+        run: |
+          python -m venv .venv
+          . .venv/bin/activate
+          python -m pip install --upgrade pip
+          python -m pip install -r backend/requirements.txt
+          if [ -f backend/requirements-dev.txt ]; then python -m pip install -r backend/requirements-dev.txt; fi
+
+      - name: Install tools
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Run CI E2E gate
+        env:
+          PYTHON_BIN: ${{ github.workspace }}/.venv/bin/python
+          DEV_SUB: ci-user
+          ADMIN_SUBS: ci-user
+        run: |
+          . .venv/bin/activate
+          cd backend
+          bash scripts/ci_e2e_gate.sh

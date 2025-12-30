@@ -22,15 +22,16 @@ fi
 # NOTE:
 # - Put this AFTER dotenv load, otherwise ".env.local" cannot override these values
 # - Only apply in CI/smoke contexts so local dev isn't accidentally forced to dummy values
+
 IS_CI=0
 if [[ "${GITHUB_ACTIONS:-}" == "true" || "${CI:-}" == "true" || "${RAGQA_SMOKE:-0}" == "1" ]]; then
     IS_CI=1
 fi
 
+export CORS_ORIGIN="${CORS_ORIGIN:-http://localhost:5173,http://127.0.0.1:5173}"
 if [[ "${IS_CI}" == "1" ]]; then
     export OPENAI_API_KEY="${OPENAI_API_KEY:-sk-smoke-ci-dummy}"
     export DATABASE_URL="${DATABASE_URL:-sqlite+pysqlite:////tmp/ragqa_smoke.db}"
-    export CORS_ORIGIN="${CORS_ORIGIN:-http://localhost:5173}"
 fi
 
 HOST="${DEV_SERVER_HOST:-127.0.0.1}"

@@ -12,6 +12,12 @@ from app.core.authz import Principal, require_permissions, is_admin
 from app.core.run_access import ensure_run_access
 from app.db.models import Document, Run
 from app.db.session import get_db
+from app.schemas.api_contract import (
+    RunCleanupResponse,
+    RunDeleteResponse,
+    RunDetailResponse,
+    RunListItem,
+)
 
 router = APIRouter()
 
@@ -23,22 +29,9 @@ class RunCreatePayload(BaseModel):
     config: dict = Field(..., description="Run configuration JSON")
     document_ids: list[str] | None = None
 
+
 class AttachDocsPayload(BaseModel):
     document_ids: list[str] = Field(..., min_length=1)
-
-class RunListItem(BaseModel):
-    run_id: str
-    created_at: str
-    status: str
-    document_ids: list[str]
-
-class RunDetailResponse(BaseModel):
-    run_id: str
-    created_at: str
-    config: dict[str, Any]
-    status: str
-    error: str | None
-    document_ids: list[str]
 
 # -------------------------
 # Helpers
@@ -199,7 +192,7 @@ def attach_docs(
     db.refresh(run)
     return _serialize_run_detail(run)
 
-@router.delete("/runs/{run_id}")
+@router.delete("/runs/{run_id}", response_model=RunDeleteResponse)
 def delete_run(
     run_id: str,
     confirm: str | None = Query(None, description='Required: "DELETE"'),
@@ -220,7 +213,7 @@ def delete_run(
     db.commit()
     return {"deleted": True, "run_id": run_id}
 
-@router.delete("/runs")
+@router.delete("/runs", response_model=RunCleanupResponse)
 def cleanup_runs(
     older_than_days: int = Query(7, ge=0, le=3650, description="Delete runs older than N days"),
     dry_run: bool = Query(True, description="Default true (safe). Set false to actually delete."),

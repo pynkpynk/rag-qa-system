@@ -1,14 +1,23 @@
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, Optional
+from typing import Optional
 
 import boto3
 from fastapi import APIRouter, Header, HTTPException, Query
 
+from app.schemas.api_contract import DebugAwsWhoAmIResponse, DebugS3HeadResponse
+from app.core.config import settings
+
 router = APIRouter()
 
+def _debug_allowed() -> bool:
+    env = (settings.app_env or "dev").strip().lower()
+    return env != "prod"
+
 def _require_debug_token(x_debug_token: Optional[str]) -> None:
+    if not _debug_allowed():
+        raise HTTPException(status_code=404, detail="Not Found")
     expected = os.getenv("DEBUG_TOKEN")
     # DEBUG_TOKEN 未設定ならデバッグ機能は無効化（404）
     if not expected:
@@ -28,8 +37,8 @@ def _s3_bucket() -> str:
         raise HTTPException(status_code=500, detail="S3_BUCKET is not set")
     return bucket
 
-@router.get("/_debug/aws-whoami")
-def aws_whoami(x_debug_token: Optional[str] = Header(default=None, alias="X-Debug-Token")) -> Dict[str, Any]:
+@router.get("/_debug/aws-whoami", response_model=DebugAwsWhoAmIResponse)
+def aws_whoami(x_debug_token: Optional[str] = Header(default=None, alias="X-Debug-Token")) -> DebugAwsWhoAmIResponse:
     _require_debug_token(x_debug_token)
 
     region = _aws_region()
@@ -55,11 +64,11 @@ def aws_whoami(x_debug_token: Optional[str] = Header(default=None, alias="X-Debu
         },
     }
 
-@router.get("/_debug/s3-head")
+@router.get("/_debug/s3-head", response_model=DebugS3HeadResponse)
 def s3_head(
     key: str = Query(..., description="S3 object key"),
     x_debug_token: Optional[str] = Header(default=None, alias="X-Debug-Token"),
-) -> Dict[str, Any]:
+) -> DebugS3HeadResponse:
     _require_debug_token(x_debug_token)
 
     region = _aws_region()
