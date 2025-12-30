@@ -2,6 +2,11 @@ import logging
 import os
 from pathlib import Path
 
+os.environ["APP_ENV"] = "dev"
+os.environ["AUTH_MODE"] = "dev"
+os.environ.setdefault("DEV_SUB", "test-user")
+os.environ.setdefault("OPENAI_OFFLINE", "1")
+
 import pytest
 
 from app.core.log_leak_scan import scan_file, format_report

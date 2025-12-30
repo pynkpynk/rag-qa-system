@@ -15,8 +15,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from pydantic import BaseModel
+from fastapi.encoders import jsonable_encoder
 
 from app.core.config import settings
+from app.core.authz import effective_auth_mode
 from app.middleware.security import (
     RequestIdMiddleware,
     SecurityHeadersMiddleware,
@@ -29,6 +31,7 @@ from app.api.routes.chat import router as chat_router
 from app.api.routes.chunks import router as chunks_router
 from app.api.routes.debug import router as debug_router
 from app.api.routes.search import router as search_router
+from app.schemas.api_contract import HealthResponse
 
 
 def smoke_endpoint_enabled() -> bool:
@@ -46,6 +49,24 @@ def _error_payload(code: str, message: str, details: Optional[Dict[str, Any]] = 
     if details is not None:
         payload["error"]["details"] = details
     return payload
+
+
+def _sanitize_validation_errors(errors: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    sanitized: list[dict[str, Any]] = []
+    for err in errors:
+        entry = dict(err)
+        ctx = entry.get("ctx")
+        if isinstance(ctx, dict):
+            safe_ctx: dict[str, Any] = {}
+            for key, value in ctx.items():
+                try:
+                    json.dumps(value)
+                    safe_ctx[key] = value
+                except TypeError:
+                    safe_ctx[key] = repr(value)
+            entry["ctx"] = safe_ctx
+        sanitized.append(entry)
+    return sanitized
 
 def normalize_http_exception_detail(detail: Any) -> Dict[str, Any] | None:
     if not isinstance(detail, dict):
@@ -124,13 +145,15 @@ def create_app() -> FastAPI:
 
     @app.exception_handler(RequestValidationError)
     async def validation_exception_handler(request: Request, exc: RequestValidationError):
+        details = {"errors": _sanitize_validation_errors(exc.errors())}
+        payload = _error_payload(
+            code="VALIDATION_ERROR",
+            message="Request validation failed.",
+            details=details,
+        )
         return JSONResponse(
             status_code=422,
-            content=_error_payload(
-                code="VALIDATION_ERROR",
-                message="Request validation failed.",
-                details={"errors": exc.errors()},
-            ),
+            content=jsonable_encoder(payload),
             headers={"x-request-id": getattr(request.state, "request_id", "")},
         )
 
@@ -145,18 +168,33 @@ def create_app() -> FastAPI:
         )
 
     # ---- Health ----
-    @app.get("/api/health")
-    def health():
+    @app.get("/api/health", response_model=HealthResponse)
+    def health() -> HealthResponse:
+        git_sha = os.getenv("GIT_SHA") or os.getenv("BUILD_ID") or "unknown"
         return {
             "app": app.title,
             "version": app.version,
             "status": "ok",
             "time_utc": datetime.now(timezone.utc).isoformat(),
+            "app_env": getattr(settings, "app_env", "dev"),
+            "auth_mode": effective_auth_mode(),
+            "git_sha": git_sha,
         }
 
     # ---- CORS ----
-    cors_origins_raw = getattr(settings, "cors_origins", "") or ""
-    origins = [o.strip() for o in cors_origins_raw.split(",") if o.strip()]
+    raw_origins = (
+        getattr(settings, "cors_origins", None)
+        or getattr(settings, "cors_origin", None)
+        or ""
+    )
+
+    def _clean_origin(value: str) -> str:
+        cleaned = value.strip()
+        while cleaned.endswith("/") and cleaned != "/":
+            cleaned = cleaned[:-1]
+        return cleaned
+
+    origins = [_clean_origin(o) for o in raw_origins.split(",") if _clean_origin(o)]
 
     app.add_middleware(
         CORSMiddleware,

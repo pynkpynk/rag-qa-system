@@ -4,7 +4,6 @@ import logging
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel
 from sqlalchemy import text as sql_text
 from sqlalchemy.orm import Session
 
@@ -12,6 +11,7 @@ from app.core.authz import Principal, require_permissions, is_admin
 from app.core.run_access import ensure_run_access
 from app.db.models import Chunk, Document, Run
 from app.db.session import get_db
+from app.schemas.api_contract import ChunkHealthResponse, ChunkResponse
 
 logger = logging.getLogger(__name__)
 
@@ -45,19 +45,6 @@ SELECT EXISTS(
   WHERE run_id = :run_id AND document_id = :document_id
 ) AS ok
 """
-
-
-# ------------------------------------------------------------
-# Response model
-# ------------------------------------------------------------
-
-class ChunkResponse(BaseModel):
-    chunk_id: str
-    document_id: str
-    filename: str | None
-    page: int | None
-    chunk_index: int
-    text: str
 
 
 # ------------------------------------------------------------
@@ -169,11 +156,11 @@ def _ensure_chunk_accessible_for_run(db: Session, run_id: UUID, document_id, p: 
 # Route
 # ------------------------------------------------------------
 
-@router.get("/chunks/health")
+@router.get("/chunks/health", response_model=ChunkHealthResponse)
 def chunks_health(
     p: Principal = Depends(require_permissions("read:docs")),
-) -> dict:
-    return {"ok": True, "principal_sub": getattr(p, "sub", None)}
+) -> ChunkHealthResponse:
+    return ChunkHealthResponse(ok=True, principal_sub=getattr(p, "sub", None))
 
 
 @router.get("/chunks/{chunk_id}", response_model=ChunkResponse)

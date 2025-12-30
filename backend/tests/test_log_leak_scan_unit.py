@@ -1,4 +1,5 @@
 from app.core.log_leak_scan import scan_text, format_report, scan_file
+from app.core.logging_utils import _apply_redaction
 
 
 def test_scan_text_detects_bearer_header():
@@ -37,3 +38,11 @@ def test_scan_file_accepts_string_path(tmp_path):
     log.write_text(sample)
     violations = scan_file(str(log))
     assert violations, "scan_file should detect violations from string paths"
+
+
+def test_log_redaction_masks_tokens():
+    message = "Authorization: Bearer dev-secret sk-TESTTOKEN1234567890"
+    sanitized = _apply_redaction(message)
+    assert "dev-secret" not in sanitized
+    assert "sk-TESTTOKEN" not in sanitized
+    assert "Bearer REDACTED" in sanitized

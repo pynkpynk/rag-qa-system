@@ -3,6 +3,9 @@ from __future__ import annotations
 import os
 import time
 from dataclasses import dataclass
+import hashlib
+import hmac
+import re
 from typing import Any, Dict, Optional, Set, Union
 
 import httpx
@@ -41,6 +44,10 @@ def _truthy(v: str) -> bool:
     return v.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _unauth_detail(message: str) -> Dict[str, str]:
+    return {"code": "NOT_AUTHENTICATED", "message": message}
+
+
 def _parse_csv(v: str) -> list[str]:
     return [x.strip() for x in v.split(",") if x.strip()]
 
@@ -51,6 +58,18 @@ def _admin_subs() -> Set[str]:
 
 def _dev_admin_subs() -> Set[str]:
     return set(_parse_csv(_env("DEV_ADMIN_SUBS")))
+
+
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _demo_token_hashes() -> Set[str]:
+    hashes: Set[str] = set()
+    for part in _parse_csv(_env("DEMO_TOKEN_SHA256_LIST")):
+        lower = part.lower()
+        if _SHA256_RE.fullmatch(lower):
+            hashes.add(lower)
+    return hashes
 
 
 def effective_auth_mode() -> str:
@@ -82,7 +101,7 @@ def _auth_disabled() -> bool:
 
 
 def _auth_mode() -> str:
-    # "auth0" (default) or "dev"
+    # "auth0" (default) or "dev" or "demo"
     return (_env("AUTH_MODE", "auth0") or "auth0").lower()
 
 
@@ -90,13 +109,15 @@ def _effective_mode() -> str:
     """
     Priority:
       1) AUTH_DISABLED=1 -> "disabled"
-      2) AUTH_MODE=dev   -> "dev"
+      2) AUTH_MODE in {"dev","demo"} -> same
       3) otherwise       -> "auth0"
     """
     if _auth_disabled():
         return "disabled"
     m = _auth_mode()
-    return "dev" if m == "dev" else "auth0"
+    if m in {"dev", "demo"}:
+        return m
+    return "auth0"
 
 
 def _normalize_domain(domain: str) -> str:
@@ -212,7 +233,7 @@ def _pick_key(jwks: Dict[str, Any], kid: str) -> Dict[str, Any]:
     for k in jwks.get("keys", []):
         if k.get("kid") == kid:
             return k
-    raise HTTPException(status_code=401, detail="Invalid token (kid not found)")
+    raise HTTPException(status_code=401, detail=_unauth_detail("Invalid token (kid not found)"))
 
 
 def _extract_permissions(payload: Dict[str, Any]) -> Set[str]:
@@ -243,7 +264,8 @@ def _maybe_guard_prod_mode() -> None:
     """
     if _truthy(_env("AUTH_BYPASS_ALLOW_IN_PROD", "0")):
         return
-    if _is_production() and _effective_mode() in {"dev", "disabled"}:
+    mode = _effective_mode()
+    if _is_production() and mode in {"dev", "disabled"}:
         raise RuntimeError("Auth bypass (AUTH_MODE=dev or AUTH_DISABLED=1) is not allowed in production.")
 
 
@@ -258,11 +280,11 @@ def _decode_and_validate(token: str) -> Principal:
     try:
         header = jwt.get_unverified_header(token)
     except Exception:
-        raise HTTPException(status_code=401, detail="Invalid token (bad header)")
+        raise HTTPException(status_code=401, detail=_unauth_detail("Invalid token (bad header)"))
 
     kid = header.get("kid")
     if not kid:
-        raise HTTPException(status_code=401, detail="Invalid token (no kid)")
+        raise HTTPException(status_code=401, detail=_unauth_detail("Invalid token (no kid)"))
 
     try:
         jwks = _get_jwks(issuer)
@@ -282,13 +304,13 @@ def _decode_and_validate(token: str) -> Principal:
             issuer=issuer,
         )
     except JWTError:
-        raise HTTPException(status_code=401, detail="Invalid token")
+        raise HTTPException(status_code=401, detail=_unauth_detail("Invalid token"))
     except Exception:
-        raise HTTPException(status_code=401, detail="Invalid token")
+        raise HTTPException(status_code=401, detail=_unauth_detail("Invalid token"))
 
     sub = payload.get("sub")
     if not isinstance(sub, str) or not sub:
-        raise HTTPException(status_code=401, detail="Invalid token (no sub)")
+        raise HTTPException(status_code=401, detail=_unauth_detail("Invalid token (no sub)"))
 
     permissions = _extract_permissions(payload)
     return Principal(sub=sub, permissions=permissions)
@@ -300,17 +322,41 @@ def get_principal(
 ) -> Principal:
     _maybe_guard_prod_mode()
 
+    def _require_bearer_token() -> str:
+        if cred is None or cred.scheme.lower() != "bearer":
+            raise HTTPException(status_code=401, detail=_unauth_detail("Missing bearer token"))
+        token = (cred.credentials or "").strip()
+        if not token:
+            raise HTTPException(status_code=401, detail=_unauth_detail("Missing bearer token"))
+        return token
+
     mode = _effective_mode()
-    if mode in {"dev", "disabled"}:
-        # Optional: allow overriding sub for local multi-tenant testing
-        # curl -H "x-dev-sub: auth0|...."
+    if mode == "disabled":
         sub_override = request.headers.get("x-dev-sub")
         return _dev_principal(sub_override=sub_override)
 
-    # auth0 mode
-    if cred is None or cred.scheme.lower() != "bearer":
-        raise HTTPException(status_code=401, detail="Missing bearer token")
-    return _decode_and_validate(cred.credentials)
+    if mode == "dev":
+        token = _require_bearer_token()
+        if token.strip().lower() not in {"dev-token", "devtoken"}:
+            raise HTTPException(status_code=401, detail=_unauth_detail("Invalid dev token"))
+        sub_override = request.headers.get("x-dev-sub")
+        return _dev_principal(sub_override=sub_override)
+
+    if mode == "demo":
+        token = _require_bearer_token()
+        digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        allowed_hashes = _demo_token_hashes()
+        allowed = any(hmac.compare_digest(digest, h) for h in allowed_hashes)
+        if not allowed:
+            raise HTTPException(status_code=401, detail=_unauth_detail("Invalid token"))
+        sub = f"demo|{digest[:12]}"
+        perms = {"read:docs"}
+        return Principal(sub=sub, permissions=perms)
+
+    token = _require_bearer_token()
+    if token.strip().lower() == "dev-token":
+        raise HTTPException(status_code=401, detail=_unauth_detail("Dev token disabled in this environment"))
+    return _decode_and_validate(token)
 
 
 def require_permissions(*required: str):
@@ -328,3 +374,11 @@ def require_permissions(*required: str):
         return p
 
     return _dep
+
+
+def current_user(principal: Principal = Depends(get_principal)) -> Principal:
+    """
+    Dependency to resolve the current authenticated principal without enforcing extra scopes.
+    Use together with require_permissions(...) where scope checks are still required.
+    """
+    return principal

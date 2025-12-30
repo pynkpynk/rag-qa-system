@@ -4,8 +4,8 @@ from alembic import op
 
 
 # revision identifiers, used by Alembic.
-revision = "xxxxxxxx_add_chunks_fts"  # ←自動生成のIDに合わせてOK
-down_revision = None  # ←自動生成に合わせてOK
+revision = "4d5928029c13"  # ←自動生成のIDに合わせてOK
+down_revision = "0001_baseline"
 branch_labels = None
 depends_on = None
 

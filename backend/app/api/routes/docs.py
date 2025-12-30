@@ -5,24 +5,31 @@ import os
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Tuple
 
 import boto3
 from botocore.exceptions import ClientError
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, UploadFile, Query
-from fastapi.responses import RedirectResponse
-from pydantic import BaseModel
+from fastapi.responses import RedirectResponse, FileResponse
 from sqlalchemy import text as sql_text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.core.authz import Principal, require_permissions, is_admin
+from app.core.authz import Principal, require_permissions, is_admin, current_user
+from app.core.config import settings
 from app.db.models import Chunk, Document
 from app.db.session import SessionLocal, get_db
 from app.services.indexing import embed_texts, extract_pdf_pages, simple_chunk
 
 from app.core.run_access import ensure_run_access
+from app.schemas.api_contract import (
+    DocumentDetailResponse,
+    DocumentListItem,
+    DocumentPageChunkItem,
+    DocumentReindexResponse,
+    DocumentUploadResponse,
+)
 
 router = APIRouter()
 
@@ -30,8 +37,6 @@ router = APIRouter()
 # Config (S3 only)
 # =========================
 
-MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "25"))
-MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 PDF_MAGIC = b"%PDF-"
 ERROR_MAX_LEN = 900
 
@@ -42,6 +47,8 @@ S3_PRESIGN_EXPIRES = int(os.environ.get("S3_PRESIGN_EXPIRES", "900"))
 
 TMP_DIR = Path(os.environ.get("RAGQA_TMP_DIR", "/tmp/rag-qa-uploads"))
 TMP_DIR.mkdir(parents=True, exist_ok=True)
+LOCAL_STORAGE_DIR = Path(settings.upload_dir).resolve()
+LOCAL_STORAGE_DIR.mkdir(parents=True, exist_ok=True)
 
 SQL_DOC_ATTACHED_TO_RUN = """
 SELECT EXISTS(
@@ -54,11 +61,13 @@ SELECT EXISTS(
 _s3_client = None
 
 
+def _s3_configured() -> bool:
+    return bool(AWS_REGION and S3_BUCKET)
+
+
 def _require_s3_settings() -> None:
-    if not AWS_REGION:
-        raise RuntimeError("AWS_REGION (or AWS_DEFAULT_REGION) is not set")
-    if not S3_BUCKET:
-        raise RuntimeError("S3_BUCKET is not set")
+    if not _s3_configured():
+        raise RuntimeError("Object storage is not configured")
 
 
 def _get_s3():
@@ -87,6 +96,30 @@ def _require_pdf_extension(filename: str) -> None:
         raise HTTPException(status_code=400, detail="Only PDF files are supported.")
 
 
+def _require_pdf_content_type(upload: UploadFile) -> None:
+    ctype = (upload.content_type or "").split(";")[0].strip().lower()
+    if ctype and ctype != "application/pdf":
+        raise HTTPException(status_code=415, detail="Content-Type must be application/pdf.")
+
+
+def _max_upload_limits() -> Tuple[int, int]:
+    """
+    Returns (bytes, mb_ceiling).
+    Prefers runtime env override, otherwise settings.max_upload_bytes.
+    """
+    env_raw = os.getenv("MAX_UPLOAD_BYTES")
+    limit = None
+    if env_raw:
+        try:
+            limit = int(env_raw)
+        except ValueError:
+            limit = None
+    if not limit or limit <= 0:
+        limit = int(getattr(settings, "max_upload_bytes", 20_000_000))
+    mb = max(1, (limit + (1024 * 1024) - 1) // (1024 * 1024))
+    return limit, mb
+
+
 def _cleanup_file(path: Path | None) -> None:
     if not path:
         return
@@ -107,6 +140,7 @@ def _sha256_and_save_tmp(upload: UploadFile, tmp_path: Path) -> str:
     hasher = hashlib.sha256()
     total = 0
     first = True
+    limit_bytes, limit_mb = _max_upload_limits()
 
     with tmp_path.open("wb") as f:
         while True:
@@ -120,8 +154,8 @@ def _sha256_and_save_tmp(upload: UploadFile, tmp_path: Path) -> str:
                     raise HTTPException(status_code=400, detail="Invalid PDF file (missing %PDF- header).")
 
             total += len(buf)
-            if total > MAX_UPLOAD_BYTES:
-                raise HTTPException(status_code=413, detail=f"File too large. Max {MAX_UPLOAD_MB}MB is allowed.")
+            if total > limit_bytes:
+                raise HTTPException(status_code=413, detail=f"File too large. Max {limit_mb}MB is allowed.")
 
             hasher.update(buf)
             f.write(buf)
@@ -227,39 +261,55 @@ def _s3_download_to_tmp(key: str, suffix: str = ".pdf") -> Path:
     return tmp
 
 
-# =========================
-# Response Models
-# =========================
-
-class DocListItem(BaseModel):
-    document_id: str
-    filename: str
-    status: str
-    error: str | None = None
+def _local_storage_path(doc_id: str) -> Path:
+    return LOCAL_STORAGE_DIR / f"{doc_id}.pdf"
 
 
-class DocUploadResponse(BaseModel):
-    document_id: str
-    filename: str
-    status: str
-    dedup: bool = False
+def _resolve_local_path(path_value: str | None) -> Path:
+    if not path_value:
+        return LOCAL_STORAGE_DIR / "missing.pdf"
+    candidate = Path(path_value)
+    if not candidate.is_absolute():
+        candidate = LOCAL_STORAGE_DIR / candidate
+    return candidate
 
 
-class DocDetailResponse(BaseModel):
-    document_id: str
-    filename: str
-    status: str
-    error: str | None = None
-    content_hash: str | None = None
-    storage_key: str | None = None
-    meta: dict[str, Any] | None = None
-    created_at: str
+def _delete_local_file(path_value: str | None) -> None:
+    path = _resolve_local_path(path_value)
+    try:
+        path.unlink(missing_ok=True)
+    except Exception:
+        pass
 
 
-class DocPageChunkItem(BaseModel):
-    chunk_id: str
-    chunk_index: int
-    text: str
+def _doc_uses_local_storage(doc: Document) -> bool:
+    storage_meta = doc.meta or {}
+    storage_type = storage_meta.get("storage")
+    if storage_type:
+        return storage_type == "local"
+    return False
+
+
+def _truthy_env(name: str, default: str = "") -> bool:
+    return (os.getenv(name, default) or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _indexing_available() -> Tuple[bool, str | None]:
+    if _truthy_env("OPENAI_OFFLINE", "0"):
+        return True, None
+    secret = getattr(settings, "openai_api_key", None)
+    if hasattr(secret, "get_secret_value"):
+        api_key_value = secret.get_secret_value()
+    elif isinstance(secret, str):
+        api_key_value = secret
+    else:
+        api_key_value = str(secret or "")
+    api_key = (api_key_value or "").strip()
+    if not api_key:
+        return False, "OPENAI_API_KEY not configured"
+    if "dummy" in api_key.lower():
+        return False, "OPENAI_API_KEY is a placeholder"
+    return True, None
 
 
 # =========================
@@ -274,18 +324,34 @@ def index_document(doc_id: str) -> None:
         if not doc:
             return
 
+        ok, reason = _indexing_available()
+        if not ok:
+            doc.status = "failed"
+            doc.error = f"INDEXING_DISABLED: {reason}"
+            db.commit()
+            return
+
         doc.status = "indexing"
         doc.error = None
         db.commit()
 
         if not doc.storage_key:
-            raise RuntimeError("storage_key missing (S3-only mode)")
+            raise RuntimeError("storage_key missing")
 
-        try:
-            tmp_download = _s3_download_to_tmp(doc.storage_key, suffix=".pdf")
-            path = tmp_download
-        except ClientError as e:
-            raise RuntimeError(f"S3 download failed: {e}")
+        storage_meta = doc.meta or {}
+        storage_type = storage_meta.get("storage") or ("s3" if _s3_configured() else "local")
+
+        if storage_type == "local":
+            path_value = storage_meta.get("path") or doc.storage_key
+            path = _resolve_local_path(path_value)
+            if not path.exists():
+                raise RuntimeError("Local document missing")
+        else:
+            try:
+                tmp_download = _s3_download_to_tmp(doc.storage_key, suffix=".pdf")
+                path = tmp_download
+            except ClientError as e:
+                raise RuntimeError(f"S3 download failed: {e}")
 
         pages = extract_pdf_pages(str(path))
 
@@ -342,15 +408,20 @@ def index_document(doc_id: str) -> None:
 # Routes (RBAC + owner_sub)
 # =========================
 
-@router.post("/docs/upload", response_model=DocUploadResponse)
+@router.post(
+    "/docs/upload",
+    response_model=DocumentUploadResponse,
+    dependencies=[Depends(require_permissions("write:docs"))],
+)
 def upload_doc(
     background: BackgroundTasks,
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
-    p: Principal = Depends(require_permissions("write:docs")),
+    p: Principal = Depends(current_user),
 ):
     filename = _safe_filename(file.filename or "uploaded.pdf")
     _require_pdf_extension(filename)
+    _require_pdf_content_type(file)
 
     tmp_path = TMP_DIR / f"tmp_{uuid.uuid4().hex}_{filename}"
 
@@ -365,7 +436,7 @@ def upload_doc(
         )
         if existing:
             _cleanup_file(tmp_path)
-            return DocUploadResponse(
+            return DocumentUploadResponse(
                 document_id=existing.id,
                 filename=existing.filename,
                 status=existing.status,
@@ -373,19 +444,35 @@ def upload_doc(
             )
 
         doc_id = str(uuid.uuid4())
-        key = _s3_key_for(doc_id, content_hash, filename)
 
-        _s3_upload_file(tmp_path, key)
-        _cleanup_file(tmp_path)
+        if _s3_configured():
+            key = _s3_key_for(doc_id, content_hash, filename)
+            try:
+                _s3_upload_file(tmp_path, key)
+            except Exception as exc:  # noqa: BLE001
+                _cleanup_file(tmp_path)
+                raise HTTPException(
+                    status_code=503,
+                    detail={"error": {"code": "STORAGE_ERROR", "message": f"Failed to upload to object storage: {exc}"}},
+                ) from exc
+            _cleanup_file(tmp_path)
+            storage_key = key
+            storage_meta = {"storage": "s3", "bucket": S3_BUCKET, "key": key, "region": AWS_REGION}
+        else:
+            dest = _local_storage_path(doc_id)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path.replace(dest)
+            storage_key = dest.name
+            storage_meta = {"storage": "local", "path": dest.name}
 
         doc = Document(
             id=doc_id,
             filename=filename,
             status="indexing",  # ここでindexingにして二重commitを減らす
             content_hash=content_hash,
-            storage_key=key,
+            storage_key=storage_key,
             owner_sub=p.sub,
-            meta={"storage": "s3", "bucket": S3_BUCKET, "key": key, "region": AWS_REGION},
+            meta=storage_meta,
         )
         db.add(doc)
 
@@ -393,7 +480,10 @@ def upload_doc(
             db.commit()
         except IntegrityError:
             db.rollback()
-            _s3_delete_object(key)
+            if storage_meta.get("storage") == "s3":
+                _s3_delete_object(storage_key)
+            else:
+                _delete_local_file(storage_meta.get("path") or storage_key)
             # 競合時：同じuser+hash ができてたらそれを返す
             existing2 = (
                 db.query(Document)
@@ -401,7 +491,7 @@ def upload_doc(
                 .first()
             )
             if existing2:
-                return DocUploadResponse(
+                return DocumentUploadResponse(
                     document_id=existing2.id,
                     filename=existing2.filename,
                     status=existing2.status,
@@ -410,9 +500,21 @@ def upload_doc(
             raise
 
         db.refresh(doc)
+        ok, reason = _indexing_available()
+        if not ok:
+            doc.status = "failed"
+            doc.error = f"INDEXING_DISABLED: {reason}"
+            db.commit()
+            return DocumentUploadResponse(
+                document_id=doc.id,
+                filename=doc.filename,
+                status=doc.status,
+                dedup=False,
+            )
+
         background.add_task(index_document, doc.id)
 
-        return DocUploadResponse(
+        return DocumentUploadResponse(
             document_id=doc.id,
             filename=doc.filename,
             status=doc.status,
@@ -426,10 +528,14 @@ def upload_doc(
             pass
 
 
-@router.get("/docs", response_model=list[DocListItem])
+@router.get(
+    "/docs",
+    response_model=list[DocumentListItem],
+    dependencies=[Depends(require_permissions("read:docs"))],
+)
 def list_docs(
     db: Session = Depends(get_db),
-    p: Principal = Depends(require_permissions("read:docs")),
+    p: Principal = Depends(current_user),
 ):
     q = db.query(Document).order_by(Document.created_at.desc())
     if not is_admin(p):
@@ -437,7 +543,7 @@ def list_docs(
 
     docs = q.all()
     return [
-        DocListItem(
+        DocumentListItem(
             document_id=d.id,
             filename=d.filename,
             status=d.status,
@@ -447,16 +553,20 @@ def list_docs(
     ]
 
 
-@router.get("/docs/{document_id}", response_model=DocDetailResponse)
+@router.get(
+    "/docs/{document_id}",
+    response_model=DocumentDetailResponse,
+    dependencies=[Depends(require_permissions("read:docs"))],
+)
 def get_doc_detail(
     document_id: str,
     db: Session = Depends(get_db),
-    p: Principal = Depends(require_permissions("read:docs")),
+    p: Principal = Depends(current_user),
 ):
     doc = _get_doc_for_read(db, document_id, p)
 
     created_at = doc.created_at.isoformat() if isinstance(doc.created_at, datetime) else str(doc.created_at)
-    return DocDetailResponse(
+    return DocumentDetailResponse(
         document_id=doc.id,
         filename=doc.filename,
         status=doc.status,
@@ -468,13 +578,17 @@ def get_doc_detail(
     )
 
 
-@router.get("/docs/{document_id}/pages/{page}", response_model=list[DocPageChunkItem])
+@router.get(
+    "/docs/{document_id}/pages/{page}",
+    response_model=list[DocumentPageChunkItem],
+    dependencies=[Depends(require_permissions("read:docs"))],
+)
 def get_doc_page_chunks(
     document_id: str,
     page: int,
     run_id: str | None = Query(default=None),
     db: Session = Depends(get_db),
-    p: Principal = Depends(require_permissions("read:docs")),
+    p: Principal = Depends(current_user),
 ):
     doc = _get_doc_for_read(db, document_id, p)
     _enforce_run_access_if_needed(db, run_id, doc.id, p)
@@ -485,19 +599,35 @@ def get_doc_page_chunks(
         .order_by(Chunk.chunk_index.asc())
         .all()
     )
-    return [DocPageChunkItem(chunk_id=r.id, chunk_index=r.chunk_index, text=r.text) for r in rows]
+    return [DocumentPageChunkItem(chunk_id=r.id, chunk_index=r.chunk_index, text=r.text) for r in rows]
 
 
-@router.get("/docs/{document_id}/download")
+@router.get(
+    "/docs/{document_id}/download",
+    dependencies=[Depends(require_permissions("read:docs"))],
+)
 def download_doc(
     document_id: str,
     run_id: str | None = None,
     db: Session = Depends(get_db),
-    p: Principal = Depends(require_permissions("read:docs")),
+    p: Principal = Depends(current_user),
 ):
     doc = _get_doc_for_read(db, document_id, p)
     _enforce_run_access_if_needed(db, run_id, doc.id, p)
 
+
+    if _doc_uses_local_storage(doc):
+        local_path = _resolve_local_path((doc.meta or {}).get("path") or doc.storage_key)
+        if not local_path.exists():
+            _not_found()
+        safe = _safe_cd_filename(doc.filename)
+        return FileResponse(local_path, media_type="application/pdf", filename=safe)
+
+    if not _s3_configured():
+        raise HTTPException(
+            status_code=503,
+            detail={"error": {"code": "STORAGE_NOT_CONFIGURED", "message": "Object storage is not configured."}},
+        )
 
     if not doc.storage_key:
         raise HTTPException(status_code=500, detail="storage_key missing")
@@ -506,15 +636,32 @@ def download_doc(
     return RedirectResponse(url, status_code=307)
 
 
-@router.get("/docs/{document_id}/view")
+@router.get(
+    "/docs/{document_id}/view",
+    dependencies=[Depends(require_permissions("read:docs"))],
+)
 def view_pdf(
     document_id: str,
     run_id: str | None = None,
     db: Session = Depends(get_db),
-    p: Principal = Depends(require_permissions("read:docs")),
+    p: Principal = Depends(current_user),
 ):
     doc = _get_doc_for_read(db, document_id, p)
     _enforce_run_access_if_needed(db, run_id, doc.id, p)
+
+    if _doc_uses_local_storage(doc):
+        local_path = _resolve_local_path((doc.meta or {}).get("path") or doc.storage_key)
+        if not local_path.exists():
+            _not_found()
+        safe = _safe_cd_filename(doc.filename)
+        headers = {"Content-Disposition": f'inline; filename="{safe}"'}
+        return FileResponse(local_path, media_type="application/pdf", headers=headers)
+
+    if not _s3_configured():
+        raise HTTPException(
+            status_code=503,
+            detail={"error": {"code": "STORAGE_NOT_CONFIGURED", "message": "Object storage is not configured."}},
+        )
 
     if not doc.storage_key:
         raise HTTPException(status_code=500, detail="storage_key missing")
@@ -523,28 +670,43 @@ def view_pdf(
     return RedirectResponse(url, status_code=307)
 
 
-@router.post("/docs/{document_id}/reindex")
+@router.post(
+    "/docs/{document_id}/reindex",
+    response_model=DocumentReindexResponse,
+    dependencies=[Depends(require_permissions("write:docs"))],
+)
 def reindex_doc(
     document_id: str,
     background: BackgroundTasks,
     db: Session = Depends(get_db),
-    p: Principal = Depends(require_permissions("write:docs")),
+    p: Principal = Depends(current_user),
 ):
     doc = _get_doc_for_read(db, document_id, p)
+
+    ok, reason = _indexing_available()
+    if not ok:
+        doc.status = "failed"
+        doc.error = f"INDEXING_DISABLED: {reason}"
+        db.commit()
+        return DocumentReindexResponse(document_id=doc.id, queued=False, reason=reason)
 
     doc.status = "indexing"
     doc.error = None
     db.commit()
 
     background.add_task(index_document, doc.id)
-    return {"document_id": doc.id, "queued": True}
+    return DocumentReindexResponse(document_id=doc.id, queued=True)
 
 
-@router.delete("/docs/{document_id}", status_code=204)
+@router.delete(
+    "/docs/{document_id}",
+    status_code=204,
+    dependencies=[Depends(require_permissions("delete:docs"))],
+)
 def delete_doc(
     document_id: str,
     db: Session = Depends(get_db),
-    p: Principal = Depends(require_permissions("delete:docs")),
+    p: Principal = Depends(current_user),
 ):
     doc = _get_doc_for_read(db, document_id, p)
 
@@ -558,8 +720,11 @@ def delete_doc(
         db.rollback()
         raise
 
-    # S3は best-effort
-    if key:
+    # Storage cleanup is best-effort.
+    storage_meta = doc.meta or {}
+    if storage_meta.get("storage") == "local":
+        _delete_local_file(storage_meta.get("path") or key)
+    elif key and _s3_configured():
         _s3_delete_object(key)
 
     return None

@@ -115,17 +115,11 @@ class SearchResponse(BaseModel):
 # Helpers
 # ----------------------------
 def _embed_query(q: str) -> List[float]:
-    api_key = os.getenv("OPENAI_API_KEY") or ""
-    if not api_key:
-        raise RuntimeError("OPENAI_API_KEY is not set")
+    # Reuse the chat route helpers so OPENAI_OFFLINE logic (and future stubs)
+    # stay consistent across endpoints. Import locally to avoid circular imports.
+    from app.api.routes.chat import embed_query as _chat_embed_query  # noqa
 
-    model = os.getenv("EMBEDDING_MODEL") or "text-embedding-3-small"
-
-    from openai import OpenAI
-
-    client = OpenAI(api_key=api_key)
-    resp = client.embeddings.create(model=model, input=q)
-    emb = resp.data[0].embedding
+    emb = _chat_embed_query(q)
     if not isinstance(emb, list) or not emb:
         raise RuntimeError("Embedding response is empty")
     return emb

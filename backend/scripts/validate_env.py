@@ -71,7 +71,14 @@ def validate_env(strict: bool = False, env: Mapping[str, str] | None = None) -> 
         )
 
     auth_mode = (env_map.get("AUTH_MODE") or "auth0").strip().lower()
-    if auth_mode != "dev":
+    if auth_mode == "demo":
+        hashes = [h for h in (env_map.get("DEMO_TOKEN_SHA256_LIST") or "").split(",") if h.strip()]
+        add(
+            "demo_token_sha256_list",
+            bool(hashes),
+            "DEMO_TOKEN_SHA256_LIST must include at least one SHA256 digest when AUTH_MODE=demo.",
+        )
+    elif auth_mode != "dev":
         issuer = (env_map.get("AUTH0_ISSUER") or "").strip()
         domain = (env_map.get("AUTH0_DOMAIN") or "").strip()
         if issuer:

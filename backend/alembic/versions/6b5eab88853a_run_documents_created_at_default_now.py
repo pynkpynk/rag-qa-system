@@ -19,10 +19,49 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    """Upgrade schema."""
-    pass
+    """Ensure run_documents.created_at defaults to now() in an idempotent way."""
+    op.execute(
+        sa.text(
+            """
+            DO $$
+            BEGIN
+                IF EXISTS (
+                    SELECT 1
+                    FROM information_schema.columns
+                    WHERE table_name = 'run_documents'
+                      AND column_name = 'created_at'
+                ) THEN
+                    UPDATE run_documents
+                    SET created_at = now()
+                    WHERE created_at IS NULL;
+
+                    ALTER TABLE run_documents
+                    ALTER COLUMN created_at SET DEFAULT now();
+                END IF;
+            END;
+            $$;
+            """
+        )
+    )
 
 
 def downgrade() -> None:
-    """Downgrade schema."""
-    pass
+    op.execute(
+        sa.text(
+            """
+            DO $$
+            BEGIN
+                IF EXISTS (
+                    SELECT 1
+                    FROM information_schema.columns
+                    WHERE table_name = 'run_documents'
+                      AND column_name = 'created_at'
+                ) THEN
+                    ALTER TABLE run_documents
+                    ALTER COLUMN created_at DROP DEFAULT;
+                END IF;
+            END;
+            $$;
+            """
+        )
+    )

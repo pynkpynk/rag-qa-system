@@ -7,8 +7,8 @@ Create Date: 2025-12-24
 
 from __future__ import annotations
 
-import sqlalchemy as sa
 from alembic import op
+import sqlalchemy as sa
 
 
 # revision identifiers, used by Alembic.
@@ -19,8 +19,18 @@ depends_on = None
 
 
 def upgrade() -> None:
-    op.add_column("documents", sa.Column("owner_sub", sa.String(length=128), nullable=True))
-    op.create_index("ix_documents_owner_sub", "documents", ["owner_sub"], unique=False)
+    op.execute(
+        """
+        ALTER TABLE documents
+        ADD COLUMN IF NOT EXISTS owner_sub VARCHAR(128)
+        """
+    )
+    op.execute(
+        """
+        CREATE INDEX IF NOT EXISTS ix_documents_owner_sub
+        ON documents(owner_sub)
+        """
+    )
 
 
 def downgrade() -> None:

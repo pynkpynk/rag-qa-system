@@ -8,8 +8,18 @@ depends_on = None
 
 
 def upgrade() -> None:
-    op.add_column("runs", sa.Column("owner_sub", sa.String(length=128), nullable=True))
-    op.create_index("ix_runs_owner_sub", "runs", ["owner_sub"], unique=False)
+    op.execute(
+        """
+        ALTER TABLE runs
+        ADD COLUMN IF NOT EXISTS owner_sub VARCHAR(128)
+        """
+    )
+    op.execute(
+        """
+        CREATE INDEX IF NOT EXISTS ix_runs_owner_sub
+        ON runs(owner_sub)
+        """
+    )
 
 
 def downgrade() -> None:

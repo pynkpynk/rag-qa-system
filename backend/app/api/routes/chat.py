@@ -10,6 +10,8 @@ import hashlib
 import hmac
 from typing import Any, Iterable, Literal, Annotated
 
+import sys
+
 from fastapi import APIRouter, Depends, HTTPException, Request
 from openai import OpenAI
 from pydantic import BaseModel, Field, model_validator
@@ -17,10 +19,12 @@ from sqlalchemy import text as sql_text
 from sqlalchemy.orm import Session
 
 from app.core.authz import Principal, is_admin, require_permissions, effective_auth_mode
+from app.core.config import settings
 from app.core.run_access import ensure_run_access
 from app.core.output_contract import sanitize_nonfinite_floats
 from app.db.models import Run
 from app.db.session import get_db
+from app.schemas.api_contract import ChatResponse
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -410,6 +414,44 @@ ORDER BY c.document_id, c.page, c.chunk_index
 LIMIT :k
 """
 
+SQL_OFFLINE_FALLBACK_BY_RUN_ADMIN = """
+SELECT c.id, c.document_id, d.filename AS filename, c.page, c.chunk_index, c.text
+FROM run_documents rd
+JOIN chunks c ON c.document_id = rd.document_id
+JOIN documents d ON d.id = rd.document_id
+WHERE rd.run_id = :run_id
+ORDER BY COALESCE(c.page, 0), c.chunk_index
+LIMIT :k
+"""
+
+SQL_OFFLINE_FALLBACK_BY_RUN_USER = """
+SELECT c.id, c.document_id, d.filename AS filename, c.page, c.chunk_index, c.text
+FROM run_documents rd
+JOIN chunks c ON c.document_id = rd.document_id
+JOIN documents d ON d.id = rd.document_id
+WHERE rd.run_id = :run_id
+  AND d.owner_sub = :owner_sub
+ORDER BY COALESCE(c.page, 0), c.chunk_index
+LIMIT :k
+"""
+
+SQL_OFFLINE_FALLBACK_ALL_DOCS_ADMIN = """
+SELECT c.id, c.document_id, d.filename AS filename, c.page, c.chunk_index, c.text
+FROM chunks c
+JOIN documents d ON d.id = c.document_id
+ORDER BY COALESCE(c.page, 0), c.chunk_index
+LIMIT :k
+"""
+
+SQL_OFFLINE_FALLBACK_ALL_DOCS_USER = """
+SELECT c.id, c.document_id, d.filename AS filename, c.page, c.chunk_index, c.text
+FROM chunks c
+JOIN documents d ON d.id = c.document_id
+WHERE d.owner_sub = :owner_sub
+ORDER BY COALESCE(c.page, 0), c.chunk_index
+LIMIT :k
+"""
+
 SQL_FIRSTK_ALL_DOCS_ADMIN = """
 SELECT c.id, c.document_id, d.filename AS filename, c.page, c.chunk_index, c.text
 FROM chunks c
@@ -659,7 +701,7 @@ def fetch_chunks(
                 if debug is not None:
                     debug["strategy"] = "firstk_by_run_admin"
                     debug["count"] = len(rows)
-                return rows, debug
+                return _apply_offline_fallback(rows, db=db, run_id=run_id, p=p, k=k, debug=debug)
 
             if q_text and (ENABLE_HYBRID or use_trgm or force_admin_hybrid):
                 vec_k = HYBRID_VEC_K if ENABLE_HYBRID else k
@@ -690,7 +732,8 @@ def fetch_chunks(
                         debug["trgm_top5"] = _preview(aux_rows) if aux_rows else []
                     debug["merged_top5"] = _preview(merged)
 
-                return (merged if merged else vec[:k]), debug
+                rows = merged if merged else vec[:k]
+                return _apply_offline_fallback(rows, db=db, run_id=run_id, p=p, k=k, debug=debug)
 
             rows = [dict(r) for r in db.execute(sql_text(SQL_TOPK_BY_RUN_ADMIN), {"qvec": qvec_lit, "k": k, "run_id": run_id}).mappings().all()]
             if debug is not None:
@@ -698,7 +741,7 @@ def fetch_chunks(
                 debug["count"] = len(rows)
                 debug["vec_best_dist"] = _best_vec_dist(rows)
                 debug["top5"] = _preview(rows)
-            return rows, debug
+            return _apply_offline_fallback(rows, db=db, run_id=run_id, p=p, k=k, debug=debug)
 
         cnt_row = db.execute(sql_text(SQL_RUN_DOC_COUNT_USER), {"run_id": run_id, "owner_sub": p.sub}).mappings().first()
         if not cnt_row or int(cnt_row["cnt"]) == 0:
@@ -710,7 +753,7 @@ def fetch_chunks(
             if debug is not None:
                 debug["strategy"] = "firstk_by_run_user"
                 debug["count"] = len(rows)
-            return rows, debug
+            return _apply_offline_fallback(rows, db=db, run_id=run_id, p=p, k=k, debug=debug)
 
         if q_text and (ENABLE_HYBRID or use_trgm):
             vec_k = HYBRID_VEC_K if ENABLE_HYBRID else k
@@ -741,7 +784,8 @@ def fetch_chunks(
                     debug["trgm_top5"] = _preview(aux_rows) if aux_rows else []
                 debug["merged_top5"] = _preview(merged)
 
-            return (merged if merged else vec[:k]), debug
+            rows = merged if merged else vec[:k]
+            return _apply_offline_fallback(rows, db=db, run_id=run_id, p=p, k=k, debug=debug)
 
         rows = [dict(r) for r in db.execute(sql_text(SQL_TOPK_BY_RUN_USER), {"qvec": qvec_lit, "k": k, "run_id": run_id, "owner_sub": p.sub}).mappings().all()]
         if debug is not None:
@@ -749,7 +793,7 @@ def fetch_chunks(
             debug["count"] = len(rows)
             debug["vec_best_dist"] = _best_vec_dist(rows)
             debug["top5"] = _preview(rows)
-        return rows, debug
+        return _apply_offline_fallback(rows, db=db, run_id=run_id, p=p, k=k, debug=debug)
 
     is_summary = _is_summary_question(question)
     if force_admin_hybrid:
@@ -762,13 +806,13 @@ def fetch_chunks(
             if debug is not None:
                 debug["strategy"] = "firstk_all_docs_admin"
                 debug["count"] = len(rows)
-            return rows, debug
+            return _apply_offline_fallback(rows, db=db, run_id=run_id, p=p, k=k, debug=debug)
 
         rows = [dict(r) for r in db.execute(sql_text(SQL_FIRSTK_ALL_DOCS_USER), {"k": k_eff, "owner_sub": p.sub}).mappings().all()]
         if debug is not None:
             debug["strategy"] = "firstk_all_docs_user"
             debug["count"] = len(rows)
-        return rows, debug
+        return _apply_offline_fallback(rows, db=db, run_id=run_id, p=p, k=k, debug=debug)
 
     if is_admin(p):
         if q_text and (ENABLE_HYBRID or use_trgm or force_admin_hybrid):
@@ -800,7 +844,8 @@ def fetch_chunks(
                     debug["trgm_top5"] = _preview(aux_rows) if aux_rows else []
                 debug["merged_top5"] = _preview(merged)
 
-            return (merged if merged else vec[:k]), debug
+            rows = merged if merged else vec[:k]
+            return _apply_offline_fallback(rows, db=db, run_id=run_id, p=p, k=k, debug=debug)
 
         rows = [dict(r) for r in db.execute(sql_text(SQL_TOPK_ALL_DOCS_ADMIN), {"qvec": qvec_lit, "k": k}).mappings().all()]
         if debug is not None:
@@ -808,7 +853,7 @@ def fetch_chunks(
             debug["count"] = len(rows)
             debug["vec_best_dist"] = _best_vec_dist(rows)
             debug["top5"] = _preview(rows)
-        return rows, debug
+        return _apply_offline_fallback(rows, db=db, run_id=run_id, p=p, k=k, debug=debug)
 
     if q_text and (ENABLE_HYBRID or use_trgm):
         vec_k = HYBRID_VEC_K if ENABLE_HYBRID else k
@@ -839,7 +884,8 @@ def fetch_chunks(
                 debug["trgm_top5"] = _preview(aux_rows) if aux_rows else []
             debug["merged_top5"] = _preview(merged)
 
-        return (merged if merged else vec[:k]), debug
+        rows = merged if merged else vec[:k]
+        return _apply_offline_fallback(rows, db=db, run_id=run_id, p=p, k=k, debug=debug)
 
     rows = [dict(r) for r in db.execute(sql_text(SQL_TOPK_ALL_DOCS_USER), {"qvec": qvec_lit, "k": k, "owner_sub": p.sub}).mappings().all()]
     if debug is not None:
@@ -847,22 +893,189 @@ def fetch_chunks(
         debug["count"] = len(rows)
         debug["vec_best_dist"] = _best_vec_dist(rows)
         debug["top5"] = _preview(rows)
-    return rows, debug
+    return _apply_offline_fallback(rows, db=db, run_id=run_id, p=p, k=k, debug=debug)
 
 
 # ============================================================
 # Embedding helpers (lazy init)
 # ============================================================
 
+
+def _offline_chunk_sample(
+    db: Session,
+    *,
+    run_id: str | None,
+    p: Principal,
+    k: int,
+) -> list[dict[str, Any]]:
+    params: dict[str, Any] = {"k": max(1, k)}
+    if run_id:
+        params["run_id"] = run_id
+        if is_admin(p):
+            sql = SQL_OFFLINE_FALLBACK_BY_RUN_ADMIN
+        else:
+            sql = SQL_OFFLINE_FALLBACK_BY_RUN_USER
+            params["owner_sub"] = p.sub
+    else:
+        if is_admin(p):
+            sql = SQL_OFFLINE_FALLBACK_ALL_DOCS_ADMIN
+        else:
+            sql = SQL_OFFLINE_FALLBACK_ALL_DOCS_USER
+            params["owner_sub"] = p.sub
+    rows = db.execute(sql_text(sql), params).mappings().all()
+    return [dict(r) for r in rows]
+
+
+def _apply_offline_fallback(
+    rows: list[dict[str, Any]],
+    *,
+    db: Session,
+    run_id: str | None,
+    p: Principal,
+    k: int,
+    debug: dict[str, Any] | None,
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    if rows or not _is_offline():
+        return rows, debug
+    fallback = _offline_chunk_sample(db, run_id=run_id, p=p, k=k)
+    if fallback:
+        if debug is not None:
+            debug["strategy"] = debug.get("strategy") or "offline_fallback"
+            debug["offline_fallback"] = True
+            debug["count"] = len(fallback)
+        return fallback, debug
+    return rows, debug
+
+EMBED_DIM = int(os.getenv("EMBED_DIM", "1536") or "1536")
+
+
+def _truthy(value: str | None) -> bool:
+    return (value or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _is_pytest() -> bool:
+    return bool(os.getenv("PYTEST_CURRENT_TEST")) or "pytest" in sys.modules
+
+
+def _is_offline() -> bool:
+    override = os.getenv("OPENAI_OFFLINE")
+    if override is not None:
+        return _truthy(override)
+    if getattr(settings, "openai_offline", False):
+        return True
+    auto = _is_pytest() or _truthy(os.getenv("CI")) or _truthy(os.getenv("GITHUB_ACTIONS"))
+    if auto:
+        os.environ["OPENAI_OFFLINE"] = "1"
+    return auto
+
+
+def _openai_offline() -> bool:
+    return _is_offline()
+
+
 _openai_client: OpenAI | None = None
+
+def _offline_embedding(text: str) -> list[float]:
+    digest = hashlib.sha256(text.encode("utf-8")).digest()
+    vec = [(b / 255.0) * 2 - 1 for b in digest]
+    while len(vec) < EMBED_DIM:
+        vec.extend(vec[: EMBED_DIM - len(vec)])
+    return vec[:EMBED_DIM]
+
+
+def _offline_answer(question: str, sources_context: str) -> tuple[str, list[str]]:
+    return "OFFLINE_MODE: stub response", []
+
+
+def _extract_prefixed_line(text: str, prefix: str) -> str | None:
+    prefix_lower = prefix.lower()
+    for line in (text or "").splitlines():
+        trimmed = line.strip()
+        if trimmed.lower().startswith(prefix_lower):
+            return trimmed
+    return None
+
+
+def _offline_answer_from_rows(
+    rows: list[dict[str, Any]],
+    sources: list[dict[str, Any]],
+) -> tuple[str, list[str]]:
+    if not rows:
+        return "Offline mode answer unavailable.", []
+
+    source_ids = [src.get("source_id") or f"S{i+1}" for i, src in enumerate(sources)]
+    stakeholders_line = None
+    stakeholders_sid = None
+    evidence_line = None
+    evidence_sid = None
+
+    for idx, row in enumerate(rows):
+        text = str(row.get("text") or "")
+        sid = source_ids[idx] if idx < len(source_ids) else f"S{idx+1}"
+        if stakeholders_line is None:
+            line = _extract_prefixed_line(text, "stakeholders:")
+            if line:
+                stakeholders_line = line
+                stakeholders_sid = sid
+        if evidence_line is None:
+            line = _extract_prefixed_line(text, "evidence:")
+            if line:
+                evidence_line = line
+                evidence_sid = sid
+        if stakeholders_line and evidence_line:
+            break
+
+    parts: list[str] = []
+    used_ids: list[str] = []
+
+    def _append(line: str | None, sid: str | None) -> None:
+        if not line:
+            return
+        actual_sid = sid or (source_ids[0] if source_ids else "S1")
+        parts.append(f"- [{actual_sid}] {line}")
+        if actual_sid not in used_ids:
+            used_ids.append(actual_sid)
+
+    _append(stakeholders_line, stakeholders_sid)
+    _append(evidence_line, evidence_sid)
+
+    if not parts:
+        fallback_sid = source_ids[0] if source_ids else "S1"
+        snippet = ""
+        for row in rows:
+            text = (row.get("text") or "").strip()
+            if text:
+                snippet = text.splitlines()[0].strip()
+                if snippet:
+                    break
+        if not snippet:
+            snippet = "Offline mode summary based on available chunks."
+        parts.append(f"- [{fallback_sid}] {snippet}")
+        used_ids = [fallback_sid]
+
+    return "\n".join(parts), used_ids
+
 
 def _get_openai_client() -> OpenAI:
     global _openai_client
+    if _is_offline():
+        raise RuntimeError("OpenAI client disabled in offline mode")
     if _openai_client is None:
-        _openai_client = OpenAI()
+        api_key_obj = settings.openai_api_key
+        api_key = (
+    api_key_obj.get_secret_value()
+    if hasattr(api_key_obj, "get_secret_value")
+    else (api_key_obj or "")
+        )
+        if not api_key:
+            raise RuntimeError("OPENAI_API_KEY is required when OPENAI_OFFLINE=0")
+        _openai_client = OpenAI(api_key=api_key)
     return _openai_client
 
+
 def embed_query(question: str) -> list[float]:
+    if _is_offline():
+        return _offline_embedding(question)
     r = _get_openai_client().embeddings.create(model=EMBED_MODEL, input=question)
     return r.data[0].embedding
 
@@ -1122,6 +1335,8 @@ def build_chat_kwargs(
     return kwargs
 
 def call_llm(model: str, gen: dict[str, Any], question: str, sources_context: str, repair_note: str | None) -> str:
+    if _is_offline():
+        return _offline_answer(question, sources_context)[0]
     kwargs = build_chat_kwargs(model, gen, question, sources_context, repair_note)
     return _chat_create_with_fallback(_get_openai_client(), kwargs)
 
@@ -1132,6 +1347,8 @@ def answer_with_contract(
     sources_context: str,
     allowed_ids: set[str],
 ) -> tuple[str, list[str]]:
+    if _is_offline():
+        return _offline_answer(question, sources_context)
     repair_note: str | None = None
 
     for attempt in range(CONTRACT_RETRIES + 1):
@@ -1303,7 +1520,7 @@ def build_retrieval_debug_payload(
     _ensure_debug_count(merged)
     return sanitize_retrieval_debug(merged)
 
-@router.post("/chat/ask")
+@router.post("/chat/ask", response_model=ChatResponse)
 def ask(
     payload: AskPayload,
     request: Request,
@@ -1318,6 +1535,7 @@ def ask(
     feature_flag_enabled = bool(ENABLE_RETRIEVAL_DEBUG)
     payload_debug_requested = bool(payload.debug)
     payload_debug_flag = bool(payload_debug_requested and _debug_allowed_in_env())
+    debug_meta_allowed = bool(auth_mode_dev and payload_debug_flag)
     principal_sub = getattr(p, "sub", None)
     principal_hash = _safe_hash_identifier(principal_sub)
     is_admin_user = bool(principal_sub) and is_admin(p)
@@ -1332,13 +1550,14 @@ def ask(
         bearer_token=bearer_token,
         is_admin_user=is_admin_user,
     )
-    include_debug = should_include_retrieval_debug(
+    include_debug = auth_mode_dev and should_include_retrieval_debug(
         payload_debug_flag,
         is_admin_debug=is_admin_debug_user,
     )
     force_admin_hybrid = bool(auth_mode_dev and is_admin_debug_user and ADMIN_DEBUG_STRATEGY == "hybrid")
     trgm_enabled_flag = bool(ENABLE_TRGM)
     trgm_available_flag = _detect_trgm_available(db) if trgm_enabled_flag else False
+    offline_mode = _is_offline()
     debug_meta: dict[str, bool] | None = None
     debug_meta_for_errors: dict[str, bool] | None = None
     rows: list[dict[str, Any]] = []
@@ -1348,23 +1567,27 @@ def ask(
     try:
         q_clean = sanitize_question_for_llm(payload.question)
         is_cjk_query = query_class(q_clean) == "cjk"
-        base_debug_meta = build_debug_meta(
-            feature_flag_enabled=feature_flag_enabled,
-            payload_debug=payload_debug_flag,
-            is_admin=is_admin_user,
-            is_admin_debug=is_admin_debug_user,
-            auth_mode_dev=auth_mode_dev,
-            admin_via_sub=is_admin_user,
-            admin_via_token_hash=admin_via_token_hash,
-            include_debug=include_debug,
-            is_cjk=is_cjk_query,
-            used_fts=False,
-            used_trgm=False,
-            auth_header_present=auth_header_present,
-            bearer_token_present=bearer_token_present,
-            trgm_enabled=trgm_enabled_flag,
-            trgm_available=trgm_available_flag,
-            fts_skipped=is_cjk_query,
+        base_debug_meta = (
+            build_debug_meta(
+                feature_flag_enabled=feature_flag_enabled,
+                payload_debug=payload_debug_flag,
+                is_admin=is_admin_user,
+                is_admin_debug=is_admin_debug_user,
+                auth_mode_dev=auth_mode_dev,
+                admin_via_sub=is_admin_user,
+                admin_via_token_hash=admin_via_token_hash,
+                include_debug=include_debug,
+                is_cjk=is_cjk_query,
+                used_fts=False,
+                used_trgm=False,
+                auth_header_present=auth_header_present,
+                bearer_token_present=bearer_token_present,
+                trgm_enabled=trgm_enabled_flag,
+                trgm_available=trgm_available_flag,
+                fts_skipped=is_cjk_query,
+            )
+            if debug_meta_allowed
+            else None
         )
         debug_meta = base_debug_meta
         debug_meta_for_errors = base_debug_meta
@@ -1426,28 +1649,32 @@ def ask(
         used_trgm_flag = bool((retrieval_debug_raw or {}).get("used_trgm"))
         fts_skipped_flag = bool((retrieval_debug_raw or {}).get("fts_skipped"))
         trgm_available_meta = bool((retrieval_debug_raw or {}).get("trgm_available", trgm_available_flag))
-        debug_meta = build_debug_meta(
-            feature_flag_enabled=feature_flag_enabled,
-            payload_debug=payload_debug_flag,
-            is_admin=is_admin_user,
-            is_admin_debug=is_admin_debug_user,
-            auth_mode_dev=auth_mode_dev,
-            admin_via_sub=is_admin_user,
-            admin_via_token_hash=admin_via_token_hash,
-            include_debug=include_debug,
-            is_cjk=is_cjk_query,
-            used_fts=used_fts_flag,
-            used_trgm=used_trgm_flag,
-            auth_header_present=auth_header_present,
-            bearer_token_present=bearer_token_present,
-            trgm_enabled=trgm_enabled_flag,
-            trgm_available=trgm_available_meta,
-            fts_skipped=fts_skipped_flag,
+        debug_meta = (
+            build_debug_meta(
+                feature_flag_enabled=feature_flag_enabled,
+                payload_debug=payload_debug_flag,
+                is_admin=is_admin_user,
+                is_admin_debug=is_admin_debug_user,
+                auth_mode_dev=auth_mode_dev,
+                admin_via_sub=is_admin_user,
+                admin_via_token_hash=admin_via_token_hash,
+                include_debug=include_debug,
+                is_cjk=is_cjk_query,
+                used_fts=used_fts_flag,
+                used_trgm=used_trgm_flag,
+                auth_header_present=auth_header_present,
+                bearer_token_present=bearer_token_present,
+                trgm_enabled=trgm_enabled_flag,
+                trgm_available=trgm_available_meta,
+                fts_skipped=fts_skipped_flag,
+            )
+            if debug_meta_allowed
+            else None
         )
         debug_meta_for_errors = debug_meta
 
         # 2) retrieval信頼度ゲート（summary以外）
-        if rows and not _is_summary_question(payload.question):
+        if rows and not offline_mode and not _is_summary_question(payload.question):
             best = _best_vec_dist(rows)
             fts_count = int((retrieval_debug_raw or {}).get("fts_count", 0) or 0)
             if best is not None and float(best) > VEC_MAX_COS_DIST and fts_count == 0:
@@ -1544,7 +1771,10 @@ def ask(
             run.t1 = _utcnow()
             db.commit()
 
-        answer, used_ids = answer_with_contract(model, gen, payload.question, context, allowed_ids)
+        if offline_mode:
+            answer, used_ids = _offline_answer_from_rows(rows, sources)
+        else:
+            answer, used_ids = answer_with_contract(model, gen, payload.question, context, allowed_ids)
 
         if run:
             run.t2 = _utcnow()

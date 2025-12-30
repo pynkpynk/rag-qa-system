@@ -1,0 +1,9 @@
+.container {
+  display: block;
+  padding: 12px;
+}
+
+.title {
+  font-size: 18px;
+  font-weight: 600;
+}

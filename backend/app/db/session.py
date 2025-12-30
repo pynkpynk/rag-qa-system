@@ -18,10 +18,18 @@ engine = create_engine(
     pool_pre_ping=True,
 )
 
+_IS_POSTGRES = engine.url.get_backend_name().startswith("postgresql")
+
+
 @event.listens_for(engine, "connect")
 def _register_vector(dbapi_connection, connection_record) -> None:  # noqa: ARG001
-    # psycopg3 用
-    register_vector(dbapi_connection)
+    if not _IS_POSTGRES:
+        return
+    try:
+        register_vector(dbapi_connection)
+    except TypeError:
+        # Non-psycopg connections in tests/offline mode.
+        return
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
