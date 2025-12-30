@@ -10,6 +10,9 @@ class HealthResponse(BaseModel):
     version: str
     status: Literal["ok", "degraded", "error"] | str = Field(..., description="Overall health status")
     time_utc: str
+    app_env: str
+    auth_mode: str
+    git_sha: str
 
 
 class DocumentListItem(BaseModel):

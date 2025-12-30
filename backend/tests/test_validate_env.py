@@ -57,3 +57,32 @@ def test_missing_auth0_audience_has_hint():
     message = checks["auth0_audience"].message
     assert "API Identifier" in message
     assert "Auth0 Dashboard" in message
+
+
+def test_demo_mode_requires_hash_list():
+    env = {
+        "DATABASE_URL": "postgresql://user:pass@localhost/db",
+        "OPENAI_API_KEY": "sk-test-REDACTED",
+        "AUTH_MODE": "demo",
+        "APP_ENV": "prod",
+        "DEMO_TOKEN_SHA256_LIST": "",
+    }
+    ok, check_list = ve.validate_env(env=env)
+    checks = {c.name: c for c in check_list}
+    assert not ok
+    assert not checks["demo_token_sha256_list"].ok
+
+
+def test_demo_mode_accepts_hashes():
+    digest = "a" * 64
+    env = {
+        "DATABASE_URL": "postgresql://user:pass@localhost/db",
+        "OPENAI_API_KEY": "sk-test-REDACTED",
+        "AUTH_MODE": "demo",
+        "APP_ENV": "prod",
+        "DEMO_TOKEN_SHA256_LIST": digest,
+    }
+    ok, check_list = ve.validate_env(env=env)
+    checks = {c.name: c for c in check_list}
+    assert ok
+    assert checks["demo_token_sha256_list"].ok

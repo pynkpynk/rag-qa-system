@@ -3,6 +3,9 @@ from __future__ import annotations
 import os
 import time
 from dataclasses import dataclass
+import hashlib
+import hmac
+import re
 from typing import Any, Dict, Optional, Set, Union
 
 import httpx
@@ -57,6 +60,18 @@ def _dev_admin_subs() -> Set[str]:
     return set(_parse_csv(_env("DEV_ADMIN_SUBS")))
 
 
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _demo_token_hashes() -> Set[str]:
+    hashes: Set[str] = set()
+    for part in _parse_csv(_env("DEMO_TOKEN_SHA256_LIST")):
+        lower = part.lower()
+        if _SHA256_RE.fullmatch(lower):
+            hashes.add(lower)
+    return hashes
+
+
 def effective_auth_mode() -> str:
     return _effective_mode()
 
@@ -86,7 +101,7 @@ def _auth_disabled() -> bool:
 
 
 def _auth_mode() -> str:
-    # "auth0" (default) or "dev"
+    # "auth0" (default) or "dev" or "demo"
     return (_env("AUTH_MODE", "auth0") or "auth0").lower()
 
 
@@ -94,13 +109,15 @@ def _effective_mode() -> str:
     """
     Priority:
       1) AUTH_DISABLED=1 -> "disabled"
-      2) AUTH_MODE=dev   -> "dev"
+      2) AUTH_MODE in {"dev","demo"} -> same
       3) otherwise       -> "auth0"
     """
     if _auth_disabled():
         return "disabled"
     m = _auth_mode()
-    return "dev" if m == "dev" else "auth0"
+    if m in {"dev", "demo"}:
+        return m
+    return "auth0"
 
 
 def _normalize_domain(domain: str) -> str:
@@ -247,7 +264,8 @@ def _maybe_guard_prod_mode() -> None:
     """
     if _truthy(_env("AUTH_BYPASS_ALLOW_IN_PROD", "0")):
         return
-    if _is_production() and _effective_mode() in {"dev", "disabled"}:
+    mode = _effective_mode()
+    if _is_production() and mode in {"dev", "disabled"}:
         raise RuntimeError("Auth bypass (AUTH_MODE=dev or AUTH_DISABLED=1) is not allowed in production.")
 
 
@@ -323,6 +341,17 @@ def get_principal(
             raise HTTPException(status_code=401, detail=_unauth_detail("Invalid dev token"))
         sub_override = request.headers.get("x-dev-sub")
         return _dev_principal(sub_override=sub_override)
+
+    if mode == "demo":
+        token = _require_bearer_token()
+        digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        allowed_hashes = _demo_token_hashes()
+        allowed = any(hmac.compare_digest(digest, h) for h in allowed_hashes)
+        if not allowed:
+            raise HTTPException(status_code=401, detail=_unauth_detail("Invalid token"))
+        sub = f"demo|{digest[:12]}"
+        perms = {"read:docs"}
+        return Principal(sub=sub, permissions=perms)
 
     token = _require_bearer_token()
     if token.strip().lower() == "dev-token":
