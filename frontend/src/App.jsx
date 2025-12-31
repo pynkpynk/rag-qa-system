@@ -70,7 +70,7 @@ async function waitUntilIndexed(targetDocId, { intervalMs = 1000, timeoutMs = 60
 
 /** api.attachDocs がない場合のフォールバック（/api/runs/{run_id}/attach_docs） */
 async function attachDocsFallback(runId, documentIds) {
-  const res = await fetch(`${API_BASE}/runs/${encodeURIComponent(runId)}/attach_docs`, {
+  const res = await api.authorizedFetch(`${API_BASE}/runs/${encodeURIComponent(runId)}/attach_docs`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ document_ids: documentIds }),
@@ -124,7 +124,7 @@ async function fetchPdfAsObjectUrl(documentId, { signal } = {}) {
   const url = pdfViewUrl(documentId);
   if (!url) throw new Error("documentId is missing");
 
-  const res = await fetch(url, { method: "GET", signal, cache: "no-store" });
+  const res = await api.authorizedFetch(url, { method: "GET", signal, cache: "no-store" });
   if (!res.ok) {
     const t = await res.text().catch(() => "");
     throw new Error(t || `${res.status} ${res.statusText}`);
@@ -169,6 +169,10 @@ export default function App() {
   const [cleanupError, setCleanupError] = useState("");
   const [cleanupResult, setCleanupResult] = useState("(none)");
 
+  const [tokenDraft, setTokenDraft] = useState("");
+  const [tokenStatus, setTokenStatus] = useState("");
+  const [savedToken, setSavedToken] = useState("");
+
   // health indicator
   const [backendOk, setBackendOk] = useState(null);
   const [backendMeta, setBackendMeta] = useState(null);
@@ -178,6 +182,7 @@ export default function App() {
   const selectedDocSet = useMemo(() => new Set(selectedDocIds), [selectedDocIds]);
 
   const disableGlobal = runsBusy || runBusy || askBusy || drillBusy || cleanupBusy;
+  const hasToken = Boolean((savedToken || "").trim());
 
   // highlight: docs attached to selected run
   const docsHighlightSet = useMemo(() => new Set(runDocIds || []), [runDocIds]);
@@ -196,6 +201,12 @@ export default function App() {
     if (!indexedDocIds.length) return false;
     return indexedDocIds.every((id) => selectedDocSet.has(id));
   }, [indexedDocIds, selectedDocSet]);
+
+  useEffect(() => {
+    const initial = api.getAuthToken() || "";
+    setTokenDraft(initial);
+    setSavedToken(initial);
+  }, []);
 
   // PDF preview (objectURL)
   const [pdfPreviewEnabled, setPdfPreviewEnabled] = useState(false);
@@ -238,7 +249,7 @@ export default function App() {
 
     const ping = async () => {
       try {
-        const res = await fetch(`${API_BASE}/health`, { cache: "no-store" });
+        const res = await api.authorizedFetch(`${API_BASE}/health`, { cache: "no-store" });
         if (!res.ok) {
           if (!cancelled) {
             setBackendOk(false);
@@ -285,6 +296,21 @@ export default function App() {
     setPdfObjectUrl(null);
 
     pageChunkRefs.current = new Map();
+  }
+
+  function saveAuthToken() {
+    api.setAuthToken(tokenDraft);
+    const next = api.getAuthToken() || "";
+    setTokenDraft(next);
+    setSavedToken(next);
+    setTokenStatus(next ? "Token saved." : "Token cleared.");
+  }
+
+  function clearAuthToken() {
+    api.clearAuthToken();
+    setTokenDraft("");
+    setSavedToken("");
+    setTokenStatus("Token cleared.");
   }
 
   function defaultRunConfig() {
