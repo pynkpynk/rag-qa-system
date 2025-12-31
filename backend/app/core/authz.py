@@ -350,7 +350,7 @@ def get_principal(
         if not allowed:
             raise HTTPException(status_code=401, detail=_unauth_detail("Invalid token"))
         sub = f"demo|{digest[:12]}"
-        perms = {"read:docs"}
+        perms = {"read:docs", "write:docs", "delete:docs"}
         return Principal(sub=sub, permissions=perms)
 
     token = _require_bearer_token()
