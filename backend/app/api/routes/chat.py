@@ -6,6 +6,7 @@ import os
 import re
 import math
 from datetime import datetime, timezone
+import uuid
 import hashlib
 import hmac
 from typing import Any, Iterable, Literal, Annotated
@@ -1520,14 +1521,18 @@ def build_retrieval_debug_payload(
     _ensure_debug_count(merged)
     return sanitize_retrieval_debug(merged)
 
-@router.post("/chat/ask", response_model=ChatResponse)
+@router.post("/chat/ask", response_model=ChatResponse, response_model_exclude_none=True)
 def ask(
     payload: AskPayload,
     request: Request,
     db: Session = Depends(get_db),
     p: Principal = Depends(require_permissions("read:docs")),
 ):
-    req_id = getattr(request.state, "request_id", None) or request.headers.get("X-Request-ID")
+    req_id = (
+        getattr(request.state, "request_id", None)
+        or request.headers.get("X-Request-ID")
+        or str(uuid.uuid4())
+    )
 
     _refresh_retrieval_debug_flags()
 
@@ -1719,7 +1724,7 @@ def ask(
                     chunk_count=len(rows),
                     status="success",
                 )
-                return resp
+                return ChatResponse(**resp).model_dump(exclude_none=True)
 
         if not rows:
             if run:
@@ -1760,7 +1765,7 @@ def ask(
                 chunk_count=len(rows),
                 status="success",
             )
-            return resp
+            return ChatResponse(**resp).model_dump(exclude_none=True)
 
         context, sources = build_sources(rows)
         allowed_ids = {s["source_id"] for s in sources}
@@ -1829,7 +1834,7 @@ def ask(
             chunk_count=len(rows),
             status="success",
         )
-        return resp
+        return ChatResponse(**resp).model_dump(exclude_none=True)
 
     except HTTPException as exc:
         if debug_meta_for_errors is not None:

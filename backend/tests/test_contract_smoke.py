@@ -71,13 +71,16 @@ def _insert_document(session_factory, *, document_id: str = "doc-contract", owne
         db.commit()
 
 
-def test_contract_health():
+def test_contract_health(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("GIT_SHA", raising=False)
+    monkeypatch.setenv("RENDER_GIT_COMMIT", "unit-test-sha")
     resp = client.get("/api/health")
     assert resp.status_code == 200
     payload = resp.json()
     assert payload["status"] == "ok"
-    for key in ("app", "version", "time_utc"):
+    for key in ("app", "version", "time_utc", "app_env", "auth_mode", "git_sha"):
         assert key in payload
+    assert payload["git_sha"] == "unit-test-sha"
 
 
 def test_contract_docs_list_and_detail(sqlite_app_db):
