@@ -78,9 +78,22 @@ def test_contract_health(monkeypatch: pytest.MonkeyPatch):
     assert resp.status_code == 200
     payload = resp.json()
     assert payload["status"] == "ok"
-    for key in ("app", "version", "time_utc", "app_env", "auth_mode", "git_sha"):
+    for key in (
+        "app",
+        "version",
+        "time_utc",
+        "app_env",
+        "auth_mode",
+        "git_sha",
+        "llm_enabled",
+        "openai_offline",
+        "openai_key_present",
+    ):
         assert key in payload
     assert payload["git_sha"] == "unit-test-sha"
+    assert isinstance(payload["llm_enabled"], bool)
+    assert isinstance(payload["openai_offline"], bool)
+    assert isinstance(payload["openai_key_present"], bool)
 
 
 def test_contract_docs_list_and_detail(sqlite_app_db):

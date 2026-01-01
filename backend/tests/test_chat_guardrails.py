@@ -82,6 +82,14 @@ def test_payload_rejects_whitespace_only():
     with pytest.raises(Exception):
         AskPayload(message="   ", k=6)
 
+def test_payload_deduplicates_document_ids():
+    p = AskPayload(question="Q", k=6, document_ids=[" doc1 ", "doc1", "", "doc2 "])
+    assert p.document_ids == ["doc1", "doc2"]
+
+def test_payload_disallows_run_and_doc_scope():
+    with pytest.raises(Exception):
+        AskPayload(question="Q", k=6, run_id="run-1", document_ids=["doc1"])
+
 def test_cjk_detection():
     assert contains_cjk("日本語の質問です")
     assert query_class("日本語の質問です") == "cjk"
@@ -259,7 +267,7 @@ def test_prod_env_forces_debug_off(monkeypatch):
     monkeypatch.setattr(chat, "embed_query", lambda q: [0.0])
     monkeypatch.setattr(chat, "_detect_trgm_available", lambda *_: False)
 
-    def fake_fetch_chunks(db, qvec_lit, q_text, k, run_id, p, question, trgm_available, admin_debug_hybrid):
+    def fake_fetch_chunks(db, qvec_lit, q_text, k, run_id, document_ids, p, question, trgm_available, admin_debug_hybrid):
         rows = [
             {
                 "id": "chunk1",
@@ -601,6 +609,7 @@ def test_admin_debug_strategy_default_firstk(monkeypatch):
         q_text="summary テスト",
         k=1,
         run_id="run1",
+        document_ids=None,
         p=principal,
         question="summary テスト",
         trgm_available=True,
@@ -651,6 +660,7 @@ def test_admin_debug_strategy_hybrid_overrides_summary(monkeypatch):
         q_text="要点 テスト",
         k=1,
         run_id="run1",
+        document_ids=None,
         p=principal,
         question="要点 テスト",
         trgm_available=True,

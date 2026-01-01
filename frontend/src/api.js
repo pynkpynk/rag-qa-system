@@ -1,4 +1,33 @@
-const API_BASE = import.meta.env.VITE_API_BASE || "/api";
+const rawEnvBase = (import.meta.env.VITE_API_BASE || "").trim();
+const API_BASE = rawEnvBase && !/^https?:\/\//i.test(rawEnvBase) ? rawEnvBase : "/api";
+
+const TOKEN_STORAGE_KEY = "ragqa_token";
+
+/**
+ * Persisted demo/auth token helpers.
+ * - Store only in localStorage (browser); never hardcode in source.
+ */
+function getStoredToken() {
+  try {
+    const t = localStorage.getItem(TOKEN_STORAGE_KEY);
+    return (t || "").trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+function setStoredToken(token) {
+  try {
+    const t = (token || "").trim();
+    if (!t) {
+      localStorage.removeItem(TOKEN_STORAGE_KEY);
+      return;
+    }
+    localStorage.setItem(TOKEN_STORAGE_KEY, t);
+  } catch {
+    // noop
+  }
+}
 
 /**
  * Small helper to generate a request id for debugging / correlation.
@@ -16,11 +45,35 @@ function newRequestId() {
   return `req_${Date.now()}_${Math.random().toString(16).slice(2)}`;
 }
 
+function normalizeErrorMessage(j) {
+  // backend error payloads can be:
+  // { detail: ... } / { message: ... } / { error: { message, code } }
+  if (!j) return null;
+  if (typeof j === "string") return j;
+  if (typeof j?.detail === "string") return j.detail;
+  if (typeof j?.message === "string") return j.message;
+  if (typeof j?.error?.message === "string") return j.error.message;
+  try {
+    return JSON.stringify(j);
+  } catch {
+    return null;
+  }
+}
+
+function withAuthHeaders(existing) {
+  const headers = new Headers(existing || {});
+  if (!headers.has("Authorization")) {
+    const token = getStoredToken();
+    if (token) headers.set("Authorization", `Bearer ${token}`);
+  }
+  return headers;
+}
+
 async function fetchJson(path, options = {}) {
   const url = `${API_BASE}${path}`;
 
-  // Normalize headers (so we can safely set X-Request-ID / Accept)
-  const headers = new Headers(options.headers || {});
+  // Normalize headers (so we can safely set X-Request-ID / Accept / Authorization)
+  const headers = withAuthHeaders(options.headers || {});
   const reqId = headers.get("X-Request-ID") || newRequestId();
 
   headers.set("X-Request-ID", reqId);
@@ -37,7 +90,7 @@ async function fetchJson(path, options = {}) {
       const ct = res.headers.get("content-type") || "";
       if (ct.includes("application/json")) {
         const j = await res.json();
-        msg = j?.detail || j?.message || JSON.stringify(j);
+        msg = normalizeErrorMessage(j) || msg;
       } else {
         const t = await res.text();
         msg = t || msg;
@@ -56,13 +109,35 @@ async function fetchJson(path, options = {}) {
 }
 
 export const api = {
+  // Auth token (demo token, etc.)
+  getAuthToken() {
+    return getStoredToken();
+  },
+  setAuthToken(token) {
+    setStoredToken(token);
+  },
+  clearAuthToken() {
+    setStoredToken("");
+  },
+  authorizedFetch(url, options = {}) {
+    const headers = withAuthHeaders(options.headers || {});
+    return fetch(url, { ...options, headers });
+  },
+
   // Docs
   listDocs() {
     return fetchJson("/docs");
   },
   uploadPdf(file) {
+    if (!file) throw new Error("No file provided.");
+    // Optional client-side guard (server still validates)
+    const isPdf =
+      file.type === "application/pdf" || String(file.name || "").toLowerCase().endsWith(".pdf");
+    if (!isPdf) throw new Error("Only PDF files are supported.");
+
     const fd = new FormData();
     fd.append("file", file);
+    // NOTE: Do NOT set Content-Type manually for FormData; browser will set boundary.
     return fetchJson("/docs/upload", { method: "POST", body: fd });
   },
 

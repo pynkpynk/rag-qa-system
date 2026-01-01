@@ -16,16 +16,17 @@ import sys
 from fastapi import APIRouter, Depends, HTTPException, Request
 from openai import OpenAI
 from pydantic import BaseModel, Field, model_validator
-from sqlalchemy import text as sql_text
+from sqlalchemy import text as sql_text, select
 from sqlalchemy.orm import Session
 
 from app.core.authz import Principal, is_admin, require_permissions, effective_auth_mode
 from app.core.config import settings
 from app.core.run_access import ensure_run_access
 from app.core.output_contract import sanitize_nonfinite_floats
-from app.db.models import Run
+from app.db.models import Run, Document
 from app.db.session import get_db
 from app.schemas.api_contract import ChatResponse
+from app.core.llm_status import is_openai_offline, is_llm_enabled
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -45,6 +46,7 @@ class AskPayload(BaseModel):
     ]
     k: int = Field(6, ge=1, le=50)
     run_id: str | None = None
+    document_ids: list[str] = Field(default_factory=list)
     debug: bool = False
 
     @model_validator(mode="before")
@@ -71,6 +73,18 @@ class AskPayload(BaseModel):
         self.question = (self.question or "").strip()
         if not self.question:
             raise ValueError("question/message must be non-empty")
+        run_id = (self.run_id or "").strip()
+        self.run_id = run_id or None
+        cleaned_docs: list[str] = []
+        for raw in self.document_ids or []:
+            doc_id = (raw or "").strip()
+            if not doc_id:
+                continue
+            if doc_id not in cleaned_docs:
+                cleaned_docs.append(doc_id)
+        self.document_ids = cleaned_docs
+        if self.run_id and self.document_ids:
+            raise ValueError("Provide either run_id or document_ids, not both.")
         return self
 
 
@@ -347,6 +361,32 @@ def _detect_trgm_available(db: Session) -> bool:
     return _TRGM_AVAILABLE_FLAG
 
 
+def _ensure_document_scope(db: Session, document_ids: list[str], principal: Principal) -> list[str]:
+    """Validate that the requested document_ids exist and belong to the principal (unless admin)."""
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for raw in document_ids or []:
+        doc_id = (raw or "").strip()
+        if not doc_id or doc_id in seen:
+            continue
+        seen.add(doc_id)
+        cleaned.append(doc_id)
+    if not cleaned:
+        raise HTTPException(status_code=422, detail="document_ids must contain at least one id.")
+
+    stmt = select(Document.id).where(Document.id.in_(cleaned))
+    if not is_admin(principal):
+        if not principal.sub:
+            raise HTTPException(status_code=404, detail="document not found or access denied.")
+        stmt = stmt.where(Document.owner_sub == principal.sub)
+
+    rows = [row[0] for row in db.execute(stmt)]
+    missing = [doc_id for doc_id in cleaned if doc_id not in rows]
+    if missing:
+        raise HTTPException(status_code=404, detail="document not found or access denied.")
+    return cleaned
+
+
 # ============================================================
 # SQL (Retrieval)
 #   vector queries include cosine distance as "dist"
@@ -394,6 +434,27 @@ ORDER BY c.embedding <=> (:qvec)::vector
 LIMIT :k
 """
 
+SQL_TOPK_BY_DOCS_ADMIN = """
+SELECT c.id, c.document_id, d.filename AS filename, c.page, c.chunk_index, c.text,
+       (c.embedding <=> (:qvec)::vector) AS dist
+FROM chunks c
+JOIN documents d ON d.id = c.document_id
+WHERE c.document_id = ANY(:doc_ids)
+ORDER BY c.embedding <=> (:qvec)::vector
+LIMIT :k
+"""
+
+SQL_TOPK_BY_DOCS_USER = """
+SELECT c.id, c.document_id, d.filename AS filename, c.page, c.chunk_index, c.text,
+       (c.embedding <=> (:qvec)::vector) AS dist
+FROM chunks c
+JOIN documents d ON d.id = c.document_id
+WHERE c.document_id = ANY(:doc_ids)
+  AND d.owner_sub = :owner_sub
+ORDER BY c.embedding <=> (:qvec)::vector
+LIMIT :k
+"""
+
 SQL_FIRSTK_BY_RUN_ADMIN = """
 SELECT c.id, c.document_id, d.filename AS filename, c.page, c.chunk_index, c.text
 FROM chunks c
@@ -415,6 +476,25 @@ ORDER BY c.document_id, c.page, c.chunk_index
 LIMIT :k
 """
 
+SQL_FIRSTK_BY_DOCS_ADMIN = """
+SELECT c.id, c.document_id, d.filename AS filename, c.page, c.chunk_index, c.text
+FROM chunks c
+JOIN documents d ON d.id = c.document_id
+WHERE c.document_id = ANY(:doc_ids)
+ORDER BY c.document_id, c.page, c.chunk_index
+LIMIT :k
+"""
+
+SQL_FIRSTK_BY_DOCS_USER = """
+SELECT c.id, c.document_id, d.filename AS filename, c.page, c.chunk_index, c.text
+FROM chunks c
+JOIN documents d ON d.id = c.document_id
+WHERE c.document_id = ANY(:doc_ids)
+  AND d.owner_sub = :owner_sub
+ORDER BY c.document_id, c.page, c.chunk_index
+LIMIT :k
+"""
+
 SQL_OFFLINE_FALLBACK_BY_RUN_ADMIN = """
 SELECT c.id, c.document_id, d.filename AS filename, c.page, c.chunk_index, c.text
 FROM run_documents rd
@@ -431,6 +511,25 @@ FROM run_documents rd
 JOIN chunks c ON c.document_id = rd.document_id
 JOIN documents d ON d.id = rd.document_id
 WHERE rd.run_id = :run_id
+  AND d.owner_sub = :owner_sub
+ORDER BY COALESCE(c.page, 0), c.chunk_index
+LIMIT :k
+"""
+
+SQL_OFFLINE_FALLBACK_BY_DOCS_ADMIN = """
+SELECT c.id, c.document_id, d.filename AS filename, c.page, c.chunk_index, c.text
+FROM chunks c
+JOIN documents d ON d.id = c.document_id
+WHERE c.document_id = ANY(:doc_ids)
+ORDER BY COALESCE(c.page, 0), c.chunk_index
+LIMIT :k
+"""
+
+SQL_OFFLINE_FALLBACK_BY_DOCS_USER = """
+SELECT c.id, c.document_id, d.filename AS filename, c.page, c.chunk_index, c.text
+FROM chunks c
+JOIN documents d ON d.id = c.document_id
+WHERE c.document_id = ANY(:doc_ids)
   AND d.owner_sub = :owner_sub
 ORDER BY COALESCE(c.page, 0), c.chunk_index
 LIMIT :k
@@ -499,6 +598,33 @@ ORDER BY rank DESC
 LIMIT :k
 """
 
+SQL_FTS_BY_DOCS_ADMIN = f"""
+WITH q AS (SELECT {TSQUERY_EXPR} AS query)
+SELECT c.id, c.document_id, d.filename AS filename, c.page, c.chunk_index, c.text,
+       ts_rank_cd(c.fts, q.query) AS rank
+FROM chunks c
+JOIN documents d ON d.id = c.document_id
+CROSS JOIN q
+WHERE c.document_id = ANY(:doc_ids)
+  AND c.fts @@ q.query
+ORDER BY rank DESC
+LIMIT :k
+"""
+
+SQL_FTS_BY_DOCS_USER = f"""
+WITH q AS (SELECT {TSQUERY_EXPR} AS query)
+SELECT c.id, c.document_id, d.filename AS filename, c.page, c.chunk_index, c.text,
+       ts_rank_cd(c.fts, q.query) AS rank
+FROM chunks c
+JOIN documents d ON d.id = c.document_id
+CROSS JOIN q
+WHERE c.document_id = ANY(:doc_ids)
+  AND d.owner_sub = :owner_sub
+  AND c.fts @@ q.query
+ORDER BY rank DESC
+LIMIT :k
+"""
+
 SQL_FTS_ALL_DOCS_ADMIN = f"""
 WITH q AS (SELECT {TSQUERY_EXPR} AS query)
 SELECT c.id, c.document_id, d.filename AS filename, c.page, c.chunk_index, c.text,
@@ -542,6 +668,27 @@ FROM chunks c
 JOIN documents d ON d.id = c.document_id
 JOIN run_documents rd ON rd.document_id = c.document_id
 WHERE rd.run_id = :run_id
+  AND d.owner_sub = :owner_sub
+ORDER BY similarity(c.text, :q) DESC
+LIMIT :k
+"""
+
+SQL_TRGM_BY_DOCS_ADMIN = """
+SELECT c.id, c.document_id, d.filename AS filename, c.page, c.chunk_index, c.text,
+       similarity(c.text, :q) AS sim
+FROM chunks c
+JOIN documents d ON d.id = c.document_id
+WHERE c.document_id = ANY(:doc_ids)
+ORDER BY similarity(c.text, :q) DESC
+LIMIT :k
+"""
+
+SQL_TRGM_BY_DOCS_USER = """
+SELECT c.id, c.document_id, d.filename AS filename, c.page, c.chunk_index, c.text,
+       similarity(c.text, :q) AS sim
+FROM chunks c
+JOIN documents d ON d.id = c.document_id
+WHERE c.document_id = ANY(:doc_ids)
   AND d.owner_sub = :owner_sub
 ORDER BY similarity(c.text, :q) DESC
 LIMIT :k
@@ -656,6 +803,7 @@ def fetch_chunks(
     q_text: str,
     k: int,
     run_id: str | None,
+    document_ids: list[str] | None,
     p: Principal,
     question: str,
     *,
@@ -685,6 +833,10 @@ def fetch_chunks(
         }
         if not use_fts:
             debug["fts_skip_reason"] = "cjk"
+    doc_scope = list(document_ids or [])
+    summary_intent = _is_summary_question(question)
+    if force_admin_hybrid:
+        summary_intent = False
 
     if run_id:
         if is_admin(p):
@@ -692,17 +844,13 @@ def fetch_chunks(
             if not cnt_row or int(cnt_row["cnt"]) == 0:
                 raise HTTPException(status_code=400, detail="This run_id has no attached documents. Attach docs first.")
 
-            is_summary = _is_summary_question(question)
-            if force_admin_hybrid:
-                is_summary = False
-
-            if is_summary:
+            if summary_intent:
                 k_eff = min(max(k, 20), 50)
                 rows = [dict(r) for r in db.execute(sql_text(SQL_FIRSTK_BY_RUN_ADMIN), {"run_id": run_id, "k": k_eff}).mappings().all()]
                 if debug is not None:
                     debug["strategy"] = "firstk_by_run_admin"
                     debug["count"] = len(rows)
-                return _apply_offline_fallback(rows, db=db, run_id=run_id, p=p, k=k, debug=debug)
+                return _apply_offline_fallback(rows, db=db, run_id=run_id, document_ids=None, p=p, k=k, debug=debug)
 
             if q_text and (ENABLE_HYBRID or use_trgm or force_admin_hybrid):
                 vec_k = HYBRID_VEC_K if ENABLE_HYBRID else k
@@ -734,7 +882,7 @@ def fetch_chunks(
                     debug["merged_top5"] = _preview(merged)
 
                 rows = merged if merged else vec[:k]
-                return _apply_offline_fallback(rows, db=db, run_id=run_id, p=p, k=k, debug=debug)
+                return _apply_offline_fallback(rows, db=db, run_id=run_id, document_ids=None, p=p, k=k, debug=debug)
 
             rows = [dict(r) for r in db.execute(sql_text(SQL_TOPK_BY_RUN_ADMIN), {"qvec": qvec_lit, "k": k, "run_id": run_id}).mappings().all()]
             if debug is not None:
@@ -742,19 +890,19 @@ def fetch_chunks(
                 debug["count"] = len(rows)
                 debug["vec_best_dist"] = _best_vec_dist(rows)
                 debug["top5"] = _preview(rows)
-            return _apply_offline_fallback(rows, db=db, run_id=run_id, p=p, k=k, debug=debug)
+            return _apply_offline_fallback(rows, db=db, run_id=run_id, document_ids=None, p=p, k=k, debug=debug)
 
         cnt_row = db.execute(sql_text(SQL_RUN_DOC_COUNT_USER), {"run_id": run_id, "owner_sub": p.sub}).mappings().first()
         if not cnt_row or int(cnt_row["cnt"]) == 0:
             raise HTTPException(status_code=400, detail="This run_id has no attached documents. Attach docs first.")
 
-        if _is_summary_question(question):
+        if summary_intent:
             k_eff = min(max(k, 20), 50)
             rows = [dict(r) for r in db.execute(sql_text(SQL_FIRSTK_BY_RUN_USER), {"run_id": run_id, "k": k_eff, "owner_sub": p.sub}).mappings().all()]
             if debug is not None:
                 debug["strategy"] = "firstk_by_run_user"
                 debug["count"] = len(rows)
-            return _apply_offline_fallback(rows, db=db, run_id=run_id, p=p, k=k, debug=debug)
+            return _apply_offline_fallback(rows, db=db, run_id=run_id, document_ids=None, p=p, k=k, debug=debug)
 
         if q_text and (ENABLE_HYBRID or use_trgm):
             vec_k = HYBRID_VEC_K if ENABLE_HYBRID else k
@@ -786,7 +934,7 @@ def fetch_chunks(
                 debug["merged_top5"] = _preview(merged)
 
             rows = merged if merged else vec[:k]
-            return _apply_offline_fallback(rows, db=db, run_id=run_id, p=p, k=k, debug=debug)
+            return _apply_offline_fallback(rows, db=db, run_id=run_id, document_ids=None, p=p, k=k, debug=debug)
 
         rows = [dict(r) for r in db.execute(sql_text(SQL_TOPK_BY_RUN_USER), {"qvec": qvec_lit, "k": k, "run_id": run_id, "owner_sub": p.sub}).mappings().all()]
         if debug is not None:
@@ -794,26 +942,91 @@ def fetch_chunks(
             debug["count"] = len(rows)
             debug["vec_best_dist"] = _best_vec_dist(rows)
             debug["top5"] = _preview(rows)
-        return _apply_offline_fallback(rows, db=db, run_id=run_id, p=p, k=k, debug=debug)
+        return _apply_offline_fallback(rows, db=db, run_id=run_id, document_ids=None, p=p, k=k, debug=debug)
 
-    is_summary = _is_summary_question(question)
-    if force_admin_hybrid:
-        is_summary = False
+    if doc_scope:
+        scope_params = {"doc_ids": doc_scope}
+        scope_params_with_owner = {**scope_params, "owner_sub": p.sub}
+        if summary_intent:
+            k_eff = min(max(k, 20), 50)
+            if is_admin(p):
+                rows = [dict(r) for r in db.execute(sql_text(SQL_FIRSTK_BY_DOCS_ADMIN), {**scope_params, "k": k_eff}).mappings().all()]
+                strat = "firstk_by_docs_admin"
+            else:
+                rows = [dict(r) for r in db.execute(sql_text(SQL_FIRSTK_BY_DOCS_USER), {**scope_params_with_owner, "k": k_eff}).mappings().all()]
+                strat = "firstk_by_docs_user"
+            if debug is not None:
+                debug["strategy"] = strat
+                debug["count"] = len(rows)
+            return _apply_offline_fallback(rows, db=db, run_id=run_id, document_ids=doc_scope, p=p, k=k, debug=debug)
 
-    if is_summary:
+        if q_text and (ENABLE_HYBRID or use_trgm or force_admin_hybrid):
+            vec_k = HYBRID_VEC_K if ENABLE_HYBRID else k
+            if is_admin(p):
+                vec = [dict(r) for r in db.execute(sql_text(SQL_TOPK_BY_DOCS_ADMIN), {**scope_params, "qvec": qvec_lit, "k": vec_k}).mappings().all()]
+            else:
+                vec = [dict(r) for r in db.execute(sql_text(SQL_TOPK_BY_DOCS_USER), {**scope_params_with_owner, "qvec": qvec_lit, "k": vec_k}).mappings().all()]
+            aux_rows: list[dict[str, Any]] = []
+            aux_kind: str | None = None
+            if ENABLE_HYBRID and use_fts:
+                if is_admin(p):
+                    aux_rows = [dict(r) for r in db.execute(sql_text(SQL_FTS_BY_DOCS_ADMIN), {**scope_params, "q": q_text, "k": HYBRID_FTS_K}).mappings().all()]
+                else:
+                    aux_rows = [dict(r) for r in db.execute(sql_text(SQL_FTS_BY_DOCS_USER), {**scope_params_with_owner, "q": q_text, "k": HYBRID_FTS_K}).mappings().all()]
+                aux_kind = "fts"
+            elif use_trgm:
+                if is_admin(p):
+                    aux_rows = [dict(r) for r in db.execute(sql_text(SQL_TRGM_BY_DOCS_ADMIN), {**scope_params, "q": q_text, "k": TRGM_K}).mappings().all()]
+                else:
+                    aux_rows = [dict(r) for r in db.execute(sql_text(SQL_TRGM_BY_DOCS_USER), {**scope_params_with_owner, "q": q_text, "k": TRGM_K}).mappings().all()]
+                aux_kind = "trgm"
+            merged = _rrf_merge(vec, aux_rows, k, rrf_k=RRF_K)
+            strat = "hybrid_rrf_by_docs_admin" if is_admin(p) else "hybrid_rrf_by_docs_user"
+            if debug is not None:
+                debug["strategy"] = strat
+                debug["vec_count"] = len(vec)
+                debug["vec_best_dist"] = _best_vec_dist(vec)
+                debug["merged_count"] = len(merged)
+                debug["vec_top5"] = _preview(vec)
+                if aux_kind == "fts":
+                    debug["used_fts"] = bool(aux_rows)
+                    debug["fts_count"] = len(aux_rows)
+                    debug["fts_top5"] = _preview(aux_rows) if aux_rows else []
+                elif aux_kind == "trgm":
+                    debug["used_trgm"] = True
+                    debug["trgm_count"] = len(aux_rows)
+                    debug["trgm_top5"] = _preview(aux_rows) if aux_rows else []
+                debug["merged_top5"] = _preview(merged)
+            rows = merged if merged else vec[:k]
+            return _apply_offline_fallback(rows, db=db, run_id=run_id, document_ids=doc_scope, p=p, k=k, debug=debug)
+
+        if is_admin(p):
+            rows = [dict(r) for r in db.execute(sql_text(SQL_TOPK_BY_DOCS_ADMIN), {**scope_params, "qvec": qvec_lit, "k": k}).mappings().all()]
+            strat = "vector_by_docs_admin"
+        else:
+            rows = [dict(r) for r in db.execute(sql_text(SQL_TOPK_BY_DOCS_USER), {**scope_params_with_owner, "qvec": qvec_lit, "k": k}).mappings().all()]
+            strat = "vector_by_docs_user"
+        if debug is not None:
+            debug["strategy"] = strat
+            debug["count"] = len(rows)
+            debug["vec_best_dist"] = _best_vec_dist(rows)
+            debug["top5"] = _preview(rows)
+        return _apply_offline_fallback(rows, db=db, run_id=run_id, document_ids=doc_scope, p=p, k=k, debug=debug)
+
+    if summary_intent:
         k_eff = min(max(k, 20), 50)
         if is_admin(p):
             rows = [dict(r) for r in db.execute(sql_text(SQL_FIRSTK_ALL_DOCS_ADMIN), {"k": k_eff}).mappings().all()]
             if debug is not None:
                 debug["strategy"] = "firstk_all_docs_admin"
                 debug["count"] = len(rows)
-            return _apply_offline_fallback(rows, db=db, run_id=run_id, p=p, k=k, debug=debug)
+            return _apply_offline_fallback(rows, db=db, run_id=run_id, document_ids=None, p=p, k=k, debug=debug)
 
         rows = [dict(r) for r in db.execute(sql_text(SQL_FIRSTK_ALL_DOCS_USER), {"k": k_eff, "owner_sub": p.sub}).mappings().all()]
         if debug is not None:
             debug["strategy"] = "firstk_all_docs_user"
             debug["count"] = len(rows)
-        return _apply_offline_fallback(rows, db=db, run_id=run_id, p=p, k=k, debug=debug)
+        return _apply_offline_fallback(rows, db=db, run_id=run_id, document_ids=None, p=p, k=k, debug=debug)
 
     if is_admin(p):
         if q_text and (ENABLE_HYBRID or use_trgm or force_admin_hybrid):
@@ -846,7 +1059,7 @@ def fetch_chunks(
                 debug["merged_top5"] = _preview(merged)
 
             rows = merged if merged else vec[:k]
-            return _apply_offline_fallback(rows, db=db, run_id=run_id, p=p, k=k, debug=debug)
+            return _apply_offline_fallback(rows, db=db, run_id=run_id, document_ids=None, p=p, k=k, debug=debug)
 
         rows = [dict(r) for r in db.execute(sql_text(SQL_TOPK_ALL_DOCS_ADMIN), {"qvec": qvec_lit, "k": k}).mappings().all()]
         if debug is not None:
@@ -854,7 +1067,7 @@ def fetch_chunks(
             debug["count"] = len(rows)
             debug["vec_best_dist"] = _best_vec_dist(rows)
             debug["top5"] = _preview(rows)
-        return _apply_offline_fallback(rows, db=db, run_id=run_id, p=p, k=k, debug=debug)
+        return _apply_offline_fallback(rows, db=db, run_id=run_id, document_ids=None, p=p, k=k, debug=debug)
 
     if q_text and (ENABLE_HYBRID or use_trgm):
         vec_k = HYBRID_VEC_K if ENABLE_HYBRID else k
@@ -886,7 +1099,7 @@ def fetch_chunks(
             debug["merged_top5"] = _preview(merged)
 
         rows = merged if merged else vec[:k]
-        return _apply_offline_fallback(rows, db=db, run_id=run_id, p=p, k=k, debug=debug)
+        return _apply_offline_fallback(rows, db=db, run_id=run_id, document_ids=None, p=p, k=k, debug=debug)
 
     rows = [dict(r) for r in db.execute(sql_text(SQL_TOPK_ALL_DOCS_USER), {"qvec": qvec_lit, "k": k, "owner_sub": p.sub}).mappings().all()]
     if debug is not None:
@@ -894,7 +1107,7 @@ def fetch_chunks(
         debug["count"] = len(rows)
         debug["vec_best_dist"] = _best_vec_dist(rows)
         debug["top5"] = _preview(rows)
-    return _apply_offline_fallback(rows, db=db, run_id=run_id, p=p, k=k, debug=debug)
+    return _apply_offline_fallback(rows, db=db, run_id=run_id, document_ids=None, p=p, k=k, debug=debug)
 
 
 # ============================================================
@@ -906,6 +1119,7 @@ def _offline_chunk_sample(
     db: Session,
     *,
     run_id: str | None,
+    document_ids: list[str] | None,
     p: Principal,
     k: int,
 ) -> list[dict[str, Any]]:
@@ -916,6 +1130,13 @@ def _offline_chunk_sample(
             sql = SQL_OFFLINE_FALLBACK_BY_RUN_ADMIN
         else:
             sql = SQL_OFFLINE_FALLBACK_BY_RUN_USER
+            params["owner_sub"] = p.sub
+    elif document_ids:
+        params["doc_ids"] = document_ids
+        if is_admin(p):
+            sql = SQL_OFFLINE_FALLBACK_BY_DOCS_ADMIN
+        else:
+            sql = SQL_OFFLINE_FALLBACK_BY_DOCS_USER
             params["owner_sub"] = p.sub
     else:
         if is_admin(p):
@@ -932,13 +1153,14 @@ def _apply_offline_fallback(
     *,
     db: Session,
     run_id: str | None,
+    document_ids: list[str] | None,
     p: Principal,
     k: int,
     debug: dict[str, Any] | None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
-    if rows or not _is_offline():
+    if rows or is_llm_enabled():
         return rows, debug
-    fallback = _offline_chunk_sample(db, run_id=run_id, p=p, k=k)
+    fallback = _offline_chunk_sample(db, run_id=run_id, document_ids=document_ids, p=p, k=k)
     if fallback:
         if debug is not None:
             debug["strategy"] = debug.get("strategy") or "offline_fallback"
@@ -948,30 +1170,6 @@ def _apply_offline_fallback(
     return rows, debug
 
 EMBED_DIM = int(os.getenv("EMBED_DIM", "1536") or "1536")
-
-
-def _truthy(value: str | None) -> bool:
-    return (value or "").strip().lower() in {"1", "true", "yes", "y", "on"}
-
-
-def _is_pytest() -> bool:
-    return bool(os.getenv("PYTEST_CURRENT_TEST")) or "pytest" in sys.modules
-
-
-def _is_offline() -> bool:
-    override = os.getenv("OPENAI_OFFLINE")
-    if override is not None:
-        return _truthy(override)
-    if getattr(settings, "openai_offline", False):
-        return True
-    auto = _is_pytest() or _truthy(os.getenv("CI")) or _truthy(os.getenv("GITHUB_ACTIONS"))
-    if auto:
-        os.environ["OPENAI_OFFLINE"] = "1"
-    return auto
-
-
-def _openai_offline() -> bool:
-    return _is_offline()
 
 
 _openai_client: OpenAI | None = None
@@ -988,78 +1186,67 @@ def _offline_answer(question: str, sources_context: str) -> tuple[str, list[str]
     return "OFFLINE_MODE: stub response", []
 
 
-def _extract_prefixed_line(text: str, prefix: str) -> str | None:
-    prefix_lower = prefix.lower()
-    for line in (text or "").splitlines():
-        trimmed = line.strip()
-        if trimmed.lower().startswith(prefix_lower):
-            return trimmed
-    return None
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?。！？])\s+")
+
+
+def _split_sentences(text: str) -> list[str]:
+    trimmed = (text or "").strip()
+    if not trimmed:
+        return []
+    sentences = [s.strip() for s in _SENTENCE_SPLIT_RE.split(trimmed) if s.strip()]
+    if sentences:
+        return sentences
+    return [ln.strip() for ln in trimmed.splitlines() if ln.strip()]
+
+
+def _build_extractive_answer(
+    rows: list[dict[str, Any]],
+    sources: list[dict[str, Any]],
+    *,
+    summary_hint: bool,
+) -> tuple[str, list[str]]:
+    source_ids = [src.get("source_id") or f"S{i+1}" for i, src in enumerate(sources)]
+    max_units = 3 if summary_hint else 2
+    sentences_per_chunk = 2 if summary_hint else 1
+    parts: list[str] = []
+    used_ids: list[str] = []
+
+    for idx, row in enumerate(rows):
+        text = str(row.get("text") or "")
+        sid = source_ids[idx] if idx < len(source_ids) else f"S{idx+1}"
+        snippets = _split_sentences(text)
+        if not snippets:
+            continue
+        snippet = " ".join(snippets[:sentences_per_chunk]).strip()
+        if not snippet:
+            continue
+        parts.append(f"- [{sid}] {snippet}")
+        if sid not in used_ids:
+            used_ids.append(sid)
+        if len(used_ids) >= max_units:
+            break
+
+    if not parts:
+        return "I don't know based on the provided sources.", []
+
+    prefix = "Summary" if summary_hint else "Key facts"
+    answer = f"{prefix}:\n" + "\n".join(parts)
+    return answer, used_ids
 
 
 def _offline_answer_from_rows(
     rows: list[dict[str, Any]],
     sources: list[dict[str, Any]],
+    summary_hint: bool = False,
 ) -> tuple[str, list[str]]:
     if not rows:
         return "Offline mode answer unavailable.", []
-
-    source_ids = [src.get("source_id") or f"S{i+1}" for i, src in enumerate(sources)]
-    stakeholders_line = None
-    stakeholders_sid = None
-    evidence_line = None
-    evidence_sid = None
-
-    for idx, row in enumerate(rows):
-        text = str(row.get("text") or "")
-        sid = source_ids[idx] if idx < len(source_ids) else f"S{idx+1}"
-        if stakeholders_line is None:
-            line = _extract_prefixed_line(text, "stakeholders:")
-            if line:
-                stakeholders_line = line
-                stakeholders_sid = sid
-        if evidence_line is None:
-            line = _extract_prefixed_line(text, "evidence:")
-            if line:
-                evidence_line = line
-                evidence_sid = sid
-        if stakeholders_line and evidence_line:
-            break
-
-    parts: list[str] = []
-    used_ids: list[str] = []
-
-    def _append(line: str | None, sid: str | None) -> None:
-        if not line:
-            return
-        actual_sid = sid or (source_ids[0] if source_ids else "S1")
-        parts.append(f"- [{actual_sid}] {line}")
-        if actual_sid not in used_ids:
-            used_ids.append(actual_sid)
-
-    _append(stakeholders_line, stakeholders_sid)
-    _append(evidence_line, evidence_sid)
-
-    if not parts:
-        fallback_sid = source_ids[0] if source_ids else "S1"
-        snippet = ""
-        for row in rows:
-            text = (row.get("text") or "").strip()
-            if text:
-                snippet = text.splitlines()[0].strip()
-                if snippet:
-                    break
-        if not snippet:
-            snippet = "Offline mode summary based on available chunks."
-        parts.append(f"- [{fallback_sid}] {snippet}")
-        used_ids = [fallback_sid]
-
-    return "\n".join(parts), used_ids
+    return _build_extractive_answer(rows, sources, summary_hint=summary_hint)
 
 
 def _get_openai_client() -> OpenAI:
     global _openai_client
-    if _is_offline():
+    if is_openai_offline():
         raise RuntimeError("OpenAI client disabled in offline mode")
     if _openai_client is None:
         api_key_obj = settings.openai_api_key
@@ -1075,7 +1262,7 @@ def _get_openai_client() -> OpenAI:
 
 
 def embed_query(question: str) -> list[float]:
-    if _is_offline():
+    if not is_llm_enabled():
         return _offline_embedding(question)
     r = _get_openai_client().embeddings.create(model=EMBED_MODEL, input=question)
     return r.data[0].embedding
@@ -1336,7 +1523,7 @@ def build_chat_kwargs(
     return kwargs
 
 def call_llm(model: str, gen: dict[str, Any], question: str, sources_context: str, repair_note: str | None) -> str:
-    if _is_offline():
+    if not is_llm_enabled():
         return _offline_answer(question, sources_context)[0]
     kwargs = build_chat_kwargs(model, gen, question, sources_context, repair_note)
     return _chat_create_with_fallback(_get_openai_client(), kwargs)
@@ -1348,7 +1535,7 @@ def answer_with_contract(
     sources_context: str,
     allowed_ids: set[str],
 ) -> tuple[str, list[str]]:
-    if _is_offline():
+    if not is_llm_enabled():
         return _offline_answer(question, sources_context)
     repair_note: str | None = None
 
@@ -1562,16 +1749,23 @@ def ask(
     force_admin_hybrid = bool(auth_mode_dev and is_admin_debug_user and ADMIN_DEBUG_STRATEGY == "hybrid")
     trgm_enabled_flag = bool(ENABLE_TRGM)
     trgm_available_flag = _detect_trgm_available(db) if trgm_enabled_flag else False
-    offline_mode = _is_offline()
+    llm_enabled = is_llm_enabled()
+    offline_mode = not llm_enabled
     debug_meta: dict[str, bool] | None = None
     debug_meta_for_errors: dict[str, bool] | None = None
     rows: list[dict[str, Any]] = []
     retrieval_debug_raw: dict[str, Any] | None = None
     run: Run | None = None
+    doc_scope: list[str] = []
 
     try:
         q_clean = sanitize_question_for_llm(payload.question)
         is_cjk_query = query_class(q_clean) == "cjk"
+        summary_request = _is_summary_question(payload.question)
+        if force_admin_hybrid:
+            summary_request = False
+        if payload.document_ids:
+            doc_scope = _ensure_document_scope(db, payload.document_ids, p)
         base_debug_meta = (
             build_debug_meta(
                 feature_flag_enabled=feature_flag_enabled,
@@ -1615,7 +1809,7 @@ def ask(
             db.commit()
 
         # 0) ★ NEW: 曖昧参照 + run_idなし は即エラー（誤回答防止）
-        if REJECT_AMBIGUOUS_REFERENCE_WITHOUT_RUN and (not payload.run_id) and has_ambiguous_reference(q_clean):
+        if REJECT_AMBIGUOUS_REFERENCE_WITHOUT_RUN and (not payload.run_id) and not doc_scope and has_ambiguous_reference(q_clean):
             raise HTTPException(
                 status_code=422,
                 detail=build_error_payload(
@@ -1645,6 +1839,7 @@ def ask(
             q_text=q_clean,
             k=payload.k,
             run_id=payload.run_id,
+            document_ids=doc_scope,
             p=p,
             question=payload.question,
             trgm_available=trgm_available_flag,
@@ -1679,7 +1874,7 @@ def ask(
         debug_meta_for_errors = debug_meta
 
         # 2) retrieval信頼度ゲート（summary以外）
-        if rows and not offline_mode and not _is_summary_question(payload.question):
+        if rows and not offline_mode and not summary_request:
             best = _best_vec_dist(rows)
             fts_count = int((retrieval_debug_raw or {}).get("fts_count", 0) or 0)
             if best is not None and float(best) > VEC_MAX_COS_DIST and fts_count == 0:
@@ -1777,9 +1972,13 @@ def ask(
             db.commit()
 
         if offline_mode:
-            answer, used_ids = _offline_answer_from_rows(rows, sources)
+            answer, used_ids = _offline_answer_from_rows(rows, sources, summary_hint=summary_request)
         else:
-            answer, used_ids = answer_with_contract(model, gen, payload.question, context, allowed_ids)
+            try:
+                answer, used_ids = answer_with_contract(model, gen, payload.question, context, allowed_ids)
+            except Exception:
+                logger.exception("answer_with_contract_failed", extra={"request_id": req_id})
+                answer, used_ids = _offline_answer_from_rows(rows, sources, summary_hint=summary_request)
 
         if run:
             run.t2 = _utcnow()

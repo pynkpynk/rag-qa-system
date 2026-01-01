@@ -12,6 +12,10 @@ def test_requires_question_or_message():
     with pytest.raises(Exception):
         ChatAskRequest(question="  ", message="  ", debug=False)
 
+def test_chat_request_disallows_run_and_docs():
+    with pytest.raises(Exception):
+        ChatAskRequest(question="Q", run_id="run1", document_ids=["doc1"])
+
 def test_debug_sanitizer_allowlist():
     raw = {
         "retrieval": {"vec_count": 1, "db_host": "secret", "principal_sub": "secret"},
