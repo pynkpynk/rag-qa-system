@@ -60,7 +60,13 @@ Typical codes:
   "app": "RAG QA System",
   "version": "0.1.0",
   "status": "ok",
-  "time_utc": "2025-12-30T10:00:00+00:00"
+  "time_utc": "2025-12-30T10:00:00+00:00",
+  "app_env": "prod",
+  "auth_mode": "demo",
+  "git_sha": "abc1234",
+  "llm_enabled": true,
+  "openai_offline": false,
+  "openai_key_present": true
 }
 ```
 
@@ -188,8 +194,10 @@ When `dry_run=false` the payload switches to `deleted_count`, `deleted_run_ids`,
 
 Request example:
 ```json
-{ "question": "Summarize project risks", "run_id": "run_123", "debug": true }
+{ "question": "Summarize project risks", "document_ids": ["doc_456"] }
 ```
+Either `run_id` or `document_ids` may be provided to scope retrieval (not both). When neither is set, the
+query falls back to the caller’s entire library/run context.
 Response:
 ```json
 {
