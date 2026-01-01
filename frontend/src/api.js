@@ -1,4 +1,5 @@
-const API_BASE = import.meta.env.VITE_API_BASE || "/api";
+const rawEnvBase = (import.meta.env.VITE_API_BASE || "").trim();
+const API_BASE = rawEnvBase && !/^https?:\/\//i.test(rawEnvBase) ? rawEnvBase : "/api";
 
 const TOKEN_STORAGE_KEY = "ragqa_token";
 

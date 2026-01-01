@@ -176,6 +176,13 @@ export default function App() {
   // health indicator
   const [backendOk, setBackendOk] = useState(null);
   const [backendMeta, setBackendMeta] = useState(null);
+  const llmEnabled = backendMeta?.llm_enabled ?? null;
+  const llmStatusText = backendMeta
+    ? backendMeta.llm_enabled
+      ? "LLM: enabled"
+      : "LLM: offline (extractive mode)"
+    : "LLM: unknown";
+  const llmWarning = backendMeta?.llm_enabled === false;
 
   // multi-doc selection
   const [selectedDocIds, setSelectedDocIds] = useState([]);
@@ -202,11 +209,25 @@ export default function App() {
     return indexedDocIds.every((id) => selectedDocSet.has(id));
   }, [indexedDocIds, selectedDocSet]);
 
+  const singleDocScopeId = !runId && selectedDocIds.length === 1 ? selectedDocIds[0] : null;
+  const askDisabled = disableGlobal || !hasToken || (!runId && !singleDocScopeId);
+  const scopeLabel = runId
+    ? `Run ${runId}`
+    : singleDocScopeId
+    ? `Doc ${filenameOf(singleDocScopeId) || singleDocScopeId}`
+    : "Select a run or exactly one document";
+
   useEffect(() => {
     const initial = api.getAuthToken() || "";
     setTokenDraft(initial);
     setSavedToken(initial);
   }, []);
+
+  useEffect(() => {
+    if (!tokenStatus) return;
+    const id = setTimeout(() => setTokenStatus(""), 3000);
+    return () => clearTimeout(id);
+  }, [tokenStatus]);
 
   // PDF preview (objectURL)
   const [pdfPreviewEnabled, setPdfPreviewEnabled] = useState(false);
@@ -472,15 +493,26 @@ export default function App() {
   }
 
   async function ask() {
-    if (!runId) {
-      setAskError("Run ID is missing. Create or select a run first.");
+    if (!hasToken) {
+      setAskError("Set a demo token first.");
+      return;
+    }
+    const docScopeId = !runId && selectedDocIds.length === 1 ? selectedDocIds[0] : null;
+    if (!runId && !docScopeId) {
+      setAskError("Select a run or exactly one document before asking.");
       return;
     }
     setAskBusy(true);
     setAskError("");
     clearAnswerAndDrill();
     try {
-      const data = await api.ask({ question, k: Number(k) || 6, run_id: runId });
+      const payload = { question, k: Number(k) || 6 };
+      if (runId) {
+        payload.run_id = runId;
+      } else if (docScopeId) {
+        payload.document_ids = [docScopeId];
+      }
+      const data = await api.ask(payload);
       setAnswerText(data.answer || "");
       setCitations(data.citations || []);
     } catch (e) {
@@ -643,6 +675,10 @@ export default function App() {
   }
 
   async function onUpload(file) {
+    if (!hasToken) {
+      setUploadResult("Set a demo token first.");
+      return;
+    }
     setUploadResult("Uploading...");
     try {
       const resp = await api.uploadPdf(file);
@@ -727,20 +763,63 @@ export default function App() {
           <code>{API_BASE}</code>
           <span className="mono">{backendOk === null ? "checking" : backendOk ? "OK" : "NG"}</span>
           {backendMeta?.version ? <span className="mono">v{backendMeta.version}</span> : null}
+          <span className="muted">
+            LLM: <span className="mono">{llmStatusText}</span>
+          </span>
         </div>
       </header>
+
+      <section className="card">
+        <h2>Connection / Demo Auth</h2>
+        <div className="row gap" style={{ alignItems: "flex-end" }}>
+          <div style={{ flex: 1 }}>
+            <label className="label inline">Bearer token</label>
+            <input
+              type="password"
+              value={tokenDraft}
+              onChange={(e) => setTokenDraft(e.target.value)}
+              placeholder="Paste demo token"
+            />
+          </div>
+          <button className="btnSmall" onClick={saveAuthToken}>
+            Save
+          </button>
+          <button className="btnSmall" disabled={!hasToken} onClick={clearAuthToken}>
+            Clear
+          </button>
+        </div>
+        <div className="muted" style={{ marginTop: 4 }}>
+          Current: <span className="mono">{hasToken ? `${savedToken.slice(0, 4)}…` : "(none)"}</span> — stored only in
+          your browser (localStorage key <code>ragqa_token</code>).
+        </div>
+        {tokenStatus ? (
+          <div className="muted" style={{ marginTop: 4 }}>
+            {tokenStatus}
+          </div>
+        ) : null}
+      </section>
 
       {/* Upload */}
       <section className="card">
         <h2>Upload PDF</h2>
+        {!hasToken ? (
+          <div className="error" style={{ marginBottom: 8 }}>
+            Set a demo token above before uploading.
+          </div>
+        ) : null}
         <div className="row">
           <input
             type="file"
             accept="application/pdf"
-            disabled={disableGlobal}
+            disabled={disableGlobal || !hasToken}
             onChange={(e) => {
               const f = e.target.files?.[0];
               if (!f) return;
+              if (!hasToken) {
+                setUploadResult("Set a demo token first.");
+                e.currentTarget.value = "";
+                return;
+              }
               if (!f.name.toLowerCase().endsWith(".pdf")) {
                 setUploadResult("Only .pdf is allowed.");
                 return;
@@ -753,6 +832,11 @@ export default function App() {
         <div className="muted" style={{ marginTop: 8 }}>
           Upload triggers background indexing. The list below will refresh automatically.
         </div>
+        {llmWarning ? (
+          <div className="muted" style={{ marginTop: 4 }}>
+            Server LLM disabled; answers will use extractive summaries from retrieved chunks.
+          </div>
+        ) : null}
         <pre className="pre" style={{ marginTop: 10 }}>
           {uploadResult}
         </pre>
@@ -976,6 +1060,9 @@ export default function App() {
           <div className="pill">
             Doc IDs: <span className="mono">{formatDocIds(runDocIds)}</span>
           </div>
+          <div className="pill">
+            Scope: <span className="mono">{scopeLabel}</span>
+          </div>
           <button className="btnSmall" disabled={!runId || disableGlobal} onClick={() => runId && void safeCopy(runId)}>
             Copy Run ID
           </button>
@@ -988,6 +1075,11 @@ export default function App() {
 
         <label className="label">Question</label>
         <textarea value={question} disabled={disableGlobal} onChange={(e) => setQuestion(e.target.value)} />
+        {llmWarning ? (
+          <div className="muted" style={{ marginTop: 8 }}>
+            Server LLM offline &mdash; Ask responses will be generated from retrieved text snippets.
+          </div>
+        ) : null}
 
         <div className="row gap" style={{ marginTop: 10 }}>
           <div style={{ width: 120 }}>
@@ -1002,12 +1094,18 @@ export default function App() {
             />
           </div>
 
-          <button className="primary" disabled={!runId || disableGlobal} onClick={() => void ask()}>
+          <button className="primary" disabled={askDisabled} onClick={() => void ask()}>
             Ask
           </button>
 
           <div className="muted" style={{ flex: 1 }}>
-            ※ Ask を有効にするには Run を選択してね
+            {!hasToken
+              ? "Set a demo token to enable Ask."
+              : runId
+              ? "※ Ask を有効にするには Run を選択してね"
+              : singleDocScopeId
+              ? "Using selected document scope."
+              : "Select a run or exactly one document to enable Ask."}
           </div>
         </div>
 
