@@ -13,6 +13,7 @@ class ChatAskRequest(BaseModel):
     question: str | None = Field(default=None)
     message: str | None = Field(default=None)
     run_id: str | None = Field(default=None)
+    document_ids: list[str] | None = Field(default=None)
     debug: bool = False
     mode: str | None = Field(default=None)
 
@@ -43,6 +44,16 @@ class ChatAskRequest(BaseModel):
             if not rid:
                 raise ValueError("run_id must not be empty if provided")
             self.run_id = rid
+
+        docs = []
+        for raw in self.document_ids or []:
+            doc_id = (raw or "").strip()
+            if doc_id:
+                docs.append(doc_id)
+        self.document_ids = docs or None
+
+        if self.run_id and self.document_ids:
+            raise ValueError("Provide either run_id or document_ids, not both.")
 
         if self.mode is not None:
             mode = self.mode.strip()

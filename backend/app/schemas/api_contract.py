@@ -13,6 +13,9 @@ class HealthResponse(BaseModel):
     app_env: str
     auth_mode: str
     git_sha: str
+    llm_enabled: bool
+    openai_offline: bool
+    openai_key_present: bool
 
 
 class DocumentListItem(BaseModel):

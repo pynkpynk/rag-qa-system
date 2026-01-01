@@ -109,7 +109,7 @@ def test_eval_cases(case, monkeypatch):
 
     fetch_data = case.get("fetch")
 
-    def fake_fetch_chunks(db, qvec_lit, q_text, k, run_id, p, question, trgm_available, admin_debug_hybrid):
+    def fake_fetch_chunks(db, qvec_lit, q_text, k, run_id, document_ids, p, question, trgm_available, admin_debug_hybrid):
         if not fetch_data:
             return [], None
         rows = _load_rows(fetch_data)

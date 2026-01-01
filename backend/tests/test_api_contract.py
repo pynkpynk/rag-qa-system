@@ -61,8 +61,11 @@ def test_health_contract_shape():
     resp = client.get("/api/health")
     assert resp.status_code == 200
     data = resp.json()
-    for key in ("app", "version", "status", "time_utc"):
+    for key in ("app", "version", "status", "time_utc", "llm_enabled", "openai_offline", "openai_key_present"):
         assert key in data
+    assert isinstance(data["llm_enabled"], bool)
+    assert isinstance(data["openai_offline"], bool)
+    assert isinstance(data["openai_key_present"], bool)
 
 
 def test_docs_list_contract():

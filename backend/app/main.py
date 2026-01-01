@@ -20,6 +20,7 @@ from fastapi.encoders import jsonable_encoder
 from app.core.config import settings
 from app.core.authz import effective_auth_mode
 from app.core.build_info import get_git_sha
+from app.core.llm_status import is_llm_enabled, is_openai_offline, openai_key_present
 from app.middleware.security import (
     RequestIdMiddleware,
     SecurityHeadersMiddleware,
@@ -179,6 +180,9 @@ def create_app() -> FastAPI:
             "app_env": getattr(settings, "app_env", "dev"),
             "auth_mode": effective_auth_mode(),
             "git_sha": get_git_sha(),
+            "llm_enabled": is_llm_enabled(),
+            "openai_offline": is_openai_offline(),
+            "openai_key_present": openai_key_present(),
         }
 
     # ---- CORS ----
