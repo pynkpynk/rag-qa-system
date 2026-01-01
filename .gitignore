@@ -124,3 +124,10 @@ pnpm-debug.log*
 *.bak
 *.sqlite
 *.db
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Next.js build output
+.next/
