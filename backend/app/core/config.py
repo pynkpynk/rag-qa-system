@@ -1,11 +1,42 @@
 from __future__ import annotations
 
+from pathlib import Path
+import os
+
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+def _resolve_env_file() -> str | None:
+    backend_dir = Path(__file__).resolve().parents[2]
+    override = os.getenv("ENV_FILE")
+    candidates: list[Path] = []
+
+    if override:
+        ov_path = Path(override)
+        if not ov_path.is_absolute():
+            ov_path = backend_dir / ov_path
+        candidates.append(ov_path)
+
+    candidates.extend(
+        [
+            backend_dir / ".env.local",
+            backend_dir / ".env",
+            backend_dir / ".env.example",
+        ]
+    )
+
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
+
+_ENV_FILE = _resolve_env_file()
+
+
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(env_file=_ENV_FILE, extra="ignore")
 
     openai_api_key: SecretStr = Field(...)
     openai_offline: bool = Field(False, alias="OPENAI_OFFLINE")
@@ -43,7 +74,9 @@ class Settings(BaseSettings):
     def _validate_env(self) -> "Settings":
         env = (self.app_env or "dev").strip().lower()
         if env == "prod" and bool(self.openai_offline):
-            raise ValueError("OPENAI_OFFLINE cannot be enabled in production (APP_ENV=prod)")
+            raise ValueError(
+                "OPENAI_OFFLINE cannot be enabled in production (APP_ENV=prod)"
+            )
         return self
 
 

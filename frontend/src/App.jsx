@@ -492,7 +492,7 @@ export default function App() {
     }
   }
 
-  async function ask() {
+  async function runAsk(modeOverride = null) {
     if (!hasToken) {
       setAskError("Set a demo token first.");
       return;
@@ -502,15 +502,23 @@ export default function App() {
       setAskError("Select a run or exactly one document before asking.");
       return;
     }
+    let prompt = (modeOverride ? question : question).trim();
+    if (modeOverride === "summary_offline_safe" && !prompt) {
+      prompt = "Provide a concise summary of this scope with key findings.";
+      setQuestion((prev) => prev || prompt);
+    }
     setAskBusy(true);
     setAskError("");
     clearAnswerAndDrill();
     try {
-      const payload = { question, k: Number(k) || 6 };
+      const payload = { question: prompt || question, k: Number(k) || 6 };
       if (runId) {
         payload.run_id = runId;
       } else if (docScopeId) {
         payload.document_ids = [docScopeId];
+      }
+      if (modeOverride) {
+        payload.mode = modeOverride;
       }
       const data = await api.ask(payload);
       setAnswerText(data.answer || "");
@@ -547,6 +555,12 @@ export default function App() {
   }
 
   async function drill(cite) {
+    if (!cite?.chunk_id) {
+      // Guard to keep runtime safe even if API ever omits chunk metadata.
+      setDrillError("Cannot drill this citation because chunk_id is unavailable.");
+      return;
+    }
+    const chunkId = cite.chunk_id;
     setPdfPreviewEnabled(false);
     setPdfPreviewError("");
     setPdfPreviewBusy(false);
@@ -561,12 +575,12 @@ export default function App() {
     pageChunkRefs.current = new Map();
 
     const inferredDocId = cite?.document_id ?? resolveDocIdFromSourceId(cite?.source_id, docs) ?? null;
-    setSelectedCitation({ ...cite, document_id: inferredDocId });
+    setSelectedCitation({ ...cite, chunk_id: chunkId, document_id: inferredDocId });
     setSelectedChunk(null);
     setPageChunks([]);
 
     try {
-      const chunk = await getChunkWithFallback(cite.chunk_id, runId || null);
+      const chunk = await getChunkWithFallback(chunkId, runId || null);
       setSelectedChunk(chunk);
 
       if (chunk && (cite?.document_id == null || cite?.page == null)) {
@@ -1094,8 +1108,16 @@ export default function App() {
             />
           </div>
 
-          <button className="primary" disabled={askDisabled} onClick={() => void ask()}>
+          <button className="primary" disabled={askDisabled} onClick={() => void runAsk()}>
             Ask
+          </button>
+          <button
+            className="btnSmall"
+            disabled={askDisabled}
+            onClick={() => void runAsk("summary_offline_safe")}
+            title="Uses deterministic context + extractive fallback when LLM is offline."
+          >
+            Summary (offline-safe)
           </button>
 
           <div className="muted" style={{ flex: 1 }}>
@@ -1119,20 +1141,40 @@ export default function App() {
             <h3>Citations</h3>
             <div className="citations">
               {citations.map((c, idx) => {
+                const chunkId = c?.chunk_id ?? null;
                 const docId = c?.document_id ?? resolveDocIdFromSourceId(c?.source_id, docs) ?? null;
-                const canOpen = !!docId;
                 const fn = filenameOf(docId);
+                const drilldownBlockedReason = c?.drilldown_blocked_reason ?? null;
+                const canDrill = Boolean(chunkId) && !drilldownBlockedReason;
+                const chunkMissingReasonRaw = c?.chunk_id_missing_reason;
+                const chunkMissingReason = !canDrill
+                  ? chunkMissingReasonRaw
+                    ? `Chunk unavailable: ${chunkMissingReasonRaw}`
+                    : drilldownBlockedReason
+                    ? `Drilldown disabled: ${drilldownBlockedReason}`
+                    : "Chunk reference unavailable."
+                  : null;
+                const citeKey = `${chunkId ?? `nochunk-${idx}`}-${c?.source_id ?? "S"}-${idx}`;
+                const citeClass = canDrill ? "citeItem" : "citeItem disabled";
+                const pdfEnabled = Boolean(docId) && canDrill;
+                const pdfDisabledTitle = !canDrill
+                  ? chunkMissingReason || "chunk_id unavailable"
+                  : "document_id is unavailable";
 
                 return (
                   <div
-                    key={`${c.chunk_id}-${c.source_id ?? "S"}-${idx}`}
-                    className="citeItem"
-                    onClick={() => void drill(c)}
-                    role="button"
-                    tabIndex={0}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter" || e.key === " ") void drill(c);
-                    }}
+                    key={citeKey}
+                    className={citeClass}
+                    onClick={canDrill ? () => void drill(c) : undefined}
+                    role={canDrill ? "button" : undefined}
+                    tabIndex={canDrill ? 0 : -1}
+                    onKeyDown={
+                      canDrill
+                        ? (e) => {
+                            if (e.key === "Enter" || e.key === " ") void drill(c);
+                          }
+                        : undefined
+                    }
                   >
                     <div className="citeTitle">
                       <div>
@@ -1142,33 +1184,34 @@ export default function App() {
                       <div className="mono">page {c.page}</div>
                     </div>
 
-                    <div className="citeMeta mono">{c.chunk_id}</div>
+                    <div className="citeMeta mono">{chunkId || "(chunk unavailable)"}</div>
+                    {!canDrill && chunkMissingReason ? <div className="citeWarning">{chunkMissingReason}</div> : null}
 
                     <div className="citeLinks">
                       <button
                         className="btnSmall"
-                        disabled={!canOpen}
+                        disabled={!pdfEnabled}
                         onClick={(e) => {
                           e.stopPropagation();
-                          if (!docId) return;
+                          if (!pdfEnabled) return;
                           const url = `${pdfViewUrl(docId)}${pdfPageHash(c.page)}`;
                           window.open(url, "_blank", "noopener,noreferrer");
                         }}
-                        title={canOpen ? "Open the PDF inline at the cited page" : "document_id is unavailable"}
+                        title={pdfEnabled ? "Open the PDF inline at the cited page" : pdfDisabledTitle}
                       >
                         Open PDF
                       </button>
 
                       <button
                         className="btnSmall"
-                        disabled={!canOpen}
+                        disabled={!pdfEnabled}
                         onClick={(e) => {
                           e.stopPropagation();
-                          if (!docId) return;
+                          if (!pdfEnabled) return;
                           const url = `${pdfDownloadUrl(docId)}${pdfPageHash(c.page)}`;
                           window.open(url, "_blank", "noopener,noreferrer");
                         }}
-                        title={canOpen ? "Download the PDF at the cited page" : "document_id is unavailable"}
+                        title={pdfEnabled ? "Download the PDF at the cited page" : pdfDisabledTitle}
                         style={{ marginLeft: 8 }}
                       >
                         Download

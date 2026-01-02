@@ -1,5 +1,4 @@
 from alembic import op
-import sqlalchemy as sa
 
 revision = "0003_add_owner_sub_to_runs"
 down_revision = "0002_add_owner_sub_to_documents"

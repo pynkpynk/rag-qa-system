@@ -15,7 +15,9 @@ from sqlalchemy.orm import sessionmaker
 # ----------------------------
 _RE_HEADER = re.compile(r"^\s*SID\s+WID\s+text_to_write\s*$", re.IGNORECASE)
 _RE_LEADING_NUM_COLS = re.compile(r"^\s*\d+\s+\d+\s+")
-_RE_LICENSE_LINE = re.compile(r"^\s*Licensed to Google for training use only\.\s*$", re.IGNORECASE)
+_RE_LICENSE_LINE = re.compile(
+    r"^\s*Licensed to Google for training use only\.\s*$", re.IGNORECASE
+)
 
 
 def clean_chunk_text(raw: str) -> str:
@@ -106,19 +108,35 @@ def iter_chunks(session, owner_sub: Optional[str], limit: int) -> Iterable[Row]:
     ORDER BY c.id
     LIMIT :limit
     """
-    rows = session.execute(text(q), {"owner_sub": owner_sub, "limit": limit}).mappings().all()
+    rows = (
+        session.execute(text(q), {"owner_sub": owner_sub, "limit": limit})
+        .mappings()
+        .all()
+    )
     for r in rows:
         yield Row(chunk_id=r["chunk_id"], text=r["text"] or "")
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--owner-sub", default=None, help="Filter by documents.owner_sub (e.g. auth0|xxxx). Omit to target all.")
+    ap.add_argument(
+        "--owner-sub",
+        default=None,
+        help="Filter by documents.owner_sub (e.g. auth0|xxxx). Omit to target all.",
+    )
     ap.add_argument("--limit", type=int, default=100000, help="Max chunks to scan")
-    ap.add_argument("--dry-run", action="store_true", help="Do not write updates; just report")
+    ap.add_argument(
+        "--dry-run", action="store_true", help="Do not write updates; just report"
+    )
     ap.add_argument("--apply", action="store_true", help="Write updates to DB")
-    ap.add_argument("--reembed", action="store_true", help="Recompute embeddings for changed chunks (costs tokens)")
-    ap.add_argument("--print-samples", type=int, default=3, help="Print N sample before/after pairs")
+    ap.add_argument(
+        "--reembed",
+        action="store_true",
+        help="Recompute embeddings for changed chunks (costs tokens)",
+    )
+    ap.add_argument(
+        "--print-samples", type=int, default=3, help="Print N sample before/after pairs"
+    )
     args = ap.parse_args()
 
     if args.apply and args.dry_run:
@@ -156,7 +174,9 @@ def main() -> None:
                     emb = embed_text(cleaned)
                     emb_lit = _to_pgvector_literal(emb)
                     session.execute(
-                        text("UPDATE chunks SET text=:t, embedding=CAST(:e AS vector) WHERE id=CAST(:id AS uuid)"),
+                        text(
+                            "UPDATE chunks SET text=:t, embedding=CAST(:e AS vector) WHERE id=CAST(:id AS uuid)"
+                        ),
                         {"t": cleaned, "e": emb_lit, "id": row.chunk_id},
                     )
                 else:
@@ -172,7 +192,9 @@ def main() -> None:
         if args.apply:
             session.commit()
 
-    print(f"scanned={scanned} changed={changed} mode={'APPLY' if args.apply else 'DRY-RUN'} reembed={args.reembed}")
+    print(
+        f"scanned={scanned} changed={changed} mode={'APPLY' if args.apply else 'DRY-RUN'} reembed={args.reembed}"
+    )
 
 
 if __name__ == "__main__":

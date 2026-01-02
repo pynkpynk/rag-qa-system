@@ -11,8 +11,6 @@ import hashlib
 import hmac
 from typing import Any, Iterable, Literal, Annotated
 
-import sys
-
 from fastapi import APIRouter, Depends, HTTPException, Request
 from openai import OpenAI
 from pydantic import BaseModel, Field, model_validator
@@ -36,6 +34,7 @@ audit_logger = logging.getLogger("audit")
 # Request model
 # ============================================================
 
+
 class AskPayload(BaseModel):
     question: Annotated[
         str,
@@ -48,6 +47,7 @@ class AskPayload(BaseModel):
     run_id: str | None = None
     document_ids: list[str] = Field(default_factory=list)
     debug: bool = False
+    mode: str | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -62,7 +62,11 @@ class AskPayload(BaseModel):
             data["question"] = q
             return data
 
-        if (not q or (isinstance(q, str) and not q.strip())) and isinstance(m, str) and m.strip():
+        if (
+            (not q or (isinstance(q, str) and not q.strip()))
+            and isinstance(m, str)
+            and m.strip()
+        ):
             data["question"] = m
             return data
 
@@ -85,6 +89,9 @@ class AskPayload(BaseModel):
         self.document_ids = cleaned_docs
         if self.run_id and self.document_ids:
             raise ValueError("Provide either run_id or document_ids, not both.")
+        if self.mode is not None:
+            mode = self.mode.strip()
+            self.mode = mode if mode else None
         return self
 
 
@@ -112,6 +119,17 @@ KNOWN_UNSUPPORTED_PARAMS: dict[str, set[str]] = {
 }
 
 SUMMARY_Q_RE = re.compile(r"(要約|要点|まとめ|概要|サマリ|summary|summarize)", re.I)
+SUMMARY_BASE_CHUNKS = int(os.getenv("SUMMARY_BASE_CHUNKS", "6") or "6")
+SUMMARY_ANCHOR_CHUNKS = int(os.getenv("SUMMARY_ANCHOR_CHUNKS", "6") or "6")
+SUMMARY_TOTAL_CHUNKS = SUMMARY_BASE_CHUNKS + SUMMARY_ANCHOR_CHUNKS
+ANCHOR_TERM_LIMIT = int(os.getenv("SUMMARY_ANCHOR_TERM_LIMIT", "8") or "8")
+SUMMARY_NO_SOURCES_MESSAGE = (
+    "[NO_SOURCES] No accessible content was found for this summary request. "
+    "Attach or index the relevant documents, then try again."
+)
+SUMMARY_DRILLDOWN_BLOCKED_REASON = (
+    "Summary run is still provisioning drilldown access for this citation."
+)
 
 _CITATION_FORMAT_HINT_RE = re.compile(r"\[S\?\s*p\.\?\]")
 _FORMAT_SENTENCE_RE = re.compile(r"形式は[「\"']?\[S\?\s*p\.\?\][」\"']?とする。?")
@@ -130,7 +148,9 @@ GENERIC_Q_RE = re.compile(
 VEC_MAX_COS_DIST = float(os.getenv("VEC_MAX_COS_DIST", "0.45"))
 
 # ★ NEW: deictic/ambiguous reference gate
-REJECT_AMBIGUOUS_REFERENCE_WITHOUT_RUN = os.getenv("REJECT_AMBIGUOUS_REFERENCE_WITHOUT_RUN", "1") == "1"
+REJECT_AMBIGUOUS_REFERENCE_WITHOUT_RUN = (
+    os.getenv("REJECT_AMBIGUOUS_REFERENCE_WITHOUT_RUN", "1") == "1"
+)
 AMBIGUOUS_REF_RE = re.compile(
     r"(この|その|上記|上述|前述|本)\s*(pdf|PDF|文書|資料|ファイル)"
     r"|(?:上記|上述|前述)(?:の(?:内容|文章))?"
@@ -149,6 +169,7 @@ _DEICTIC_ABSTRACT_RE = re.compile(
     re.IGNORECASE,
 )
 
+
 def is_generic_query(q: str) -> bool:
     qq = (q or "").strip()
     if len(qq) < MIN_QUERY_CHARS:
@@ -156,6 +177,7 @@ def is_generic_query(q: str) -> bool:
     if GENERIC_Q_RE.fullmatch(qq):
         return True
     return False
+
 
 def has_ambiguous_reference(q: str) -> bool:
     text = (q or "").strip()
@@ -167,6 +189,7 @@ def has_ambiguous_reference(q: str) -> bool:
     if _DEICTIC_FOLLOWUP_RE.search(normalized):
         return True
     return bool(_DEICTIC_ABSTRACT_RE.search(normalized))
+
 
 def normalize_bullets(text: str) -> str:
     """
@@ -192,12 +215,15 @@ HYBRID_FTS_K = int(os.getenv("HYBRID_FTS_K", "30"))
 RRF_K = int(os.getenv("RRF_K", "60"))
 
 ENABLE_RETRIEVAL_DEBUG = os.getenv("ENABLE_RETRIEVAL_DEBUG", "1") == "1"
-RETRIEVAL_DEBUG_REQUIRE_TOKEN_HASH = os.getenv("RETRIEVAL_DEBUG_REQUIRE_TOKEN_HASH", "0") == "1"
+RETRIEVAL_DEBUG_REQUIRE_TOKEN_HASH = (
+    os.getenv("RETRIEVAL_DEBUG_REQUIRE_TOKEN_HASH", "0") == "1"
+)
 ENABLE_TRGM = os.getenv("ENABLE_TRGM", "1") == "1"
 TRGM_K = max(1, int(os.getenv("TRGM_K", "30") or "30"))
 APP_ENV = (os.getenv("APP_ENV", "dev") or "dev").strip().lower()
 _ALLOW_PROD_DEBUG = os.getenv("ALLOW_PROD_DEBUG", "0") == "1"
 _TRGM_AVAILABLE_FLAG: bool | None = None
+
 
 def _parse_admin_debug_token_hashes(raw: str | None) -> set[str]:
     hashes: set[str] = set()
@@ -207,30 +233,51 @@ def _parse_admin_debug_token_hashes(raw: str | None) -> set[str]:
             hashes.add(h)
     return hashes
 
-_ADMIN_DEBUG_TOKEN_HASHES = _parse_admin_debug_token_hashes(os.getenv("ADMIN_DEBUG_TOKEN_SHA256_LIST"))
-ADMIN_DEBUG_STRATEGY = (os.getenv("ADMIN_DEBUG_STRATEGY", "firstk") or "firstk").strip().lower()
+
+_ADMIN_DEBUG_TOKEN_HASHES = _parse_admin_debug_token_hashes(
+    os.getenv("ADMIN_DEBUG_TOKEN_SHA256_LIST")
+)
+ADMIN_DEBUG_STRATEGY = (
+    (os.getenv("ADMIN_DEBUG_STRATEGY", "firstk") or "firstk").strip().lower()
+)
 
 
 def _refresh_retrieval_debug_flags() -> None:
-    global ENABLE_RETRIEVAL_DEBUG, RETRIEVAL_DEBUG_REQUIRE_TOKEN_HASH, ADMIN_DEBUG_STRATEGY, _ADMIN_DEBUG_TOKEN_HASHES, APP_ENV, _ALLOW_PROD_DEBUG
+    global \
+        ENABLE_RETRIEVAL_DEBUG, \
+        RETRIEVAL_DEBUG_REQUIRE_TOKEN_HASH, \
+        ADMIN_DEBUG_STRATEGY, \
+        _ADMIN_DEBUG_TOKEN_HASHES, \
+        APP_ENV, \
+        _ALLOW_PROD_DEBUG
     ENABLE_RETRIEVAL_DEBUG = os.getenv("ENABLE_RETRIEVAL_DEBUG", "1") == "1"
-    RETRIEVAL_DEBUG_REQUIRE_TOKEN_HASH = os.getenv("RETRIEVAL_DEBUG_REQUIRE_TOKEN_HASH", "0") == "1"
-    ADMIN_DEBUG_STRATEGY = (os.getenv("ADMIN_DEBUG_STRATEGY", "firstk") or "firstk").strip().lower()
-    _ADMIN_DEBUG_TOKEN_HASHES = _parse_admin_debug_token_hashes(os.getenv("ADMIN_DEBUG_TOKEN_SHA256_LIST"))
+    RETRIEVAL_DEBUG_REQUIRE_TOKEN_HASH = (
+        os.getenv("RETRIEVAL_DEBUG_REQUIRE_TOKEN_HASH", "0") == "1"
+    )
+    ADMIN_DEBUG_STRATEGY = (
+        (os.getenv("ADMIN_DEBUG_STRATEGY", "firstk") or "firstk").strip().lower()
+    )
+    _ADMIN_DEBUG_TOKEN_HASHES = _parse_admin_debug_token_hashes(
+        os.getenv("ADMIN_DEBUG_TOKEN_SHA256_LIST")
+    )
     APP_ENV = (os.getenv("APP_ENV", "dev") or "dev").strip().lower()
     _ALLOW_PROD_DEBUG = os.getenv("ALLOW_PROD_DEBUG", "0") == "1"
+
 
 def _is_prod_env() -> bool:
     return APP_ENV == "prod"
 
+
 def _debug_allowed_in_env() -> bool:
     return (not _is_prod_env()) or _ALLOW_PROD_DEBUG
+
 
 def _safe_hash_identifier(value: str | None) -> str | None:
     if not value:
         return None
     digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
     return digest[:12]
+
 
 def _extract_error_code(detail: Any) -> str | None:
     if isinstance(detail, dict):
@@ -240,6 +287,7 @@ def _extract_error_code(detail: Any) -> str | None:
             if isinstance(val, str):
                 return val
     return None
+
 
 def _emit_audit_event(
     *,
@@ -274,26 +322,35 @@ def _emit_audit_event(
     line = json.dumps(event, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
     audit_logger.info(line)
 
+
 _FTS_CONFIG_RAW = os.getenv("FTS_CONFIG", "simple")
-FTS_CONFIG = _FTS_CONFIG_RAW if re.fullmatch(r"[A-Za-z_]+", _FTS_CONFIG_RAW or "") else "simple"
+FTS_CONFIG = (
+    _FTS_CONFIG_RAW if re.fullmatch(r"[A-Za-z_]+", _FTS_CONFIG_RAW or "") else "simple"
+)
 
 FTS_QUERY_MODE = (os.getenv("FTS_QUERY_MODE", "plainto") or "plainto").strip().lower()
 if FTS_QUERY_MODE not in {"plainto", "websearch"}:
     FTS_QUERY_MODE = "plainto"
 
-TSQUERY_FN = "websearch_to_tsquery" if FTS_QUERY_MODE == "websearch" else "plainto_tsquery"
+TSQUERY_FN = (
+    "websearch_to_tsquery" if FTS_QUERY_MODE == "websearch" else "plainto_tsquery"
+)
 TSQUERY_EXPR = f"{TSQUERY_FN}('{FTS_CONFIG}', :q)"
 
 _CJK_RE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af]")
 
+
 def contains_cjk(text: str) -> bool:
     return bool(_CJK_RE.search(text or ""))
+
 
 def query_class(text: str) -> Literal["cjk", "latin"]:
     return "cjk" if contains_cjk(text) else "latin"
 
+
 def should_use_fts(text: str) -> bool:
     return query_class(text) == "latin"
+
 
 def should_use_trgm(text: str, *, trgm_available: bool | None = None) -> bool:
     if not ENABLE_TRGM:
@@ -304,8 +361,11 @@ def should_use_trgm(text: str, *, trgm_available: bool | None = None) -> bool:
     if len(t) < 2:
         return False
     if trgm_available is None:
-        trgm_available = True if _TRGM_AVAILABLE_FLAG is None else bool(_TRGM_AVAILABLE_FLAG)
+        trgm_available = (
+            True if _TRGM_AVAILABLE_FLAG is None else bool(_TRGM_AVAILABLE_FLAG)
+        )
     return bool(trgm_available) and query_class(t) == "cjk"
+
 
 def get_bearer_token(request: Request | None) -> str | None:
     if request is None or not hasattr(request, "headers"):
@@ -322,6 +382,7 @@ def get_bearer_token(request: Request | None) -> str | None:
     token = parts[1].strip()
     return token or None
 
+
 def _token_hash_allowed(token: str | None) -> bool:
     if not token or not _ADMIN_DEBUG_TOKEN_HASHES:
         return False
@@ -331,9 +392,13 @@ def _token_hash_allowed(token: str | None) -> bool:
             return True
     return False
 
-def admin_debug_via_token(request: Request | None, *, bearer_token: str | None = None) -> bool:
+
+def admin_debug_via_token(
+    request: Request | None, *, bearer_token: str | None = None
+) -> bool:
     token = bearer_token if bearer_token is not None else get_bearer_token(request)
     return _token_hash_allowed(token)
+
 
 def is_admin_debug(
     principal: Principal | None,
@@ -342,26 +407,35 @@ def is_admin_debug(
     bearer_token: str | None = None,
     is_admin_user: bool | None = None,
 ) -> bool:
-    admin_sub = bool(is_admin_user if is_admin_user is not None else (is_admin(principal) if principal else False))
+    admin_sub = bool(
+        is_admin_user
+        if is_admin_user is not None
+        else (is_admin(principal) if principal else False)
+    )
     token = bearer_token if bearer_token is not None else get_bearer_token(request)
     token_allowed = _token_hash_allowed(token)
     if RETRIEVAL_DEBUG_REQUIRE_TOKEN_HASH:
         return bool(token_allowed)
     return bool(admin_sub or token_allowed)
 
+
 def _detect_trgm_available(db: Session) -> bool:
     global _TRGM_AVAILABLE_FLAG
     if _TRGM_AVAILABLE_FLAG is not None:
         return _TRGM_AVAILABLE_FLAG
     try:
-        row = db.execute(sql_text("SELECT true FROM pg_extension WHERE extname = 'pg_trgm'")).first()
+        row = db.execute(
+            sql_text("SELECT true FROM pg_extension WHERE extname = 'pg_trgm'")
+        ).first()
         _TRGM_AVAILABLE_FLAG = bool(row)
     except Exception:
         _TRGM_AVAILABLE_FLAG = False
     return _TRGM_AVAILABLE_FLAG
 
 
-def _ensure_document_scope(db: Session, document_ids: list[str], principal: Principal) -> list[str]:
+def _ensure_document_scope(
+    db: Session, document_ids: list[str], principal: Principal
+) -> list[str]:
     """Validate that the requested document_ids exist and belong to the principal (unless admin)."""
     cleaned: list[str] = []
     seen: set[str] = set()
@@ -372,19 +446,126 @@ def _ensure_document_scope(db: Session, document_ids: list[str], principal: Prin
         seen.add(doc_id)
         cleaned.append(doc_id)
     if not cleaned:
-        raise HTTPException(status_code=422, detail="document_ids must contain at least one id.")
+        raise HTTPException(
+            status_code=422, detail="document_ids must contain at least one id."
+        )
 
     stmt = select(Document.id).where(Document.id.in_(cleaned))
     if not is_admin(principal):
         if not principal.sub:
-            raise HTTPException(status_code=404, detail="document not found or access denied.")
+            raise HTTPException(
+                status_code=404, detail="document not found or access denied."
+            )
         stmt = stmt.where(Document.owner_sub == principal.sub)
 
     rows = [row[0] for row in db.execute(stmt)]
     missing = [doc_id for doc_id in cleaned if doc_id not in rows]
     if missing:
-        raise HTTPException(status_code=404, detail="document not found or access denied.")
+        raise HTTPException(
+            status_code=404, detail="document not found or access denied."
+        )
     return cleaned
+
+
+def _run_has_accessible_docs(
+    db: Session, run_id: str | None, principal: Principal
+) -> bool:
+    if not run_id:
+        return False
+    params: dict[str, Any] = {"run_id": run_id}
+    if is_admin(principal):
+        sql = SQL_RUN_DOC_COUNT_ADMIN
+    else:
+        sql = SQL_RUN_DOC_COUNT_USER
+        params["owner_sub"] = principal.sub
+    result = db.execute(sql_text(sql), params).scalar()
+    return bool(result and int(result) > 0)
+
+
+def _create_summary_run(
+    db: Session, owner_sub: str | None, doc_scope: list[str]
+) -> Run:
+    run = Run(
+        owner_sub=(owner_sub or "demo|summary"),
+        config={"mode": "summary_offline_safe"},
+        status="summary_ephemeral",
+    )
+    if doc_scope:
+        docs = db.query(Document).filter(Document.id.in_(doc_scope)).all()
+        for doc in docs:
+            run.documents.append(doc)
+    run.t0 = _utcnow()
+    db.add(run)
+    db.commit()
+    db.refresh(run)
+    return run
+
+
+def _attach_docs_to_summary_run(
+    db: Session,
+    run: Run | None,
+    doc_ids: set[str],
+    *,
+    is_admin_user: bool,
+) -> set[str]:
+    if run is None or not doc_ids:
+        return set()
+    if not hasattr(db, "query"):
+        return set()
+
+    safe_ids = {str(doc_id) for doc_id in doc_ids if doc_id}
+    if not safe_ids:
+        return set()
+
+    existing: set[str] = set()
+    for doc in getattr(run, "documents", []) or []:
+        doc_id = getattr(doc, "id", None)
+        if doc_id:
+            existing.add(str(doc_id))
+
+    missing = [doc_id for doc_id in safe_ids if doc_id not in existing]
+    if not missing:
+        return set()
+
+    try:
+        q = db.query(Document).filter(Document.id.in_(missing))
+        if run.owner_sub and not is_admin_user:
+            q = q.filter(Document.owner_sub == run.owner_sub)
+        docs = q.all()
+    except Exception:
+        logger.exception(
+            "summary_run_attach_docs_failed_query",
+            extra={"run_id": getattr(run, "id", None)},
+        )
+        return safe_ids
+
+    attached: set[str] = set()
+    for doc in docs:
+        try:
+            run.documents.append(doc)
+            doc_id = getattr(doc, "id", None)
+            if doc_id:
+                attached.add(str(doc_id))
+        except Exception:
+            logger.exception(
+                "summary_run_attach_docs_failed_append",
+                extra={"run_id": getattr(run, "id", None)},
+            )
+            return safe_ids
+
+    try:
+        db.commit()
+        db.refresh(run)
+    except Exception:
+        logger.exception(
+            "summary_run_attach_docs_failed_commit",
+            extra={"run_id": getattr(run, "id", None)},
+        )
+        db.rollback()
+        return safe_ids
+
+    failures = safe_ids - attached
+    return failures
 
 
 # ============================================================
@@ -727,11 +908,14 @@ WHERE rd.run_id = :run_id
   AND d.owner_sub = :owner_sub
 """
 
+
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
+
 def _is_summary_question(q: str) -> bool:
     return bool(SUMMARY_Q_RE.search(q or ""))
+
 
 def sanitize_question_for_llm(question: str) -> str:
     q = (question or "").strip()
@@ -739,6 +923,7 @@ def sanitize_question_for_llm(question: str) -> str:
     q = _CITATION_FORMAT_HINT_RE.sub("", q)
     q = re.sub(r"\s{2,}", " ", q).strip()
     return q
+
 
 def _preview(rows: list[dict[str, Any]], n: int = 5) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
@@ -753,6 +938,7 @@ def _preview(rows: list[dict[str, Any]], n: int = 5) -> list[dict[str, Any]]:
             }
         )
     return out
+
 
 def _rrf_merge(
     vec_rows: list[dict[str, Any]],
@@ -787,6 +973,7 @@ def _rrf_merge(
         merged.append(rr)
     return merged
 
+
 def _best_vec_dist(rows: list[dict[str, Any]]) -> float | None:
     dists: list[float] = []
     for r in rows:
@@ -796,6 +983,7 @@ def _best_vec_dist(rows: list[dict[str, Any]]) -> float | None:
             except Exception:
                 pass
     return min(dists) if dists else None
+
 
 def fetch_chunks(
     db: Session,
@@ -840,28 +1028,69 @@ def fetch_chunks(
 
     if run_id:
         if is_admin(p):
-            cnt_row = db.execute(sql_text(SQL_RUN_DOC_COUNT_ADMIN), {"run_id": run_id}).mappings().first()
+            cnt_row = (
+                db.execute(sql_text(SQL_RUN_DOC_COUNT_ADMIN), {"run_id": run_id})
+                .mappings()
+                .first()
+            )
             if not cnt_row or int(cnt_row["cnt"]) == 0:
-                raise HTTPException(status_code=400, detail="This run_id has no attached documents. Attach docs first.")
+                raise HTTPException(
+                    status_code=400,
+                    detail="This run_id has no attached documents. Attach docs first.",
+                )
 
             if summary_intent:
                 k_eff = min(max(k, 20), 50)
-                rows = [dict(r) for r in db.execute(sql_text(SQL_FIRSTK_BY_RUN_ADMIN), {"run_id": run_id, "k": k_eff}).mappings().all()]
+                rows = [
+                    dict(r)
+                    for r in db.execute(
+                        sql_text(SQL_FIRSTK_BY_RUN_ADMIN),
+                        {"run_id": run_id, "k": k_eff},
+                    )
+                    .mappings()
+                    .all()
+                ]
                 if debug is not None:
                     debug["strategy"] = "firstk_by_run_admin"
                     debug["count"] = len(rows)
-                return _apply_offline_fallback(rows, db=db, run_id=run_id, document_ids=None, p=p, k=k, debug=debug)
+                return _apply_offline_fallback(
+                    rows, db=db, run_id=run_id, document_ids=None, p=p, k=k, debug=debug
+                )
 
             if q_text and (ENABLE_HYBRID or use_trgm or force_admin_hybrid):
                 vec_k = HYBRID_VEC_K if ENABLE_HYBRID else k
-                vec = [dict(r) for r in db.execute(sql_text(SQL_TOPK_BY_RUN_ADMIN), {"qvec": qvec_lit, "k": vec_k, "run_id": run_id}).mappings().all()]
+                vec = [
+                    dict(r)
+                    for r in db.execute(
+                        sql_text(SQL_TOPK_BY_RUN_ADMIN),
+                        {"qvec": qvec_lit, "k": vec_k, "run_id": run_id},
+                    )
+                    .mappings()
+                    .all()
+                ]
                 aux_rows: list[dict[str, Any]] = []
                 aux_kind: str | None = None
                 if ENABLE_HYBRID and use_fts:
-                    aux_rows = [dict(r) for r in db.execute(sql_text(SQL_FTS_BY_RUN_ADMIN), {"q": q_text, "k": HYBRID_FTS_K, "run_id": run_id}).mappings().all()]
+                    aux_rows = [
+                        dict(r)
+                        for r in db.execute(
+                            sql_text(SQL_FTS_BY_RUN_ADMIN),
+                            {"q": q_text, "k": HYBRID_FTS_K, "run_id": run_id},
+                        )
+                        .mappings()
+                        .all()
+                    ]
                     aux_kind = "fts"
                 elif use_trgm:
-                    aux_rows = [dict(r) for r in db.execute(sql_text(SQL_TRGM_BY_RUN_ADMIN), {"q": q_text, "k": TRGM_K, "run_id": run_id}).mappings().all()]
+                    aux_rows = [
+                        dict(r)
+                        for r in db.execute(
+                            sql_text(SQL_TRGM_BY_RUN_ADMIN),
+                            {"q": q_text, "k": TRGM_K, "run_id": run_id},
+                        )
+                        .mappings()
+                        .all()
+                    ]
                     aux_kind = "trgm"
                 merged = _rrf_merge(vec, aux_rows, k, rrf_k=RRF_K)
 
@@ -882,38 +1111,108 @@ def fetch_chunks(
                     debug["merged_top5"] = _preview(merged)
 
                 rows = merged if merged else vec[:k]
-                return _apply_offline_fallback(rows, db=db, run_id=run_id, document_ids=None, p=p, k=k, debug=debug)
+                return _apply_offline_fallback(
+                    rows, db=db, run_id=run_id, document_ids=None, p=p, k=k, debug=debug
+                )
 
-            rows = [dict(r) for r in db.execute(sql_text(SQL_TOPK_BY_RUN_ADMIN), {"qvec": qvec_lit, "k": k, "run_id": run_id}).mappings().all()]
+            rows = [
+                dict(r)
+                for r in db.execute(
+                    sql_text(SQL_TOPK_BY_RUN_ADMIN),
+                    {"qvec": qvec_lit, "k": k, "run_id": run_id},
+                )
+                .mappings()
+                .all()
+            ]
             if debug is not None:
                 debug["strategy"] = "vector_by_run_admin"
                 debug["count"] = len(rows)
                 debug["vec_best_dist"] = _best_vec_dist(rows)
                 debug["top5"] = _preview(rows)
-            return _apply_offline_fallback(rows, db=db, run_id=run_id, document_ids=None, p=p, k=k, debug=debug)
+            return _apply_offline_fallback(
+                rows, db=db, run_id=run_id, document_ids=None, p=p, k=k, debug=debug
+            )
 
-        cnt_row = db.execute(sql_text(SQL_RUN_DOC_COUNT_USER), {"run_id": run_id, "owner_sub": p.sub}).mappings().first()
+        cnt_row = (
+            db.execute(
+                sql_text(SQL_RUN_DOC_COUNT_USER), {"run_id": run_id, "owner_sub": p.sub}
+            )
+            .mappings()
+            .first()
+        )
         if not cnt_row or int(cnt_row["cnt"]) == 0:
-            raise HTTPException(status_code=400, detail="This run_id has no attached documents. Attach docs first.")
+            raise HTTPException(
+                status_code=400,
+                detail="This run_id has no attached documents. Attach docs first.",
+            )
 
         if summary_intent:
             k_eff = min(max(k, 20), 50)
-            rows = [dict(r) for r in db.execute(sql_text(SQL_FIRSTK_BY_RUN_USER), {"run_id": run_id, "k": k_eff, "owner_sub": p.sub}).mappings().all()]
+            rows = [
+                dict(r)
+                for r in db.execute(
+                    sql_text(SQL_FIRSTK_BY_RUN_USER),
+                    {"run_id": run_id, "k": k_eff, "owner_sub": p.sub},
+                )
+                .mappings()
+                .all()
+            ]
             if debug is not None:
                 debug["strategy"] = "firstk_by_run_user"
                 debug["count"] = len(rows)
-            return _apply_offline_fallback(rows, db=db, run_id=run_id, document_ids=None, p=p, k=k, debug=debug)
+            return _apply_offline_fallback(
+                rows, db=db, run_id=run_id, document_ids=None, p=p, k=k, debug=debug
+            )
 
         if q_text and (ENABLE_HYBRID or use_trgm):
             vec_k = HYBRID_VEC_K if ENABLE_HYBRID else k
-            vec = [dict(r) for r in db.execute(sql_text(SQL_TOPK_BY_RUN_USER), {"qvec": qvec_lit, "k": vec_k, "run_id": run_id, "owner_sub": p.sub}).mappings().all()]
+            vec = [
+                dict(r)
+                for r in db.execute(
+                    sql_text(SQL_TOPK_BY_RUN_USER),
+                    {
+                        "qvec": qvec_lit,
+                        "k": vec_k,
+                        "run_id": run_id,
+                        "owner_sub": p.sub,
+                    },
+                )
+                .mappings()
+                .all()
+            ]
             aux_rows: list[dict[str, Any]] = []
             aux_kind: str | None = None
             if ENABLE_HYBRID and use_fts:
-                aux_rows = [dict(r) for r in db.execute(sql_text(SQL_FTS_BY_RUN_USER), {"q": q_text, "k": HYBRID_FTS_K, "run_id": run_id, "owner_sub": p.sub}).mappings().all()]
+                aux_rows = [
+                    dict(r)
+                    for r in db.execute(
+                        sql_text(SQL_FTS_BY_RUN_USER),
+                        {
+                            "q": q_text,
+                            "k": HYBRID_FTS_K,
+                            "run_id": run_id,
+                            "owner_sub": p.sub,
+                        },
+                    )
+                    .mappings()
+                    .all()
+                ]
                 aux_kind = "fts"
             elif use_trgm:
-                aux_rows = [dict(r) for r in db.execute(sql_text(SQL_TRGM_BY_RUN_USER), {"q": q_text, "k": TRGM_K, "run_id": run_id, "owner_sub": p.sub}).mappings().all()]
+                aux_rows = [
+                    dict(r)
+                    for r in db.execute(
+                        sql_text(SQL_TRGM_BY_RUN_USER),
+                        {
+                            "q": q_text,
+                            "k": TRGM_K,
+                            "run_id": run_id,
+                            "owner_sub": p.sub,
+                        },
+                    )
+                    .mappings()
+                    .all()
+                ]
                 aux_kind = "trgm"
             merged = _rrf_merge(vec, aux_rows, k, rrf_k=RRF_K)
 
@@ -934,15 +1233,27 @@ def fetch_chunks(
                 debug["merged_top5"] = _preview(merged)
 
             rows = merged if merged else vec[:k]
-            return _apply_offline_fallback(rows, db=db, run_id=run_id, document_ids=None, p=p, k=k, debug=debug)
+            return _apply_offline_fallback(
+                rows, db=db, run_id=run_id, document_ids=None, p=p, k=k, debug=debug
+            )
 
-        rows = [dict(r) for r in db.execute(sql_text(SQL_TOPK_BY_RUN_USER), {"qvec": qvec_lit, "k": k, "run_id": run_id, "owner_sub": p.sub}).mappings().all()]
+        rows = [
+            dict(r)
+            for r in db.execute(
+                sql_text(SQL_TOPK_BY_RUN_USER),
+                {"qvec": qvec_lit, "k": k, "run_id": run_id, "owner_sub": p.sub},
+            )
+            .mappings()
+            .all()
+        ]
         if debug is not None:
             debug["strategy"] = "vector_by_run_user"
             debug["count"] = len(rows)
             debug["vec_best_dist"] = _best_vec_dist(rows)
             debug["top5"] = _preview(rows)
-        return _apply_offline_fallback(rows, db=db, run_id=run_id, document_ids=None, p=p, k=k, debug=debug)
+        return _apply_offline_fallback(
+            rows, db=db, run_id=run_id, document_ids=None, p=p, k=k, debug=debug
+        )
 
     if doc_scope:
         scope_params = {"doc_ids": doc_scope}
@@ -950,38 +1261,111 @@ def fetch_chunks(
         if summary_intent:
             k_eff = min(max(k, 20), 50)
             if is_admin(p):
-                rows = [dict(r) for r in db.execute(sql_text(SQL_FIRSTK_BY_DOCS_ADMIN), {**scope_params, "k": k_eff}).mappings().all()]
+                rows = [
+                    dict(r)
+                    for r in db.execute(
+                        sql_text(SQL_FIRSTK_BY_DOCS_ADMIN), {**scope_params, "k": k_eff}
+                    )
+                    .mappings()
+                    .all()
+                ]
                 strat = "firstk_by_docs_admin"
             else:
-                rows = [dict(r) for r in db.execute(sql_text(SQL_FIRSTK_BY_DOCS_USER), {**scope_params_with_owner, "k": k_eff}).mappings().all()]
+                rows = [
+                    dict(r)
+                    for r in db.execute(
+                        sql_text(SQL_FIRSTK_BY_DOCS_USER),
+                        {**scope_params_with_owner, "k": k_eff},
+                    )
+                    .mappings()
+                    .all()
+                ]
                 strat = "firstk_by_docs_user"
             if debug is not None:
                 debug["strategy"] = strat
                 debug["count"] = len(rows)
-            return _apply_offline_fallback(rows, db=db, run_id=run_id, document_ids=doc_scope, p=p, k=k, debug=debug)
+            return _apply_offline_fallback(
+                rows,
+                db=db,
+                run_id=run_id,
+                document_ids=doc_scope,
+                p=p,
+                k=k,
+                debug=debug,
+            )
 
         if q_text and (ENABLE_HYBRID or use_trgm or force_admin_hybrid):
             vec_k = HYBRID_VEC_K if ENABLE_HYBRID else k
             if is_admin(p):
-                vec = [dict(r) for r in db.execute(sql_text(SQL_TOPK_BY_DOCS_ADMIN), {**scope_params, "qvec": qvec_lit, "k": vec_k}).mappings().all()]
+                vec = [
+                    dict(r)
+                    for r in db.execute(
+                        sql_text(SQL_TOPK_BY_DOCS_ADMIN),
+                        {**scope_params, "qvec": qvec_lit, "k": vec_k},
+                    )
+                    .mappings()
+                    .all()
+                ]
             else:
-                vec = [dict(r) for r in db.execute(sql_text(SQL_TOPK_BY_DOCS_USER), {**scope_params_with_owner, "qvec": qvec_lit, "k": vec_k}).mappings().all()]
+                vec = [
+                    dict(r)
+                    for r in db.execute(
+                        sql_text(SQL_TOPK_BY_DOCS_USER),
+                        {**scope_params_with_owner, "qvec": qvec_lit, "k": vec_k},
+                    )
+                    .mappings()
+                    .all()
+                ]
             aux_rows: list[dict[str, Any]] = []
             aux_kind: str | None = None
             if ENABLE_HYBRID and use_fts:
                 if is_admin(p):
-                    aux_rows = [dict(r) for r in db.execute(sql_text(SQL_FTS_BY_DOCS_ADMIN), {**scope_params, "q": q_text, "k": HYBRID_FTS_K}).mappings().all()]
+                    aux_rows = [
+                        dict(r)
+                        for r in db.execute(
+                            sql_text(SQL_FTS_BY_DOCS_ADMIN),
+                            {**scope_params, "q": q_text, "k": HYBRID_FTS_K},
+                        )
+                        .mappings()
+                        .all()
+                    ]
                 else:
-                    aux_rows = [dict(r) for r in db.execute(sql_text(SQL_FTS_BY_DOCS_USER), {**scope_params_with_owner, "q": q_text, "k": HYBRID_FTS_K}).mappings().all()]
+                    aux_rows = [
+                        dict(r)
+                        for r in db.execute(
+                            sql_text(SQL_FTS_BY_DOCS_USER),
+                            {**scope_params_with_owner, "q": q_text, "k": HYBRID_FTS_K},
+                        )
+                        .mappings()
+                        .all()
+                    ]
                 aux_kind = "fts"
             elif use_trgm:
                 if is_admin(p):
-                    aux_rows = [dict(r) for r in db.execute(sql_text(SQL_TRGM_BY_DOCS_ADMIN), {**scope_params, "q": q_text, "k": TRGM_K}).mappings().all()]
+                    aux_rows = [
+                        dict(r)
+                        for r in db.execute(
+                            sql_text(SQL_TRGM_BY_DOCS_ADMIN),
+                            {**scope_params, "q": q_text, "k": TRGM_K},
+                        )
+                        .mappings()
+                        .all()
+                    ]
                 else:
-                    aux_rows = [dict(r) for r in db.execute(sql_text(SQL_TRGM_BY_DOCS_USER), {**scope_params_with_owner, "q": q_text, "k": TRGM_K}).mappings().all()]
+                    aux_rows = [
+                        dict(r)
+                        for r in db.execute(
+                            sql_text(SQL_TRGM_BY_DOCS_USER),
+                            {**scope_params_with_owner, "q": q_text, "k": TRGM_K},
+                        )
+                        .mappings()
+                        .all()
+                    ]
                 aux_kind = "trgm"
             merged = _rrf_merge(vec, aux_rows, k, rrf_k=RRF_K)
-            strat = "hybrid_rrf_by_docs_admin" if is_admin(p) else "hybrid_rrf_by_docs_user"
+            strat = (
+                "hybrid_rrf_by_docs_admin" if is_admin(p) else "hybrid_rrf_by_docs_user"
+            )
             if debug is not None:
                 debug["strategy"] = strat
                 debug["vec_count"] = len(vec)
@@ -998,47 +1382,111 @@ def fetch_chunks(
                     debug["trgm_top5"] = _preview(aux_rows) if aux_rows else []
                 debug["merged_top5"] = _preview(merged)
             rows = merged if merged else vec[:k]
-            return _apply_offline_fallback(rows, db=db, run_id=run_id, document_ids=doc_scope, p=p, k=k, debug=debug)
+            return _apply_offline_fallback(
+                rows,
+                db=db,
+                run_id=run_id,
+                document_ids=doc_scope,
+                p=p,
+                k=k,
+                debug=debug,
+            )
 
         if is_admin(p):
-            rows = [dict(r) for r in db.execute(sql_text(SQL_TOPK_BY_DOCS_ADMIN), {**scope_params, "qvec": qvec_lit, "k": k}).mappings().all()]
+            rows = [
+                dict(r)
+                for r in db.execute(
+                    sql_text(SQL_TOPK_BY_DOCS_ADMIN),
+                    {**scope_params, "qvec": qvec_lit, "k": k},
+                )
+                .mappings()
+                .all()
+            ]
             strat = "vector_by_docs_admin"
         else:
-            rows = [dict(r) for r in db.execute(sql_text(SQL_TOPK_BY_DOCS_USER), {**scope_params_with_owner, "qvec": qvec_lit, "k": k}).mappings().all()]
+            rows = [
+                dict(r)
+                for r in db.execute(
+                    sql_text(SQL_TOPK_BY_DOCS_USER),
+                    {**scope_params_with_owner, "qvec": qvec_lit, "k": k},
+                )
+                .mappings()
+                .all()
+            ]
             strat = "vector_by_docs_user"
         if debug is not None:
             debug["strategy"] = strat
             debug["count"] = len(rows)
             debug["vec_best_dist"] = _best_vec_dist(rows)
             debug["top5"] = _preview(rows)
-        return _apply_offline_fallback(rows, db=db, run_id=run_id, document_ids=doc_scope, p=p, k=k, debug=debug)
+        return _apply_offline_fallback(
+            rows, db=db, run_id=run_id, document_ids=doc_scope, p=p, k=k, debug=debug
+        )
 
     if summary_intent:
         k_eff = min(max(k, 20), 50)
         if is_admin(p):
-            rows = [dict(r) for r in db.execute(sql_text(SQL_FIRSTK_ALL_DOCS_ADMIN), {"k": k_eff}).mappings().all()]
+            rows = [
+                dict(r)
+                for r in db.execute(sql_text(SQL_FIRSTK_ALL_DOCS_ADMIN), {"k": k_eff})
+                .mappings()
+                .all()
+            ]
             if debug is not None:
                 debug["strategy"] = "firstk_all_docs_admin"
                 debug["count"] = len(rows)
-            return _apply_offline_fallback(rows, db=db, run_id=run_id, document_ids=None, p=p, k=k, debug=debug)
+            return _apply_offline_fallback(
+                rows, db=db, run_id=run_id, document_ids=None, p=p, k=k, debug=debug
+            )
 
-        rows = [dict(r) for r in db.execute(sql_text(SQL_FIRSTK_ALL_DOCS_USER), {"k": k_eff, "owner_sub": p.sub}).mappings().all()]
+        rows = [
+            dict(r)
+            for r in db.execute(
+                sql_text(SQL_FIRSTK_ALL_DOCS_USER), {"k": k_eff, "owner_sub": p.sub}
+            )
+            .mappings()
+            .all()
+        ]
         if debug is not None:
             debug["strategy"] = "firstk_all_docs_user"
             debug["count"] = len(rows)
-        return _apply_offline_fallback(rows, db=db, run_id=run_id, document_ids=None, p=p, k=k, debug=debug)
+        return _apply_offline_fallback(
+            rows, db=db, run_id=run_id, document_ids=None, p=p, k=k, debug=debug
+        )
 
     if is_admin(p):
         if q_text and (ENABLE_HYBRID or use_trgm or force_admin_hybrid):
             vec_k = HYBRID_VEC_K if ENABLE_HYBRID else k
-            vec = [dict(r) for r in db.execute(sql_text(SQL_TOPK_ALL_DOCS_ADMIN), {"qvec": qvec_lit, "k": vec_k}).mappings().all()]
+            vec = [
+                dict(r)
+                for r in db.execute(
+                    sql_text(SQL_TOPK_ALL_DOCS_ADMIN), {"qvec": qvec_lit, "k": vec_k}
+                )
+                .mappings()
+                .all()
+            ]
             aux_rows: list[dict[str, Any]] = []
             aux_kind: str | None = None
             if ENABLE_HYBRID and use_fts:
-                aux_rows = [dict(r) for r in db.execute(sql_text(SQL_FTS_ALL_DOCS_ADMIN), {"q": q_text, "k": HYBRID_FTS_K}).mappings().all()]
+                aux_rows = [
+                    dict(r)
+                    for r in db.execute(
+                        sql_text(SQL_FTS_ALL_DOCS_ADMIN),
+                        {"q": q_text, "k": HYBRID_FTS_K},
+                    )
+                    .mappings()
+                    .all()
+                ]
                 aux_kind = "fts"
             elif use_trgm:
-                aux_rows = [dict(r) for r in db.execute(sql_text(SQL_TRGM_ALL_DOCS_ADMIN), {"q": q_text, "k": TRGM_K}).mappings().all()]
+                aux_rows = [
+                    dict(r)
+                    for r in db.execute(
+                        sql_text(SQL_TRGM_ALL_DOCS_ADMIN), {"q": q_text, "k": TRGM_K}
+                    )
+                    .mappings()
+                    .all()
+                ]
                 aux_kind = "trgm"
             merged = _rrf_merge(vec, aux_rows, k, rrf_k=RRF_K)
 
@@ -1059,26 +1507,61 @@ def fetch_chunks(
                 debug["merged_top5"] = _preview(merged)
 
             rows = merged if merged else vec[:k]
-            return _apply_offline_fallback(rows, db=db, run_id=run_id, document_ids=None, p=p, k=k, debug=debug)
+            return _apply_offline_fallback(
+                rows, db=db, run_id=run_id, document_ids=None, p=p, k=k, debug=debug
+            )
 
-        rows = [dict(r) for r in db.execute(sql_text(SQL_TOPK_ALL_DOCS_ADMIN), {"qvec": qvec_lit, "k": k}).mappings().all()]
+        rows = [
+            dict(r)
+            for r in db.execute(
+                sql_text(SQL_TOPK_ALL_DOCS_ADMIN), {"qvec": qvec_lit, "k": k}
+            )
+            .mappings()
+            .all()
+        ]
         if debug is not None:
             debug["strategy"] = "vector_all_docs_admin"
             debug["count"] = len(rows)
             debug["vec_best_dist"] = _best_vec_dist(rows)
             debug["top5"] = _preview(rows)
-        return _apply_offline_fallback(rows, db=db, run_id=run_id, document_ids=None, p=p, k=k, debug=debug)
+        return _apply_offline_fallback(
+            rows, db=db, run_id=run_id, document_ids=None, p=p, k=k, debug=debug
+        )
 
     if q_text and (ENABLE_HYBRID or use_trgm):
         vec_k = HYBRID_VEC_K if ENABLE_HYBRID else k
-        vec = [dict(r) for r in db.execute(sql_text(SQL_TOPK_ALL_DOCS_USER), {"qvec": qvec_lit, "k": vec_k, "owner_sub": p.sub}).mappings().all()]
+        vec = [
+            dict(r)
+            for r in db.execute(
+                sql_text(SQL_TOPK_ALL_DOCS_USER),
+                {"qvec": qvec_lit, "k": vec_k, "owner_sub": p.sub},
+            )
+            .mappings()
+            .all()
+        ]
         aux_rows: list[dict[str, Any]] = []
         aux_kind: str | None = None
         if ENABLE_HYBRID and use_fts:
-            aux_rows = [dict(r) for r in db.execute(sql_text(SQL_FTS_ALL_DOCS_USER), {"q": q_text, "k": HYBRID_FTS_K, "owner_sub": p.sub}).mappings().all()]
+            aux_rows = [
+                dict(r)
+                for r in db.execute(
+                    sql_text(SQL_FTS_ALL_DOCS_USER),
+                    {"q": q_text, "k": HYBRID_FTS_K, "owner_sub": p.sub},
+                )
+                .mappings()
+                .all()
+            ]
             aux_kind = "fts"
         elif use_trgm:
-            aux_rows = [dict(r) for r in db.execute(sql_text(SQL_TRGM_ALL_DOCS_USER), {"q": q_text, "k": TRGM_K, "owner_sub": p.sub}).mappings().all()]
+            aux_rows = [
+                dict(r)
+                for r in db.execute(
+                    sql_text(SQL_TRGM_ALL_DOCS_USER),
+                    {"q": q_text, "k": TRGM_K, "owner_sub": p.sub},
+                )
+                .mappings()
+                .all()
+            ]
             aux_kind = "trgm"
         merged = _rrf_merge(vec, aux_rows, k, rrf_k=RRF_K)
 
@@ -1099,15 +1582,27 @@ def fetch_chunks(
             debug["merged_top5"] = _preview(merged)
 
         rows = merged if merged else vec[:k]
-        return _apply_offline_fallback(rows, db=db, run_id=run_id, document_ids=None, p=p, k=k, debug=debug)
+        return _apply_offline_fallback(
+            rows, db=db, run_id=run_id, document_ids=None, p=p, k=k, debug=debug
+        )
 
-    rows = [dict(r) for r in db.execute(sql_text(SQL_TOPK_ALL_DOCS_USER), {"qvec": qvec_lit, "k": k, "owner_sub": p.sub}).mappings().all()]
+    rows = [
+        dict(r)
+        for r in db.execute(
+            sql_text(SQL_TOPK_ALL_DOCS_USER),
+            {"qvec": qvec_lit, "k": k, "owner_sub": p.sub},
+        )
+        .mappings()
+        .all()
+    ]
     if debug is not None:
         debug["strategy"] = "vector_all_docs_user"
         debug["count"] = len(rows)
         debug["vec_best_dist"] = _best_vec_dist(rows)
         debug["top5"] = _preview(rows)
-    return _apply_offline_fallback(rows, db=db, run_id=run_id, document_ids=None, p=p, k=k, debug=debug)
+    return _apply_offline_fallback(
+        rows, db=db, run_id=run_id, document_ids=None, p=p, k=k, debug=debug
+    )
 
 
 # ============================================================
@@ -1160,7 +1655,9 @@ def _apply_offline_fallback(
 ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
     if rows or is_llm_enabled():
         return rows, debug
-    fallback = _offline_chunk_sample(db, run_id=run_id, document_ids=document_ids, p=p, k=k)
+    fallback = _offline_chunk_sample(
+        db, run_id=run_id, document_ids=document_ids, p=p, k=k
+    )
     if fallback:
         if debug is not None:
             debug["strategy"] = debug.get("strategy") or "offline_fallback"
@@ -1169,10 +1666,169 @@ def _apply_offline_fallback(
         return fallback, debug
     return rows, debug
 
+
+ANCHOR_TOKEN_RE = re.compile(r"[0-9A-Za-z\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff]+")
+ANCHOR_STOPWORDS = {
+    "and",
+    "the",
+    "this",
+    "that",
+    "with",
+    "from",
+    "when",
+    "what",
+    "about",
+    "who",
+    "whom",
+    "where",
+    "summary",
+    "summarize",
+    "document",
+}
+
+
+def _extract_anchor_terms(text: str, limit: int = ANCHOR_TERM_LIMIT) -> list[str]:
+    terms: list[str] = []
+    for token in ANCHOR_TOKEN_RE.findall((text or "").lower()):
+        if len(token) < 3:
+            continue
+        if token in ANCHOR_STOPWORDS:
+            continue
+        if token not in terms:
+            terms.append(token)
+        if len(terms) >= limit:
+            break
+    return terms
+
+
+def _summary_scope_filters(
+    run_id: str | None,
+    document_ids: list[str] | None,
+    p: Principal,
+) -> tuple[list[str], list[str], dict[str, Any]]:
+    joins: list[str] = []
+    where: list[str] = []
+    params: dict[str, Any] = {}
+    if run_id:
+        joins.append("JOIN run_documents rd ON rd.document_id = c.document_id")
+        where.append("rd.run_id = :run_id")
+        params["run_id"] = run_id
+        if not is_admin(p) and p.sub:
+            where.append("d.owner_sub = :owner_sub")
+            params["owner_sub"] = p.sub
+    elif document_ids:
+        where.append("c.document_id = ANY(:doc_ids)")
+        params["doc_ids"] = document_ids
+        if not is_admin(p) and p.sub:
+            where.append("d.owner_sub = :owner_sub")
+            params["owner_sub"] = p.sub
+    else:
+        if not is_admin(p) and p.sub:
+            where.append("d.owner_sub = :owner_sub")
+            params["owner_sub"] = p.sub
+    return joins, where, params
+
+
+def _summary_anchor_chunks(
+    db: Session,
+    *,
+    run_id: str | None,
+    document_ids: list[str] | None,
+    p: Principal,
+    anchor_terms: list[str],
+    limit: int,
+    exclude_ids: set[str],
+) -> list[dict[str, Any]]:
+    if not anchor_terms or limit <= 0:
+        return []
+    joins, where_clauses, params = _summary_scope_filters(run_id, document_ids, p)
+    conditions: list[str] = []
+    for idx, term in enumerate(anchor_terms):
+        key = f"anchor_{idx}"
+        params[key] = f"%{term}%"
+        conditions.append(f"LOWER(c.text) LIKE :{key}")
+    if not conditions:
+        return []
+    params["k"] = limit
+    sql_parts = [
+        "SELECT c.id, c.document_id, d.filename AS filename, c.page, c.chunk_index, c.text",
+        "FROM chunks c",
+        "JOIN documents d ON d.id = c.document_id",
+    ]
+    sql_parts.extend(joins)
+    where_all = list(where_clauses)
+    where_all.append("(" + " OR ".join(conditions) + ")")
+    sql_parts.append("WHERE " + " AND ".join(where_all))
+    sql_parts.append("ORDER BY COALESCE(c.page, 0), c.chunk_index")
+    sql_parts.append("LIMIT :k")
+    rows = db.execute(sql_text("\n".join(sql_parts)), params).mappings().all()
+    unique: list[dict[str, Any]] = []
+    for mapping in rows:
+        row = dict(mapping)
+        if row["id"] in exclude_ids:
+            continue
+        unique.append(row)
+    return unique
+
+
+def fetch_summary_chunks(
+    db: Session,
+    *,
+    run_id: str | None,
+    document_ids: list[str] | None,
+    p: Principal,
+    question: str,
+    base_k: int = SUMMARY_BASE_CHUNKS,
+    anchor_k: int = SUMMARY_ANCHOR_CHUNKS,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    base_rows = _offline_chunk_sample(
+        db, run_id=run_id, document_ids=document_ids, p=p, k=max(base_k, 1)
+    )
+    seen_ids = {row["id"] for row in base_rows}
+    anchor_terms = _extract_anchor_terms(question, ANCHOR_TERM_LIMIT)
+    anchor_rows = _summary_anchor_chunks(
+        db,
+        run_id=run_id,
+        document_ids=document_ids,
+        p=p,
+        anchor_terms=anchor_terms,
+        limit=max(anchor_k, 0),
+        exclude_ids=seen_ids,
+    )
+    for row in anchor_rows:
+        if row["id"] not in seen_ids:
+            base_rows.append(row)
+            seen_ids.add(row["id"])
+    if not base_rows:
+        fallback = _offline_chunk_sample(
+            db,
+            run_id=run_id,
+            document_ids=document_ids,
+            p=p,
+            k=max(SUMMARY_TOTAL_CHUNKS, 1),
+        )
+        for row in fallback:
+            if row["id"] in seen_ids:
+                continue
+            base_rows.append(row)
+            seen_ids.add(row["id"])
+            if len(base_rows) >= SUMMARY_TOTAL_CHUNKS:
+                break
+    rows = base_rows[:SUMMARY_TOTAL_CHUNKS]
+    debug = {
+        "strategy": "summary_offline_safe",
+        "base_count": min(len(rows), base_k),
+        "anchor_hits": len(anchor_rows),
+        "anchor_terms": anchor_terms,
+    }
+    return rows, debug
+
+
 EMBED_DIM = int(os.getenv("EMBED_DIM", "1536") or "1536")
 
 
 _openai_client: OpenAI | None = None
+
 
 def _offline_embedding(text: str) -> list[float]:
     digest = hashlib.sha256(text.encode("utf-8")).digest()
@@ -1205,7 +1861,7 @@ def _build_extractive_answer(
     *,
     summary_hint: bool,
 ) -> tuple[str, list[str]]:
-    source_ids = [src.get("source_id") or f"S{i+1}" for i, src in enumerate(sources)]
+    source_ids = [src.get("source_id") or f"S{i + 1}" for i, src in enumerate(sources)]
     max_units = 3 if summary_hint else 2
     sentences_per_chunk = 2 if summary_hint else 1
     parts: list[str] = []
@@ -1213,7 +1869,7 @@ def _build_extractive_answer(
 
     for idx, row in enumerate(rows):
         text = str(row.get("text") or "")
-        sid = source_ids[idx] if idx < len(source_ids) else f"S{idx+1}"
+        sid = source_ids[idx] if idx < len(source_ids) else f"S{idx + 1}"
         snippets = _split_sentences(text)
         if not snippets:
             continue
@@ -1251,9 +1907,9 @@ def _get_openai_client() -> OpenAI:
     if _openai_client is None:
         api_key_obj = settings.openai_api_key
         api_key = (
-    api_key_obj.get_secret_value()
-    if hasattr(api_key_obj, "get_secret_value")
-    else (api_key_obj or "")
+            api_key_obj.get_secret_value()
+            if hasattr(api_key_obj, "get_secret_value")
+            else (api_key_obj or "")
         )
         if not api_key:
             raise RuntimeError("OPENAI_API_KEY is required when OPENAI_OFFLINE=0")
@@ -1266,6 +1922,7 @@ def embed_query(question: str) -> list[float]:
         return _offline_embedding(question)
     r = _get_openai_client().embeddings.create(model=EMBED_MODEL, input=question)
     return r.data[0].embedding
+
 
 def to_pgvector_literal(vec: list[float]) -> str:
     return "[" + ",".join(f"{x:.8f}" for x in vec) + "]"
@@ -1301,6 +1958,7 @@ INJECTION_PATTERNS = [
 ]
 _inj_re = re.compile("|".join(INJECTION_PATTERNS), re.IGNORECASE)
 
+
 def guard_source_text(text: str) -> str:
     if not text:
         return text
@@ -1312,6 +1970,7 @@ def guard_source_text(text: str) -> str:
             out_lines.append(ln)
     return "\n".join(out_lines)
 
+
 def clean_forbidden_citations(text: str) -> str:
     if not text:
         return text
@@ -1321,6 +1980,7 @@ def clean_forbidden_citations(text: str) -> str:
     cleaned = re.sub(r"\]\[S", "] [S", cleaned)
     cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
     return cleaned
+
 
 def build_sources(rows: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]]:
     sources: list[dict[str, Any]] = []
@@ -1340,6 +2000,7 @@ def build_sources(rows: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]
     context = "\n\n---\n\n".join(parts)
     return context, sources
 
+
 def extract_used_source_ids(answer: str) -> list[str]:
     seen: set[str] = set()
     used: list[str] = []
@@ -1350,9 +2011,13 @@ def extract_used_source_ids(answer: str) -> list[str]:
             used.append(sid)
     return used
 
-def filter_sources(sources: list[dict[str, Any]], used_ids: Iterable[str]) -> list[dict[str, Any]]:
+
+def filter_sources(
+    sources: list[dict[str, Any]], used_ids: Iterable[str]
+) -> list[dict[str, Any]]:
     used_set = set(used_ids)
     return [s for s in sources if s["source_id"] in used_set]
+
 
 def _split_citable_units(text: str) -> list[str]:
     t = (text or "").strip()
@@ -1363,7 +2028,10 @@ def _split_citable_units(text: str) -> list[str]:
         return lines
     return [s.strip() for s in re.split(r"(?<=[.!?。！？])\s*", t) if s.strip()]
 
-def validate_citations(answer: str, used_ids: list[str], allowed_ids: set[str]) -> tuple[bool, str]:
+
+def validate_citations(
+    answer: str, used_ids: list[str], allowed_ids: set[str]
+) -> tuple[bool, str]:
     if not used_ids:
         return False, "missing_citations"
     if FORBIDDEN_INLINE_PAGE_RE.search(answer or ""):
@@ -1379,6 +2047,7 @@ def validate_citations(answer: str, used_ids: list[str], allowed_ids: set[str]) 
             if not SOURCE_ID_RE.search(u):
                 return False, f"unit_missing_citation:{i}"
     return True, "ok"
+
 
 def add_page_to_inline_citations(answer: str, citations: list[dict[str, Any]]) -> str:
     if not answer:
@@ -1399,6 +2068,7 @@ def add_page_to_inline_citations(answer: str, citations: list[dict[str, Any]]) -
 
     return pattern.sub(repl, answer)
 
+
 def public_citations(citations: list[dict[str, Any]]) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for c in citations or []:
@@ -1415,6 +2085,7 @@ def public_citations(citations: list[dict[str, Any]]) -> list[dict[str, Any]]:
 # ============================================================
 # Run config
 # ============================================================
+
 
 def get_model_and_gen_from_run(run: Run | None) -> tuple[str, dict[str, Any]]:
     if not run:
@@ -1451,6 +2122,7 @@ SYSTEM_PROMPT = (
     "Output plain text (no JSON)."
 )
 
+
 def _extract_unsupported_param(err_text: str) -> str | None:
     patterns = [
         r"param[\"']\s*:\s*[\"'](\w+)[\"']",
@@ -1463,6 +2135,7 @@ def _extract_unsupported_param(err_text: str) -> str | None:
         if m:
             return m.group(1)
     return None
+
 
 def _chat_create_with_fallback(client: OpenAI, kwargs: dict[str, Any]) -> str:
     last_err: Exception | None = None
@@ -1483,6 +2156,7 @@ def _chat_create_with_fallback(client: OpenAI, kwargs: dict[str, Any]) -> str:
             raise
 
     raise last_err if last_err else RuntimeError("Unknown error in chat completion")
+
 
 def build_chat_kwargs(
     model: str,
@@ -1522,11 +2196,19 @@ def build_chat_kwargs(
 
     return kwargs
 
-def call_llm(model: str, gen: dict[str, Any], question: str, sources_context: str, repair_note: str | None) -> str:
+
+def call_llm(
+    model: str,
+    gen: dict[str, Any],
+    question: str,
+    sources_context: str,
+    repair_note: str | None,
+) -> str:
     if not is_llm_enabled():
         return _offline_answer(question, sources_context)[0]
     kwargs = build_chat_kwargs(model, gen, question, sources_context, repair_note)
     return _chat_create_with_fallback(_get_openai_client(), kwargs)
+
 
 def answer_with_contract(
     model: str,
@@ -1563,12 +2245,14 @@ def answer_with_contract(
 # Route
 # ============================================================
 
+
 def should_include_retrieval_debug(
     payload_debug: bool,
     *,
     is_admin_debug: bool,
 ) -> bool:
     return bool(ENABLE_RETRIEVAL_DEBUG) and bool(payload_debug) and bool(is_admin_debug)
+
 
 def build_debug_meta(
     *,
@@ -1610,6 +2294,7 @@ def build_debug_meta(
         "fts_skipped": bool(fts_skipped),
     }
 
+
 def build_error_payload(
     code: str,
     message: str,
@@ -1622,6 +2307,7 @@ def build_error_payload(
     payload, _ = sanitize_nonfinite_floats(payload)
     return payload
 
+
 def attach_debug_meta_to_detail(detail: Any, debug_meta: dict[str, bool] | None) -> Any:
     if not debug_meta:
         return detail
@@ -1633,7 +2319,10 @@ def attach_debug_meta_to_detail(detail: Any, debug_meta: dict[str, bool] | None)
         sanitized, _ = sanitize_nonfinite_floats(updated)
         return sanitized
     message = detail if isinstance(detail, str) else ""
-    return build_error_payload("http_exception", message or "error", debug_meta=debug_meta)
+    return build_error_payload(
+        "http_exception", message or "error", debug_meta=debug_meta
+    )
+
 
 _SAFE_DEBUG_SCALAR_KEYS = {
     "strategy",
@@ -1655,6 +2344,7 @@ _SAFE_DEBUG_SCALAR_KEYS = {
 }
 _SAFE_DEBUG_LIST_KEYS = {"top5", "vec_top5", "fts_top5", "trgm_top5", "merged_top5"}
 
+
 def sanitize_retrieval_debug(data: dict[str, Any] | None) -> dict[str, Any] | None:
     if not data:
         return None
@@ -1666,6 +2356,7 @@ def sanitize_retrieval_debug(data: dict[str, Any] | None) -> dict[str, Any] | No
         if key in data and data[key]:
             cleaned[key] = data[key]
     return cleaned or None
+
 
 def _ensure_debug_count(data: dict[str, Any]) -> None:
     if "count" in data and isinstance(data.get("count"), (int, float)):
@@ -1694,6 +2385,7 @@ def _ensure_debug_count(data: dict[str, Any]) -> None:
     else:
         data["count"] = 0
 
+
 def build_retrieval_debug_payload(
     raw: dict[str, Any] | None,
     extra: dict[str, Any] | None = None,
@@ -1707,6 +2399,7 @@ def build_retrieval_debug_payload(
         merged.update(extra)
     _ensure_debug_count(merged)
     return sanitize_retrieval_debug(merged)
+
 
 @router.post("/chat/ask", response_model=ChatResponse, response_model_exclude_none=True)
 def ask(
@@ -1731,7 +2424,9 @@ def ask(
     principal_sub = getattr(p, "sub", None)
     principal_hash = _safe_hash_identifier(principal_sub)
     is_admin_user = bool(principal_sub) and is_admin(p)
-    auth_header_value = request.headers.get("authorization") or request.headers.get("Authorization")
+    auth_header_value = request.headers.get("authorization") or request.headers.get(
+        "Authorization"
+    )
     auth_header_present = bool((auth_header_value or "").strip())
     bearer_token = get_bearer_token(request)
     bearer_token_present = bool(bearer_token)
@@ -1746,11 +2441,14 @@ def ask(
         payload_debug_flag,
         is_admin_debug=is_admin_debug_user,
     )
-    force_admin_hybrid = bool(auth_mode_dev and is_admin_debug_user and ADMIN_DEBUG_STRATEGY == "hybrid")
+    force_admin_hybrid = bool(
+        auth_mode_dev and is_admin_debug_user and ADMIN_DEBUG_STRATEGY == "hybrid"
+    )
     trgm_enabled_flag = bool(ENABLE_TRGM)
     trgm_available_flag = _detect_trgm_available(db) if trgm_enabled_flag else False
     llm_enabled = is_llm_enabled()
     offline_mode = not llm_enabled
+    summary_mode = (payload.mode or "").strip().lower() == "summary_offline_safe"
     debug_meta: dict[str, bool] | None = None
     debug_meta_for_errors: dict[str, bool] | None = None
     rows: list[dict[str, Any]] = []
@@ -1761,11 +2459,49 @@ def ask(
     try:
         q_clean = sanitize_question_for_llm(payload.question)
         is_cjk_query = query_class(q_clean) == "cjk"
-        summary_request = _is_summary_question(payload.question)
-        if force_admin_hybrid:
+        summary_request = _is_summary_question(payload.question) or summary_mode
+        if force_admin_hybrid and not summary_mode:
             summary_request = False
         if payload.document_ids:
             doc_scope = _ensure_document_scope(db, payload.document_ids, p)
+
+        effective_run_id = payload.run_id
+        summary_run_created = False
+        summary_query_run_id: str | None = None
+        summary_run_has_docs = False
+
+        if summary_mode:
+            while True:
+                if effective_run_id:
+                    try:
+                        ensure_run_access(db, effective_run_id, p)
+                    except HTTPException as exc:
+                        if exc.status_code in {403, 404}:
+                            effective_run_id = None
+                            continue
+                        exc.detail = attach_debug_meta_to_detail(
+                            exc.detail, debug_meta_for_errors
+                        )
+                        raise
+
+                    run = db.get(Run, effective_run_id)
+                    if not run:
+                        effective_run_id = None
+                        continue
+                    summary_run_has_docs = _run_has_accessible_docs(
+                        db, effective_run_id, p
+                    )
+                    break
+
+                run = _create_summary_run(db, principal_sub, doc_scope)
+                effective_run_id = run.id
+                summary_run_created = True
+                summary_run_has_docs = bool(run.documents)
+                break
+
+            summary_query_run_id = effective_run_id if summary_run_has_docs else None
+        else:
+            summary_query_run_id = None
         base_debug_meta = (
             build_debug_meta(
                 feature_flag_enabled=feature_flag_enabled,
@@ -1791,64 +2527,88 @@ def ask(
         debug_meta = base_debug_meta
         debug_meta_for_errors = base_debug_meta
 
-        if payload.run_id:
+        if effective_run_id and not summary_mode:
             try:
-                ensure_run_access(db, payload.run_id, p)
+                ensure_run_access(db, effective_run_id, p)
             except HTTPException as exc:
-                exc.detail = attach_debug_meta_to_detail(exc.detail, debug_meta_for_errors)
+                exc.detail = attach_debug_meta_to_detail(
+                    exc.detail, debug_meta_for_errors
+                )
                 raise
-
-            run = db.get(Run, payload.run_id)
+            run = db.get(Run, effective_run_id)
             if not run:
                 raise HTTPException(
                     status_code=404,
-                    detail=build_error_payload("run_not_found", "run not found", debug_meta=debug_meta_for_errors),
+                    detail=build_error_payload(
+                        "run_not_found",
+                        "run not found",
+                        debug_meta=debug_meta_for_errors,
+                    ),
                 )
 
             run.t0 = _utcnow()
             db.commit()
+        elif summary_mode and run and not summary_run_created:
+            run.t0 = _utcnow()
+            db.commit()
 
-        # 0) ★ NEW: 曖昧参照 + run_idなし は即エラー（誤回答防止）
-        if REJECT_AMBIGUOUS_REFERENCE_WITHOUT_RUN and (not payload.run_id) and not doc_scope and has_ambiguous_reference(q_clean):
-            raise HTTPException(
-                status_code=422,
-                detail=build_error_payload(
-                    "ambiguous_reference",
-                    "Ambiguous reference detected (e.g., 'this PDF'). Please specify run_id (attach target PDF(s) to a run) before asking.",
-                    debug_meta=debug_meta_for_errors,
-                ),
+        if not summary_mode:
+            if (
+                REJECT_AMBIGUOUS_REFERENCE_WITHOUT_RUN
+                and (not payload.run_id)
+                and not doc_scope
+                and has_ambiguous_reference(q_clean)
+            ):
+                raise HTTPException(
+                    status_code=422,
+                    detail=build_error_payload(
+                        "ambiguous_reference",
+                        "Ambiguous reference detected (e.g., 'this PDF'). Please specify run_id (attach target PDF(s) to a run) before asking.",
+                        debug_meta=debug_meta_for_errors,
+                    ),
+                )
+
+            if REJECT_GENERIC_QUERIES and is_generic_query(q_clean):
+                raise HTTPException(
+                    status_code=422,
+                    detail=build_error_payload(
+                        "generic_query",
+                        "Query is too generic. Please ask a specific question (e.g., include what, where, and which document/topic).",
+                        debug_meta=debug_meta_for_errors,
+                    ),
+                )
+
+            qvec = embed_query(q_clean)
+            qvec_lit = to_pgvector_literal(qvec)
+
+            rows, retrieval_debug_raw = fetch_chunks(
+                db,
+                qvec_lit=qvec_lit,
+                q_text=q_clean,
+                k=payload.k,
+                run_id=effective_run_id,
+                document_ids=doc_scope,
+                p=p,
+                question=payload.question,
+                trgm_available=trgm_available_flag,
+                admin_debug_hybrid=force_admin_hybrid,
             )
-
-        # 1) generic/短すぎクエリはRAGを走らせない
-        if REJECT_GENERIC_QUERIES and is_generic_query(q_clean):
-            raise HTTPException(
-                status_code=422,
-                detail=build_error_payload(
-                    "generic_query",
-                    "Query is too generic. Please ask a specific question (e.g., include what, where, and which document/topic).",
-                    debug_meta=debug_meta_for_errors,
-                ),
+        else:
+            rows, retrieval_debug_raw = fetch_summary_chunks(
+                db,
+                run_id=summary_query_run_id,
+                document_ids=doc_scope,
+                p=p,
+                question=payload.question,
+                base_k=SUMMARY_BASE_CHUNKS,
+                anchor_k=SUMMARY_ANCHOR_CHUNKS,
             )
-
-        qvec = embed_query(q_clean)
-        qvec_lit = to_pgvector_literal(qvec)
-
-        rows, retrieval_debug_raw = fetch_chunks(
-            db,
-            qvec_lit=qvec_lit,
-            q_text=q_clean,
-            k=payload.k,
-            run_id=payload.run_id,
-            document_ids=doc_scope,
-            p=p,
-            question=payload.question,
-            trgm_available=trgm_available_flag,
-            admin_debug_hybrid=force_admin_hybrid,
-        )
         used_fts_flag = bool((retrieval_debug_raw or {}).get("used_fts"))
         used_trgm_flag = bool((retrieval_debug_raw or {}).get("used_trgm"))
         fts_skipped_flag = bool((retrieval_debug_raw or {}).get("fts_skipped"))
-        trgm_available_meta = bool((retrieval_debug_raw or {}).get("trgm_available", trgm_available_flag))
+        trgm_available_meta = bool(
+            (retrieval_debug_raw or {}).get("trgm_available", trgm_available_flag)
+        )
         debug_meta = (
             build_debug_meta(
                 feature_flag_enabled=feature_flag_enabled,
@@ -1884,7 +2644,7 @@ def ask(
                 resp = {
                     "answer": "I don't know based on the provided sources.",
                     "citations": [],
-                    "run_id": payload.run_id,
+                    "run_id": effective_run_id,
                     "request_id": req_id,
                 }
                 included_retrieval_debug = False
@@ -1908,7 +2668,7 @@ def ask(
                     )
                 _emit_audit_event(
                     request_id=req_id,
-                    run_id=payload.run_id,
+                    run_id=effective_run_id,
                     principal_hash=principal_hash,
                     is_admin_user=is_admin_user,
                     debug_requested=payload_debug_requested,
@@ -1925,12 +2685,20 @@ def ask(
             if run:
                 run.t3 = _utcnow()
                 db.commit()
-            resp = {
-                "answer": "I don't know based on the provided sources.",
-                "citations": [],
-                "run_id": payload.run_id,
-                "request_id": req_id,
-            }
+            if summary_mode:
+                resp = {
+                    "answer": SUMMARY_NO_SOURCES_MESSAGE,
+                    "citations": [],
+                    "run_id": effective_run_id,
+                    "request_id": req_id,
+                }
+            else:
+                resp = {
+                    "answer": "I don't know based on the provided sources.",
+                    "citations": [],
+                    "run_id": effective_run_id,
+                    "request_id": req_id,
+                }
             included_retrieval_debug = False
             included_debug_meta = False
             if include_debug:
@@ -1949,7 +2717,7 @@ def ask(
                 )
             _emit_audit_event(
                 request_id=req_id,
-                run_id=payload.run_id,
+                run_id=effective_run_id,
                 principal_hash=principal_hash,
                 is_admin_user=is_admin_user,
                 debug_requested=payload_debug_requested,
@@ -1972,19 +2740,47 @@ def ask(
             db.commit()
 
         if offline_mode:
-            answer, used_ids = _offline_answer_from_rows(rows, sources, summary_hint=summary_request)
+            answer, used_ids = _offline_answer_from_rows(
+                rows, sources, summary_hint=summary_request
+            )
         else:
             try:
-                answer, used_ids = answer_with_contract(model, gen, payload.question, context, allowed_ids)
+                answer, used_ids = answer_with_contract(
+                    model, gen, payload.question, context, allowed_ids
+                )
             except Exception:
-                logger.exception("answer_with_contract_failed", extra={"request_id": req_id})
-                answer, used_ids = _offline_answer_from_rows(rows, sources, summary_hint=summary_request)
+                logger.exception(
+                    "answer_with_contract_failed", extra={"request_id": req_id}
+                )
+                answer, used_ids = _offline_answer_from_rows(
+                    rows, sources, summary_hint=summary_request
+                )
 
         if run:
             run.t2 = _utcnow()
             db.commit()
 
         used_sources = filter_sources(sources, used_ids)
+        if summary_mode and run:
+            doc_ids_for_run = {
+                str(src.get("document_id"))
+                for src in used_sources
+                if src.get("document_id")
+            }
+            if doc_ids_for_run:
+                failures = _attach_docs_to_summary_run(
+                    db,
+                    run,
+                    doc_ids_for_run,
+                    is_admin_user=is_admin_user,
+                )
+                if failures:
+                    for src in used_sources:
+                        doc_id = str(src.get("document_id") or "")
+                        if doc_id and doc_id in failures:
+                            src["drilldown_blocked_reason"] = (
+                                SUMMARY_DRILLDOWN_BLOCKED_REASON
+                            )
 
         # サーバで [S#] -> [S# p.#]
         answer = add_page_to_inline_citations(answer, used_sources)
@@ -1996,12 +2792,14 @@ def ask(
             run.t3 = _utcnow()
             db.commit()
 
-        citations_out = used_sources if is_admin_user else public_citations(used_sources)
+        citations_out = (
+            used_sources if is_admin_user else public_citations(used_sources)
+        )
 
         resp = {
             "answer": answer,
             "citations": citations_out,
-            "run_id": payload.run_id,
+            "run_id": effective_run_id,
             "request_id": req_id,
         }
         included_retrieval_debug = False
@@ -2022,7 +2820,7 @@ def ask(
             )
         _emit_audit_event(
             request_id=req_id,
-            run_id=payload.run_id,
+            run_id=effective_run_id,
             principal_hash=principal_hash,
             is_admin_user=is_admin_user,
             debug_requested=payload_debug_requested,
@@ -2047,7 +2845,7 @@ def ask(
             exc.detail = detail_sanitized
         _emit_audit_event(
             request_id=req_id,
-            run_id=payload.run_id,
+            run_id=effective_run_id,
             principal_hash=principal_hash,
             is_admin_user=is_admin_user,
             debug_requested=payload_debug_requested,
@@ -2061,12 +2859,16 @@ def ask(
         )
         raise
     except Exception as e:
-        logger.exception("ask failed", extra={"request_id": req_id, "run_id": payload.run_id})
+        logger.exception(
+            "ask failed", extra={"request_id": req_id, "run_id": effective_run_id}
+        )
         message = str(e) if include_debug else "internal server error"
-        detail = build_error_payload("internal_error", message, debug_meta=debug_meta_for_errors)
+        detail = build_error_payload(
+            "internal_error", message, debug_meta=debug_meta_for_errors
+        )
         _emit_audit_event(
             request_id=req_id,
-            run_id=payload.run_id,
+            run_id=effective_run_id,
             principal_hash=principal_hash,
             is_admin_user=is_admin_user,
             debug_requested=payload_debug_requested,

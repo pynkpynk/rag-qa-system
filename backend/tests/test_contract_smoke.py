@@ -58,7 +58,9 @@ def sqlite_app_db(monkeypatch: pytest.MonkeyPatch):
         engine.dispose()
 
 
-def _insert_document(session_factory, *, document_id: str = "doc-contract", owner_sub: str = "dev|local"):
+def _insert_document(
+    session_factory, *, document_id: str = "doc-contract", owner_sub: str = "dev|local"
+):
     with session_factory() as db:
         doc = Document(
             id=document_id,
@@ -146,7 +148,9 @@ def test_contract_chat_ask(monkeypatch: pytest.MonkeyPatch, sqlite_app_db):
     resp = client.post(
         "/api/chat/ask",
         headers=_dev_headers(),
-        json={"question": "Provide a short summary of the stakeholders for this project."},
+        json={
+            "question": "Provide a short summary of the stakeholders for this project."
+        },
     )
     assert resp.status_code == 200
     body = resp.json()

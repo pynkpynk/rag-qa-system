@@ -63,14 +63,18 @@ def _normalize_db_url(url: str) -> str:
 
 
 def get_url() -> str:
-    url = (os.getenv("DATABASE_URL") or os.getenv("SQLALCHEMY_DATABASE_URL") or "").strip()
+    url = (
+        os.getenv("DATABASE_URL") or os.getenv("SQLALCHEMY_DATABASE_URL") or ""
+    ).strip()
 
     if not url:
         # alembic.ini の sqlalchemy.url を使う運用なら fallback
         url = (config.get_main_option("sqlalchemy.url") or "").strip()
 
     if not url:
-        raise RuntimeError("DATABASE_URL is required for alembic (set env DATABASE_URL).")
+        raise RuntimeError(
+            "DATABASE_URL is required for alembic (set env DATABASE_URL)."
+        )
 
     url = _normalize_db_url(url)
 

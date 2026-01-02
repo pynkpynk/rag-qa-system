@@ -37,9 +37,14 @@ def test_prod_debug_clamp_enforced():
 
 
 def test_prod_retrieval_debug_warning_strict_mode():
-    ok, checks = run_env({"APP_ENV": "prod", "ALLOW_PROD_DEBUG": "0", "ENABLE_RETRIEVAL_DEBUG": "1"})
+    ok, checks = run_env(
+        {"APP_ENV": "prod", "ALLOW_PROD_DEBUG": "0", "ENABLE_RETRIEVAL_DEBUG": "1"}
+    )
     assert ok, "warning should not fail without --strict"
-    ok_strict, _ = run_env({"APP_ENV": "prod", "ALLOW_PROD_DEBUG": "0", "ENABLE_RETRIEVAL_DEBUG": "1"}, strict=True)
+    ok_strict, _ = run_env(
+        {"APP_ENV": "prod", "ALLOW_PROD_DEBUG": "0", "ENABLE_RETRIEVAL_DEBUG": "1"},
+        strict=True,
+    )
     assert not ok_strict, "strict mode should fail on warnings"
 
 

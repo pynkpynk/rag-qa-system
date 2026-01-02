@@ -7,8 +7,6 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
-from typing import Any, Dict, Optional
-
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -46,7 +44,9 @@ class SmokeEchoPayload(BaseModel):
     run_id: Optional[str] = None
 
 
-def _error_payload(code: str, message: str, details: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def _error_payload(
+    code: str, message: str, details: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
     payload: Dict[str, Any] = {"error": {"code": code, "message": message}}
     if details is not None:
         payload["error"]["details"] = details
@@ -69,6 +69,7 @@ def _sanitize_validation_errors(errors: list[dict[str, Any]]) -> list[dict[str, 
             entry["ctx"] = safe_ctx
         sanitized.append(entry)
     return sanitized
+
 
 def normalize_http_exception_detail(detail: Any) -> Dict[str, Any] | None:
     if not isinstance(detail, dict):
@@ -146,7 +147,9 @@ def create_app() -> FastAPI:
         )
 
     @app.exception_handler(RequestValidationError)
-    async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    async def validation_exception_handler(
+        request: Request, exc: RequestValidationError
+    ):
         details = {"errors": _sanitize_validation_errors(exc.errors())}
         payload = _error_payload(
             code="VALIDATION_ERROR",
@@ -162,10 +165,17 @@ def create_app() -> FastAPI:
     @app.exception_handler(Exception)
     async def unhandled_exception_handler(request: Request, exc: Exception):
         rid = getattr(request.state, "request_id", "")
-        print(json.dumps({"event": "unhandled_exception", "request_id": rid, "error": repr(exc)}, ensure_ascii=False))
+        print(
+            json.dumps(
+                {"event": "unhandled_exception", "request_id": rid, "error": repr(exc)},
+                ensure_ascii=False,
+            )
+        )
         return JSONResponse(
             status_code=500,
-            content=_error_payload(code="INTERNAL_ERROR", message="Internal server error."),
+            content=_error_payload(
+                code="INTERNAL_ERROR", message="Internal server error."
+            ),
             headers={"x-request-id": rid},
         )
 
@@ -214,10 +224,13 @@ def create_app() -> FastAPI:
     app.include_router(docs_router, prefix=api_prefix, tags=["docs"])
     app.include_router(chat_router, prefix=api_prefix, tags=["chat"])
     app.include_router(chunks_router, prefix=api_prefix, tags=["chunks"])
-    app.include_router(search_router, prefix=api_prefix, tags=["search"])  # ✅ ここで統一して追加
+    app.include_router(
+        search_router, prefix=api_prefix, tags=["search"]
+    )  # ✅ ここで統一して追加
     app.include_router(debug_router, prefix=api_prefix, tags=["_debug"])
 
     if smoke_endpoint_enabled():
+
         @app.post("/api/_smoke/echo")
         async def smoke_echo(payload: SmokeEchoPayload):
             return {"ok": True, "echo_length": len(payload.question)}

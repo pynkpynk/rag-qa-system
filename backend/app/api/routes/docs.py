@@ -5,12 +5,20 @@ import os
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Tuple
+from typing import Tuple
 
 import boto3
 from botocore.exceptions import ClientError
 
-from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, UploadFile, Query
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    File,
+    HTTPException,
+    UploadFile,
+    Query,
+)
 from fastapi.responses import RedirectResponse, FileResponse
 from sqlalchemy import text as sql_text
 from sqlalchemy.exc import IntegrityError
@@ -82,6 +90,7 @@ def _get_s3():
 # Helpers
 # =========================
 
+
 def _safe_filename(name: str) -> str:
     base = os.path.basename(name or "")
     return base or "uploaded.pdf"
@@ -99,7 +108,9 @@ def _require_pdf_extension(filename: str) -> None:
 def _require_pdf_content_type(upload: UploadFile) -> None:
     ctype = (upload.content_type or "").split(";")[0].strip().lower()
     if ctype and ctype != "application/pdf":
-        raise HTTPException(status_code=415, detail="Content-Type must be application/pdf.")
+        raise HTTPException(
+            status_code=415, detail="Content-Type must be application/pdf."
+        )
 
 
 def _max_upload_limits() -> Tuple[int, int]:
@@ -151,11 +162,17 @@ def _sha256_and_save_tmp(upload: UploadFile, tmp_path: Path) -> str:
             if first:
                 first = False
                 if not buf.startswith(PDF_MAGIC):
-                    raise HTTPException(status_code=400, detail="Invalid PDF file (missing %PDF- header).")
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Invalid PDF file (missing %PDF- header).",
+                    )
 
             total += len(buf)
             if total > limit_bytes:
-                raise HTTPException(status_code=413, detail=f"File too large. Max {limit_mb}MB is allowed.")
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"File too large. Max {limit_mb}MB is allowed.",
+                )
 
             hasher.update(buf)
             f.write(buf)
@@ -166,7 +183,9 @@ def _sha256_and_save_tmp(upload: UploadFile, tmp_path: Path) -> str:
     return hasher.hexdigest()
 
 
-def _enforce_run_access_if_needed(db: Session, run_id: str | None, document_id: str, p: Principal) -> None:
+def _enforce_run_access_if_needed(
+    db: Session, run_id: str | None, document_id: str, p: Principal
+) -> None:
     if not run_id:
         return
 
@@ -174,10 +193,14 @@ def _enforce_run_access_if_needed(db: Session, run_id: str | None, document_id: 
     ensure_run_access(db, run_id, p)
 
     # ② run_documentsに紐づくdocか
-    row = db.execute(
-        sql_text(SQL_DOC_ATTACHED_TO_RUN),
-        {"run_id": run_id, "document_id": document_id},
-    ).mappings().first()
+    row = (
+        db.execute(
+            sql_text(SQL_DOC_ATTACHED_TO_RUN),
+            {"run_id": run_id, "document_id": document_id},
+        )
+        .mappings()
+        .first()
+    )
     ok = bool(row and row.get("ok"))
     if not ok:
         raise HTTPException(status_code=404, detail="document not found")
@@ -214,6 +237,7 @@ def _get_doc_for_read(db: Session, document_id: str, p: Principal) -> Document:
 # =========================
 # S3 helpers
 # =========================
+
 
 def _s3_key_for(doc_id: str, content_hash: str, filename: str) -> str:
     safe = _safe_filename(filename)
@@ -291,7 +315,12 @@ def _doc_uses_local_storage(doc: Document) -> bool:
 
 
 def _truthy_env(name: str, default: str = "") -> bool:
-    return (os.getenv(name, default) or "").strip().lower() in {"1", "true", "yes", "on"}
+    return (os.getenv(name, default) or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 def _indexing_available() -> Tuple[bool, str | None]:
@@ -316,6 +345,7 @@ def _indexing_available() -> Tuple[bool, str | None]:
 # Background Task
 # =========================
 
+
 def index_document(doc_id: str) -> None:
     db = SessionLocal()
     tmp_download: Path | None = None
@@ -339,7 +369,9 @@ def index_document(doc_id: str) -> None:
             raise RuntimeError("storage_key missing")
 
         storage_meta = doc.meta or {}
-        storage_type = storage_meta.get("storage") or ("s3" if _s3_configured() else "local")
+        storage_type = storage_meta.get("storage") or (
+            "s3" if _s3_configured() else "local"
+        )
 
         if storage_type == "local":
             path_value = storage_meta.get("path") or doc.storage_key
@@ -368,7 +400,9 @@ def index_document(doc_id: str) -> None:
 
         vecs = embed_texts(texts)
 
-        db.query(Chunk).filter(Chunk.document_id == doc_id).delete(synchronize_session=False)
+        db.query(Chunk).filter(Chunk.document_id == doc_id).delete(
+            synchronize_session=False
+        )
 
         for (page_no, idx, ch), vec in zip(metas, vecs):
             db.add(
@@ -407,6 +441,7 @@ def index_document(doc_id: str) -> None:
 # =========================
 # Routes (RBAC + owner_sub)
 # =========================
+
 
 @router.post(
     "/docs/upload",
@@ -453,11 +488,21 @@ def upload_doc(
                 _cleanup_file(tmp_path)
                 raise HTTPException(
                     status_code=503,
-                    detail={"error": {"code": "STORAGE_ERROR", "message": f"Failed to upload to object storage: {exc}"}},
+                    detail={
+                        "error": {
+                            "code": "STORAGE_ERROR",
+                            "message": f"Failed to upload to object storage: {exc}",
+                        }
+                    },
                 ) from exc
             _cleanup_file(tmp_path)
             storage_key = key
-            storage_meta = {"storage": "s3", "bucket": S3_BUCKET, "key": key, "region": AWS_REGION}
+            storage_meta = {
+                "storage": "s3",
+                "bucket": S3_BUCKET,
+                "key": key,
+                "region": AWS_REGION,
+            }
         else:
             dest = _local_storage_path(doc_id)
             dest.parent.mkdir(parents=True, exist_ok=True)
@@ -487,7 +532,9 @@ def upload_doc(
             # 競合時：同じuser+hash ができてたらそれを返す
             existing2 = (
                 db.query(Document)
-                .filter(Document.content_hash == content_hash, Document.owner_sub == p.sub)
+                .filter(
+                    Document.content_hash == content_hash, Document.owner_sub == p.sub
+                )
                 .first()
             )
             if existing2:
@@ -565,7 +612,11 @@ def get_doc_detail(
 ):
     doc = _get_doc_for_read(db, document_id, p)
 
-    created_at = doc.created_at.isoformat() if isinstance(doc.created_at, datetime) else str(doc.created_at)
+    created_at = (
+        doc.created_at.isoformat()
+        if isinstance(doc.created_at, datetime)
+        else str(doc.created_at)
+    )
     return DocumentDetailResponse(
         document_id=doc.id,
         filename=doc.filename,
@@ -599,7 +650,10 @@ def get_doc_page_chunks(
         .order_by(Chunk.chunk_index.asc())
         .all()
     )
-    return [DocumentPageChunkItem(chunk_id=r.id, chunk_index=r.chunk_index, text=r.text) for r in rows]
+    return [
+        DocumentPageChunkItem(chunk_id=r.id, chunk_index=r.chunk_index, text=r.text)
+        for r in rows
+    ]
 
 
 @router.get(
@@ -615,9 +669,10 @@ def download_doc(
     doc = _get_doc_for_read(db, document_id, p)
     _enforce_run_access_if_needed(db, run_id, doc.id, p)
 
-
     if _doc_uses_local_storage(doc):
-        local_path = _resolve_local_path((doc.meta or {}).get("path") or doc.storage_key)
+        local_path = _resolve_local_path(
+            (doc.meta or {}).get("path") or doc.storage_key
+        )
         if not local_path.exists():
             _not_found()
         safe = _safe_cd_filename(doc.filename)
@@ -626,7 +681,12 @@ def download_doc(
     if not _s3_configured():
         raise HTTPException(
             status_code=503,
-            detail={"error": {"code": "STORAGE_NOT_CONFIGURED", "message": "Object storage is not configured."}},
+            detail={
+                "error": {
+                    "code": "STORAGE_NOT_CONFIGURED",
+                    "message": "Object storage is not configured.",
+                }
+            },
         )
 
     if not doc.storage_key:
@@ -650,7 +710,9 @@ def view_pdf(
     _enforce_run_access_if_needed(db, run_id, doc.id, p)
 
     if _doc_uses_local_storage(doc):
-        local_path = _resolve_local_path((doc.meta or {}).get("path") or doc.storage_key)
+        local_path = _resolve_local_path(
+            (doc.meta or {}).get("path") or doc.storage_key
+        )
         if not local_path.exists():
             _not_found()
         safe = _safe_cd_filename(doc.filename)
@@ -660,7 +722,12 @@ def view_pdf(
     if not _s3_configured():
         raise HTTPException(
             status_code=503,
-            detail={"error": {"code": "STORAGE_NOT_CONFIGURED", "message": "Object storage is not configured."}},
+            detail={
+                "error": {
+                    "code": "STORAGE_NOT_CONFIGURED",
+                    "message": "Object storage is not configured.",
+                }
+            },
         )
 
     if not doc.storage_key:

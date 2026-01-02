@@ -25,6 +25,7 @@ router = APIRouter()
 # Schemas
 # -------------------------
 
+
 class RunCreatePayload(BaseModel):
     config: dict = Field(..., description="Run configuration JSON")
     document_ids: list[str] | None = None
@@ -33,16 +34,19 @@ class RunCreatePayload(BaseModel):
 class AttachDocsPayload(BaseModel):
     document_ids: list[str] = Field(..., min_length=1)
 
+
 # -------------------------
 # Helpers
 # -------------------------
 
 PROTECTED_STATUSES = {"running", "in_progress", "processing", "indexing"}
 
+
 def _iso(dt: Any) -> str:
     if isinstance(dt, datetime):
         return dt.isoformat()
     return str(dt)
+
 
 def _require_indexed_docs(docs: list[Document]) -> None:
     not_indexed = [d.id for d in docs if (d.status or "").lower() != "indexed"]
@@ -52,6 +56,7 @@ def _require_indexed_docs(docs: list[Document]) -> None:
             detail=f"one or more documents are not indexed yet: {', '.join(not_indexed)}",
         )
 
+
 def _serialize_run_list(run: Run) -> dict[str, Any]:
     return {
         "run_id": run.id,
@@ -59,6 +64,7 @@ def _serialize_run_list(run: Run) -> dict[str, Any]:
         "status": run.status,
         "document_ids": [d.id for d in run.documents],
     }
+
 
 def _serialize_run_detail(run: Run) -> dict[str, Any]:
     return {
@@ -70,6 +76,7 @@ def _serialize_run_detail(run: Run) -> dict[str, Any]:
         "document_ids": [d.id for d in run.documents],
     }
 
+
 def _require_confirm(confirm: str | None) -> None:
     if confirm != "DELETE":
         raise HTTPException(
@@ -77,7 +84,10 @@ def _require_confirm(confirm: str | None) -> None:
             detail='Destructive operation. Add query "?confirm=DELETE" to proceed.',
         )
 
-def _fetch_docs_owned_by(db: Session, document_ids: list[str], owner_sub: str) -> list[Document]:
+
+def _fetch_docs_owned_by(
+    db: Session, document_ids: list[str], owner_sub: str
+) -> list[Document]:
     """
     Attach入口の強制：
     - ここでは「run.owner_sub と doc.owner_sub が一致するdocのみ」取得する
@@ -90,8 +100,11 @@ def _fetch_docs_owned_by(db: Session, document_ids: list[str], owner_sub: str) -
         .all()
     )
     if len(docs) != len(uniq):
-        raise HTTPException(status_code=400, detail="one or more document_ids not found")
+        raise HTTPException(
+            status_code=400, detail="one or more document_ids not found"
+        )
     return docs
+
 
 def _get_run_for_update(db: Session, run_id: str, p: Principal) -> Run:
     """
@@ -104,9 +117,11 @@ def _get_run_for_update(db: Session, run_id: str, p: Principal) -> Run:
         raise HTTPException(status_code=404, detail="run not found")
     return run
 
+
 # -------------------------
 # Routes
 # -------------------------
+
 
 @router.get("/runs", response_model=list[RunListItem])
 def list_runs(
@@ -117,8 +132,9 @@ def list_runs(
 ):
     # ✅ filter → order_by → limit の順（SQLAlchemy 2系の事故回避）
     q = (
-        db.query(Run)
-        .options(selectinload(Run.documents))  # run.documents 参照のN+1回避
+        db.query(Run).options(
+            selectinload(Run.documents)
+        )  # run.documents 参照のN+1回避
     )
 
     # 基本は自分のrunのみ（admin + all=true の時だけ全件）
@@ -129,6 +145,7 @@ def list_runs(
 
     runs = q.all()
     return [_serialize_run_list(r) for r in runs]
+
 
 @router.post("/runs", response_model=RunDetailResponse)
 def create_run(
@@ -162,6 +179,7 @@ def create_run(
     db.refresh(run)
     return _serialize_run_detail(run)
 
+
 @router.get("/runs/{run_id}", response_model=RunDetailResponse)
 def get_run(
     run_id: str,
@@ -170,6 +188,7 @@ def get_run(
 ):
     run = _get_run_for_update(db, run_id, p)
     return _serialize_run_detail(run)
+
 
 @router.post("/runs/{run_id}/attach_docs", response_model=RunDetailResponse)
 def attach_docs(
@@ -192,6 +211,7 @@ def attach_docs(
     db.refresh(run)
     return _serialize_run_detail(run)
 
+
 @router.delete("/runs/{run_id}", response_model=RunDeleteResponse)
 def delete_run(
     run_id: str,
@@ -204,7 +224,10 @@ def delete_run(
     run = _get_run_for_update(db, run_id, p)
 
     if (run.status or "").lower() in PROTECTED_STATUSES:
-        raise HTTPException(status_code=409, detail=f"run is active (status={run.status}); refuse to delete")
+        raise HTTPException(
+            status_code=409,
+            detail=f"run is active (status={run.status}); refuse to delete",
+        )
 
     run.documents.clear()
     db.flush()
@@ -213,13 +236,24 @@ def delete_run(
     db.commit()
     return {"deleted": True, "run_id": run_id}
 
+
 @router.delete("/runs", response_model=RunCleanupResponse)
 def cleanup_runs(
-    older_than_days: int = Query(7, ge=0, le=3650, description="Delete runs older than N days"),
-    dry_run: bool = Query(True, description="Default true (safe). Set false to actually delete."),
-    confirm: str | None = Query(None, description='Required when dry_run=false: "DELETE"'),
-    limit: int = Query(200, ge=1, le=2000, description="Max runs to delete in one call"),
-    all_runs: bool = Query(False, alias="all", description="Admin only: cleanup all users' runs"),
+    older_than_days: int = Query(
+        7, ge=0, le=3650, description="Delete runs older than N days"
+    ),
+    dry_run: bool = Query(
+        True, description="Default true (safe). Set false to actually delete."
+    ),
+    confirm: str | None = Query(
+        None, description='Required when dry_run=false: "DELETE"'
+    ),
+    limit: int = Query(
+        200, ge=1, le=2000, description="Max runs to delete in one call"
+    ),
+    all_runs: bool = Query(
+        False, alias="all", description="Admin only: cleanup all users' runs"
+    ),
     db: Session = Depends(get_db),
     p: Principal = Depends(require_permissions("delete:docs")),
 ):
@@ -246,7 +280,9 @@ def cleanup_runs(
     skipped: list[dict[str, Any]] = []
     for r in candidates:
         if (r.status or "").lower() in PROTECTED_STATUSES:
-            skipped.append({"run_id": r.id, "status": r.status, "created_at": _iso(r.created_at)})
+            skipped.append(
+                {"run_id": r.id, "status": r.status, "created_at": _iso(r.created_at)}
+            )
         else:
             deletable.append(r)
 

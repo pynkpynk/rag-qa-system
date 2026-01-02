@@ -63,12 +63,25 @@ def _dev_admin_subs() -> Set[str]:
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
+def _demo_digest(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def demo_owner_sub_from_token(token: str) -> str:
+    digest = _demo_digest(token)
+    return f"demo|{digest[:12]}"
+
+
 def _demo_token_hashes() -> Set[str]:
     hashes: Set[str] = set()
     for part in _parse_csv(_env("DEMO_TOKEN_SHA256_LIST")):
         lower = part.lower()
         if _SHA256_RE.fullmatch(lower):
             hashes.add(lower)
+    plaintext = _env("DEMO_TOKEN_PLAINTEXT")
+    if plaintext and not _is_production():
+        digest = _demo_digest(plaintext)
+        hashes.add(digest)
     return hashes
 
 
@@ -233,7 +246,9 @@ def _pick_key(jwks: Dict[str, Any], kid: str) -> Dict[str, Any]:
     for k in jwks.get("keys", []):
         if k.get("kid") == kid:
             return k
-    raise HTTPException(status_code=401, detail=_unauth_detail("Invalid token (kid not found)"))
+    raise HTTPException(
+        status_code=401, detail=_unauth_detail("Invalid token (kid not found)")
+    )
 
 
 def _extract_permissions(payload: Dict[str, Any]) -> Set[str]:
@@ -266,7 +281,9 @@ def _maybe_guard_prod_mode() -> None:
         return
     mode = _effective_mode()
     if _is_production() and mode in {"dev", "disabled"}:
-        raise RuntimeError("Auth bypass (AUTH_MODE=dev or AUTH_DISABLED=1) is not allowed in production.")
+        raise RuntimeError(
+            "Auth bypass (AUTH_MODE=dev or AUTH_DISABLED=1) is not allowed in production."
+        )
 
 
 # -------------------------
@@ -280,16 +297,22 @@ def _decode_and_validate(token: str) -> Principal:
     try:
         header = jwt.get_unverified_header(token)
     except Exception:
-        raise HTTPException(status_code=401, detail=_unauth_detail("Invalid token (bad header)"))
+        raise HTTPException(
+            status_code=401, detail=_unauth_detail("Invalid token (bad header)")
+        )
 
     kid = header.get("kid")
     if not kid:
-        raise HTTPException(status_code=401, detail=_unauth_detail("Invalid token (no kid)"))
+        raise HTTPException(
+            status_code=401, detail=_unauth_detail("Invalid token (no kid)")
+        )
 
     try:
         jwks = _get_jwks(issuer)
     except httpx.HTTPStatusError as e:
-        raise RuntimeError(f"Failed to fetch JWKS (check AUTH0_ISSUER/AUTH0_DOMAIN): {e}") from e
+        raise RuntimeError(
+            f"Failed to fetch JWKS (check AUTH0_ISSUER/AUTH0_DOMAIN): {e}"
+        ) from e
     except Exception as e:
         raise RuntimeError(f"Failed to fetch JWKS: {e}") from e
 
@@ -310,7 +333,9 @@ def _decode_and_validate(token: str) -> Principal:
 
     sub = payload.get("sub")
     if not isinstance(sub, str) or not sub:
-        raise HTTPException(status_code=401, detail=_unauth_detail("Invalid token (no sub)"))
+        raise HTTPException(
+            status_code=401, detail=_unauth_detail("Invalid token (no sub)")
+        )
 
     permissions = _extract_permissions(payload)
     return Principal(sub=sub, permissions=permissions)
@@ -324,10 +349,14 @@ def get_principal(
 
     def _require_bearer_token() -> str:
         if cred is None or cred.scheme.lower() != "bearer":
-            raise HTTPException(status_code=401, detail=_unauth_detail("Missing bearer token"))
+            raise HTTPException(
+                status_code=401, detail=_unauth_detail("Missing bearer token")
+            )
         token = (cred.credentials or "").strip()
         if not token:
-            raise HTTPException(status_code=401, detail=_unauth_detail("Missing bearer token"))
+            raise HTTPException(
+                status_code=401, detail=_unauth_detail("Missing bearer token")
+            )
         return token
 
     mode = _effective_mode()
@@ -338,24 +367,29 @@ def get_principal(
     if mode == "dev":
         token = _require_bearer_token()
         if token.strip().lower() not in {"dev-token", "devtoken"}:
-            raise HTTPException(status_code=401, detail=_unauth_detail("Invalid dev token"))
+            raise HTTPException(
+                status_code=401, detail=_unauth_detail("Invalid dev token")
+            )
         sub_override = request.headers.get("x-dev-sub")
         return _dev_principal(sub_override=sub_override)
 
     if mode == "demo":
         token = _require_bearer_token()
-        digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        digest = _demo_digest(token)
         allowed_hashes = _demo_token_hashes()
         allowed = any(hmac.compare_digest(digest, h) for h in allowed_hashes)
         if not allowed:
             raise HTTPException(status_code=401, detail=_unauth_detail("Invalid token"))
-        sub = f"demo|{digest[:12]}"
+        sub = demo_owner_sub_from_token(token)
         perms = {"read:docs", "write:docs", "delete:docs"}
         return Principal(sub=sub, permissions=perms)
 
     token = _require_bearer_token()
     if token.strip().lower() == "dev-token":
-        raise HTTPException(status_code=401, detail=_unauth_detail("Dev token disabled in this environment"))
+        raise HTTPException(
+            status_code=401,
+            detail=_unauth_detail("Dev token disabled in this environment"),
+        )
     return _decode_and_validate(token)
 
 

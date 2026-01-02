@@ -8,7 +8,9 @@ from pydantic import BaseModel, Field
 class HealthResponse(BaseModel):
     app: str
     version: str
-    status: Literal["ok", "degraded", "error"] | str = Field(..., description="Overall health status")
+    status: Literal["ok", "degraded", "error"] | str = Field(
+        ..., description="Overall health status"
+    )
     time_utc: str
     app_env: str
     auth_mode: str
@@ -73,6 +75,10 @@ class ChatCitation(BaseModel):
     source_id: str | None = None
     page: int | None = None
     filename: str | None = None
+    document_id: str | None = None
+    chunk_id: str | None = None
+    chunk_id_missing_reason: str | None = None
+    drilldown_blocked_reason: str | None = None
 
 
 class ChatResponse(BaseModel):

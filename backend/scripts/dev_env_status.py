@@ -2,6 +2,7 @@
 """
 Print SET/MISSING for required backend env keys without leaking values.
 """
+
 from __future__ import annotations
 
 import os
@@ -24,6 +25,7 @@ DEV_CONTEXT_KEYS = [
 BACKEND_DIR = Path(__file__).resolve().parents[1]
 ENV_FILE = BACKEND_DIR / ".env.local"
 
+
 def _load_env_file() -> dict[str, str]:
     data: dict[str, str] = {}
     if not ENV_FILE.exists():
@@ -41,14 +43,17 @@ def _load_env_file() -> dict[str, str]:
         data.setdefault(key, value.strip())
     return data
 
+
 def _truthy(val: str) -> bool:
     return val.strip().lower() in {"1", "true", "yes", "on"}
+
 
 def _effective_mode(env: dict[str, str]) -> str:
     if _truthy(env.get("AUTH_DISABLED", "")):
         return "disabled"
     mode = (env.get("AUTH_MODE", "auth0") or "auth0").lower()
     return "dev" if mode == "dev" else "auth0"
+
 
 def main() -> int:
     file_env = _load_env_file()
@@ -73,6 +78,7 @@ def main() -> int:
     print(f"effective_mode: {effective_mode}")
     print(f"{allowlist_key}: {status}")
     return 0
+
 
 if __name__ == "__main__":
     raise SystemExit(main())

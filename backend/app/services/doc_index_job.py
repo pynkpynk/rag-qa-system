@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from typing import Any, Dict, Optional
+from typing import Any, Optional
 
 # --- DB session import (プロジェクトに合わせて調整) ---
 try:
@@ -13,11 +13,15 @@ except Exception:  # pragma: no cover
     from sqlalchemy.orm import sessionmaker
     from app.core.config import settings
 
-    db_url = getattr(settings, "database_url", None) or getattr(settings, "DATABASE_URL", None)
+    db_url = getattr(settings, "database_url", None) or getattr(
+        settings, "DATABASE_URL", None
+    )
     if not db_url:
         raise RuntimeError("database_url is not configured (settings.database_url).")
 
-    connect_args = {"check_same_thread": False} if str(db_url).startswith("sqlite") else {}
+    connect_args = (
+        {"check_same_thread": False} if str(db_url).startswith("sqlite") else {}
+    )
     engine = create_engine(db_url, connect_args=connect_args)  # type: ignore
     SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
@@ -26,7 +30,9 @@ try:
     from app.db.models import Document  # type: ignore
 except Exception:  # pragma: no cover
     # ここはあなたのモデルパスに合わせて直す
-    raise ImportError("Cannot import Document model. Update import path in doc_index_job.py")
+    raise ImportError(
+        "Cannot import Document model. Update import path in doc_index_job.py"
+    )
 
 # --- Indexer import (あなたの既存 index 関数に合わせて調整) ---
 try:
@@ -94,7 +100,9 @@ def run_index_job(document_id: str) -> None:
             raise RuntimeError("PDF path is missing in Document record.")
 
         if index_document_from_pdf is None:
-            raise RuntimeError("index_document_from_pdf import is not configured. Fix import in doc_index_job.py")
+            raise RuntimeError(
+                "index_document_from_pdf import is not configured. Fix import in doc_index_job.py"
+            )
 
         # 例：既存パイプラインに合わせて「パス＋document_id」を渡す
         index_document_from_pdf(pdf_path, document_id=document_id)

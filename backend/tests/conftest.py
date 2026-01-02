@@ -2,10 +2,14 @@ import logging
 import os
 from pathlib import Path
 
-os.environ["APP_ENV"] = "dev"
-os.environ["AUTH_MODE"] = "dev"
+os.environ.setdefault("APP_ENV", "dev")
+os.environ.setdefault("AUTH_MODE", "dev")
 os.environ.setdefault("DEV_SUB", "test-user")
 os.environ.setdefault("OPENAI_OFFLINE", "1")
+os.environ.setdefault(
+    "DATABASE_URL",
+    "postgresql+psycopg://postgres:postgres@localhost:5432/ragqa_test",
+)
 
 import pytest
 
@@ -17,8 +21,21 @@ def _set_default_test_env(monkeypatch):
     monkeypatch.setenv("AUTH_MODE", os.getenv("AUTH_MODE", "dev") or "dev")
     monkeypatch.setenv("APP_ENV", os.getenv("APP_ENV", "dev") or "dev")
     monkeypatch.setenv("ALLOW_PROD_DEBUG", os.getenv("ALLOW_PROD_DEBUG", "1") or "1")
-    monkeypatch.setenv("RATE_LIMIT_ENABLED", os.getenv("RATE_LIMIT_ENABLED", "0") or "0")
-    monkeypatch.setenv("MAX_REQUEST_BYTES", os.getenv("MAX_REQUEST_BYTES", "1048576") or "1048576")
+    monkeypatch.setenv(
+        "RATE_LIMIT_ENABLED", os.getenv("RATE_LIMIT_ENABLED", "0") or "0"
+    )
+    monkeypatch.setenv(
+        "MAX_REQUEST_BYTES", os.getenv("MAX_REQUEST_BYTES", "1048576") or "1048576"
+    )
+
+
+@pytest.fixture
+def force_dev_auth(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("APP_ENV", "test")
+    monkeypatch.setenv("AUTH_MODE", "dev")
+    monkeypatch.delenv("AUTH_DISABLED", raising=False)
+    monkeypatch.delenv("TOKEN", raising=False)
+    yield
 
 
 @pytest.fixture(scope="session", autouse=True)

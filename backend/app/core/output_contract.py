@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 from typing import Any, Tuple
 
+
 def _is_nonfinite(value: Any) -> bool:
     try:
         if isinstance(value, (float, int)):
@@ -13,6 +14,7 @@ def _is_nonfinite(value: Any) -> bool:
         return False
     except Exception:
         return False
+
 
 def sanitize_nonfinite_floats(obj: Any) -> Tuple[Any, list[str]]:
     paths: list[str] = []

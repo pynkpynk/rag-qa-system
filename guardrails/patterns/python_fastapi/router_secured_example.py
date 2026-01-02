@@ -3,7 +3,6 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends
 
 from .authn_authz import CurrentUser, deny_as_not_found, require_scope
-from .errors import http_error
 from .dto_mapping import DocumentOut, to_document_out
 
 router = APIRouter(tags=["documents"])
@@ -16,7 +15,12 @@ def _get_document_by_id(db: object, doc_id: str):
     return type(
         "Doc",
         (),
-        {"id": doc_id, "title": "Example", "owner_sub": "demo-user", "created_at": __import__("datetime").datetime.utcnow()},
+        {
+            "id": doc_id,
+            "title": "Example",
+            "owner_sub": "demo-user",
+            "created_at": __import__("datetime").datetime.utcnow(),
+        },
     )()
 
 

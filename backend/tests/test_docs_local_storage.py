@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from io import BytesIO
-import os
 
 import pytest
 from fastapi.testclient import TestClient
@@ -56,7 +55,12 @@ def sqlite_docs_storage(monkeypatch: pytest.MonkeyPatch, tmp_path):
     monkeypatch.setattr(docs_module, "LOCAL_STORAGE_DIR", local_dir)
     monkeypatch.setattr(docs_module, "index_document", lambda doc_id: None)
     monkeypatch.setenv("OPENAI_OFFLINE", "1")
-    monkeypatch.setattr(config_module.settings, "openai_api_key", SecretStr("ci-test-key"), raising=False)
+    monkeypatch.setattr(
+        config_module.settings,
+        "openai_api_key",
+        SecretStr("ci-test-key"),
+        raising=False,
+    )
 
     try:
         yield SessionLocal, local_dir
@@ -92,10 +96,14 @@ def test_upload_and_view_local_storage(sqlite_docs_storage):
     assert view_resp.content.startswith(b"%PDF-")
 
 
-def test_upload_marks_failed_when_openai_missing(monkeypatch: pytest.MonkeyPatch, sqlite_docs_storage):
+def test_upload_marks_failed_when_openai_missing(
+    monkeypatch: pytest.MonkeyPatch, sqlite_docs_storage
+):
     session_factory, _ = sqlite_docs_storage
     monkeypatch.setenv("OPENAI_OFFLINE", "0")
-    monkeypatch.setattr(config_module.settings, "openai_api_key", SecretStr(""), raising=False)
+    monkeypatch.setattr(
+        config_module.settings, "openai_api_key", SecretStr(""), raising=False
+    )
 
     sample_pdf = b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\nxref\n0 1\n0000000000 65535 f \ntrailer\n<<>>\nstartxref\n9\n%%EOF"
 

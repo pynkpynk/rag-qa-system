@@ -14,7 +14,9 @@ from app.db.session import get_db
 import app.api.routes.chat as chat
 
 client = TestClient(app)
-TOKEN = os.environ.get("TOKEN", "dev-token")
+TOKEN = "dev-token"
+
+pytestmark = pytest.mark.usefixtures("force_dev_auth")
 
 
 def _auth_headers() -> dict[str, str]:
@@ -47,7 +49,9 @@ def _sqlite_contract_db(monkeypatch: pytest.MonkeyPatch):
     app.dependency_overrides[get_db] = override_get_db
     monkeypatch.setattr(chat, "fetch_chunks", lambda *args, **kwargs: ([], {}))
     monkeypatch.setattr(chat, "embed_query", lambda q: [0.0])
-    monkeypatch.setattr(chat, "answer_with_contract", lambda *args, **kwargs: ("contract answer", []))
+    monkeypatch.setattr(
+        chat, "answer_with_contract", lambda *args, **kwargs: ("contract answer", [])
+    )
 
     try:
         yield
@@ -61,7 +65,15 @@ def test_health_contract_shape():
     resp = client.get("/api/health")
     assert resp.status_code == 200
     data = resp.json()
-    for key in ("app", "version", "status", "time_utc", "llm_enabled", "openai_offline", "openai_key_present"):
+    for key in (
+        "app",
+        "version",
+        "status",
+        "time_utc",
+        "llm_enabled",
+        "openai_offline",
+        "openai_key_present",
+    ):
         assert key in data
     assert isinstance(data["llm_enabled"], bool)
     assert isinstance(data["openai_offline"], bool)

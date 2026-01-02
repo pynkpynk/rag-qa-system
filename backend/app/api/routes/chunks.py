@@ -51,6 +51,7 @@ SELECT EXISTS(
 # Internal helpers
 # ------------------------------------------------------------
 
+
 def _not_found() -> None:
     raise HTTPException(status_code=404, detail="not found")
 
@@ -90,7 +91,9 @@ def _ensure_run_has_docs(db: Session, run_id: UUID, p: Principal) -> None:
 
     try:
         if is_admin(p):
-            cnt = db.execute(sql_text(SQL_RUN_DOC_COUNT_ADMIN), {"run_id": run_id_s}).scalar_one()
+            cnt = db.execute(
+                sql_text(SQL_RUN_DOC_COUNT_ADMIN), {"run_id": run_id_s}
+            ).scalar_one()
         else:
             cnt = db.execute(
                 sql_text(SQL_RUN_DOC_COUNT_USER),
@@ -134,7 +137,9 @@ def _ensure_doc_readable(db: Session, document_id, p: Principal) -> Document:
     return doc
 
 
-def _ensure_chunk_accessible_for_run(db: Session, run_id: UUID, document_id, p: Principal) -> None:
+def _ensure_chunk_accessible_for_run(
+    db: Session, run_id: UUID, document_id, p: Principal
+) -> None:
     run_id_s = str(run_id)
     doc_id_s = str(document_id)
 
@@ -142,10 +147,14 @@ def _ensure_chunk_accessible_for_run(db: Session, run_id: UUID, document_id, p: 
     ensure_run_access(db, run_id_s, p)
 
     # ② run_documentsに紐づいてるか
-    row = db.execute(
-        sql_text(SQL_DOC_ATTACHED_TO_RUN),
-        {"run_id": run_id_s, "document_id": doc_id_s},
-    ).mappings().first()
+    row = (
+        db.execute(
+            sql_text(SQL_DOC_ATTACHED_TO_RUN),
+            {"run_id": run_id_s, "document_id": doc_id_s},
+        )
+        .mappings()
+        .first()
+    )
 
     ok = bool(row and row.get("ok"))
     if not ok:
@@ -155,6 +164,7 @@ def _ensure_chunk_accessible_for_run(db: Session, run_id: UUID, document_id, p: 
 # ------------------------------------------------------------
 # Route
 # ------------------------------------------------------------
+
 
 @router.get("/chunks/health", response_model=ChunkHealthResponse)
 def chunks_health(

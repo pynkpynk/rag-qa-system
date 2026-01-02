@@ -23,4 +23,6 @@ def test_dev_scripts_have_valid_syntax(script_path: Path) -> None:
         capture_output=True,
         text=True,
     )
-    assert result.returncode == 0, f"{script_path} failed syntax check: {result.stderr.strip()}"
+    assert result.returncode == 0, (
+        f"{script_path} failed syntax check: {result.stderr.strip()}"
+    )
