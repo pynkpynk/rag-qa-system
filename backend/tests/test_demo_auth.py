@@ -13,7 +13,9 @@ from app.main import app
 from app.db.session import get_db
 import app.api.routes.chat as chat
 import app.api.routes.docs as docs_module
-from app.db.models import Base
+from app.db.models import Base, Run
+from app.core.authz import demo_owner_sub_from_token, Principal
+from app.core.run_access import ensure_run_access
 
 
 client = TestClient(app)
@@ -61,7 +63,9 @@ def stub_chat(monkeypatch: pytest.MonkeyPatch):
     app.dependency_overrides[get_db] = override_db
     monkeypatch.setattr(chat, "fetch_chunks", lambda *args, **kwargs: ([], {}))
     monkeypatch.setattr(chat, "embed_query", lambda q: [0.0])
-    monkeypatch.setattr(chat, "answer_with_contract", lambda *args, **kwargs: ("demo answer", []))
+    monkeypatch.setattr(
+        chat, "answer_with_contract", lambda *args, **kwargs: ("demo answer", [])
+    )
 
     try:
         yield
@@ -106,12 +110,17 @@ def demo_docs_env(monkeypatch: pytest.MonkeyPatch, tmp_path):
         engine.dispose()
 
 
-def test_demo_token_allows_chat(monkeypatch: pytest.MonkeyPatch, demo_env: str, stub_chat):
+def test_demo_token_allows_chat(
+    monkeypatch: pytest.MonkeyPatch, demo_env: str, stub_chat
+):
     digest = hashlib.sha256(demo_env.encode("utf-8")).hexdigest()
     monkeypatch.setenv("DEMO_TOKEN_SHA256_LIST", digest)
     resp = client.post(
         "/api/chat/ask",
-        headers={"Authorization": f"Bearer {demo_env}", "Content-Type": "application/json"},
+        headers={
+            "Authorization": f"Bearer {demo_env}",
+            "Content-Type": "application/json",
+        },
         json={"question": "demo question"},
     )
     assert resp.status_code in (200, 201)
@@ -119,6 +128,24 @@ def test_demo_token_allows_chat(monkeypatch: pytest.MonkeyPatch, demo_env: str, 
     assert "answer" in data
     assert "debug_meta" not in data
     assert "retrieval_debug" not in data
+
+
+def test_demo_plaintext_token_allowed(monkeypatch: pytest.MonkeyPatch, stub_chat):
+    monkeypatch.setenv("AUTH_MODE", "demo")
+    monkeypatch.setenv("APP_ENV", "dev")
+    monkeypatch.setenv("DEMO_TOKEN_PLAINTEXT", "plain-demo-token")
+    monkeypatch.delenv("DEMO_TOKEN_SHA256_LIST", raising=False)
+    resp = client.post(
+        "/api/chat/ask",
+        headers={
+            "Authorization": "Bearer plain-demo-token",
+            "Content-Type": "application/json",
+        },
+        json={"question": "demo plaintext"},
+    )
+    assert resp.status_code in (200, 201)
+    data = resp.json()
+    assert "answer" in data
 
 
 def test_demo_docs_upload_not_forbidden(demo_env: str, demo_docs_env):
@@ -131,3 +158,28 @@ def test_demo_docs_upload_not_forbidden(demo_env: str, demo_docs_env):
     body = resp.json()
     assert resp.status_code != 403
     assert "error" in body
+
+
+def test_demo_run_owner_matches_token(monkeypatch: pytest.MonkeyPatch):
+    token = "demo-run-token"
+    sub = demo_owner_sub_from_token(token)
+    engine = create_engine(
+        "sqlite+pysqlite:///:memory:",
+        future=True,
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    SessionLocal = sessionmaker(bind=engine, expire_on_commit=False, future=True)
+    Base.metadata.create_all(bind=engine)
+    session = SessionLocal()
+    try:
+        run = Run(owner_sub=sub, config={}, status="seeded")
+        session.add(run)
+        session.commit()
+        ensure_run_access(
+            session, run.id, Principal(sub=sub, permissions={"read:docs"})
+        )
+    finally:
+        session.close()
+        Base.metadata.drop_all(bind=engine)
+        engine.dispose()

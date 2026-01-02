@@ -31,8 +31,11 @@ button:disabled { opacity:.5; cursor:not-allowed; }
 .citations { display:flex; flex-direction:column; gap:8px; }
 .citeItem { border: 1px solid rgba(127,127,127,.25); border-radius: 12px; padding: 10px; cursor:pointer; }
 .citeItem:hover { outline: 2px solid rgba(127,127,127,.35); }
+.citeItem.disabled { cursor:not-allowed; opacity: .7; }
+.citeItem.disabled:hover { outline: none; }
 .citeTitle { display:flex; justify-content:space-between; align-items:center; }
 .citeMeta { opacity:.75; }
+.citeWarning { margin-top: 4px; color: #c25555; font-size: .85rem; }
 
 .pageChunk { border: 1px solid rgba(127,127,127,.25); border-radius: 12px; padding: 10px; margin: 10px 0; }
 .pageChunk.highlight { outline: 2px solid rgba(127,127,127,.45); }
