@@ -8,6 +8,7 @@ from pydantic import BaseModel, ConfigDict
 
 # Example Pydantic DTOs (Pydantic v2 style)
 
+
 class DocumentOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

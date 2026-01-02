@@ -6,7 +6,6 @@ import uuid
 
 from fastapi import Request
 from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")

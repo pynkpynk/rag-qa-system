@@ -89,7 +89,10 @@ def test_eval_cases(case, monkeypatch):
     monkeypatch.setenv("ENABLE_HYBRID", "1")
     monkeypatch.setenv("ENABLE_TRGM", "1")
     monkeypatch.setenv("TRGM_K", "30")
-    monkeypatch.setenv("RETRIEVAL_DEBUG_REQUIRE_TOKEN_HASH", case.get("env", {}).get("RETRIEVAL_DEBUG_REQUIRE_TOKEN_HASH", "0"))
+    monkeypatch.setenv(
+        "RETRIEVAL_DEBUG_REQUIRE_TOKEN_HASH",
+        case.get("env", {}).get("RETRIEVAL_DEBUG_REQUIRE_TOKEN_HASH", "0"),
+    )
     # case-specific env overrides
     for key, value in case.get("env", {}).items():
         monkeypatch.setenv(key, str(value))
@@ -97,7 +100,9 @@ def test_eval_cases(case, monkeypatch):
     monkeypatch.delenv("ADMIN_DEBUG_TOKEN_SHA256_LIST", raising=False)
 
     if "force_summary" in case:
-        monkeypatch.setattr(chat, "_is_summary_question", lambda q: case["force_summary"])
+        monkeypatch.setattr(
+            chat, "_is_summary_question", lambda q: case["force_summary"]
+        )
 
     monkeypatch.setattr(chat, "embed_query", lambda q: [0.0])
     monkeypatch.setattr(chat, "ensure_run_access", lambda *args, **kwargs: None)
@@ -109,7 +114,18 @@ def test_eval_cases(case, monkeypatch):
 
     fetch_data = case.get("fetch")
 
-    def fake_fetch_chunks(db, qvec_lit, q_text, k, run_id, document_ids, p, question, trgm_available, admin_debug_hybrid):
+    def fake_fetch_chunks(
+        db,
+        qvec_lit,
+        q_text,
+        k,
+        run_id,
+        document_ids,
+        p,
+        question,
+        trgm_available,
+        admin_debug_hybrid,
+    ):
         if not fetch_data:
             return [], None
         rows = _load_rows(fetch_data)
@@ -122,12 +138,17 @@ def test_eval_cases(case, monkeypatch):
     monkeypatch.setattr(
         chat,
         "answer_with_contract",
-        lambda *args, **kwargs: (answer_cfg.get("text", "answer"), answer_cfg.get("citations", [])),
+        lambda *args, **kwargs: (
+            answer_cfg.get("text", "answer"),
+            answer_cfg.get("citations", []),
+        ),
     )
 
     payload = AskPayload.model_validate(case["payload"])
     request = DummyRequest(case["name"], case.get("authorization"))
-    principal = Principal(sub=case.get("principal_sub", "dev|user"), permissions={"read:docs"})
+    principal = Principal(
+        sub=case.get("principal_sub", "dev|user"), permissions={"read:docs"}
+    )
     db = DummyDB(case)
 
     try:
@@ -140,26 +161,42 @@ def test_eval_cases(case, monkeypatch):
         body = detail if isinstance(detail, dict) else {"error": {"code": str(detail)}}
 
     expect = case["expect"]
-    assert status == expect["status"], f"{case['name']}: status {status} != {expect['status']}"
+    assert status == expect["status"], (
+        f"{case['name']}: status {status} != {expect['status']}"
+    )
 
     json.dumps(body, allow_nan=False)
 
     if status >= 400:
-        assert body["error"]["code"] == expect["error_code"], f"{case['name']}: error code mismatch"
+        assert body["error"]["code"] == expect["error_code"], (
+            f"{case['name']}: error code mismatch"
+        )
         return
 
     rd_expect = expect.get("retrieval_debug")
     if rd_expect:
         present = rd_expect.get("present", True)
         if present:
-            assert "retrieval_debug" in body, f"{case['name']}: expected retrieval_debug"
+            assert "retrieval_debug" in body, (
+                f"{case['name']}: expected retrieval_debug"
+            )
             rd = body["retrieval_debug"]
             if "strategy" in rd_expect:
-                assert rd.get("strategy") == rd_expect["strategy"], f"{case['name']}: strategy mismatch"
+                assert rd.get("strategy") == rd_expect["strategy"], (
+                    f"{case['name']}: strategy mismatch"
+                )
             if "min_count" in rd_expect:
-                assert isinstance(rd.get("count"), int), f"{case['name']}: count missing or not int"
-                assert rd["count"] >= rd_expect["min_count"], f"{case['name']}: count too low"
+                assert isinstance(rd.get("count"), int), (
+                    f"{case['name']}: count missing or not int"
+                )
+                assert rd["count"] >= rd_expect["min_count"], (
+                    f"{case['name']}: count too low"
+                )
             if "used_trgm" in rd_expect:
-                assert rd.get("used_trgm") == rd_expect["used_trgm"], f"{case['name']}: used_trgm mismatch"
+                assert rd.get("used_trgm") == rd_expect["used_trgm"], (
+                    f"{case['name']}: used_trgm mismatch"
+                )
         else:
-            assert "retrieval_debug" not in body, f"{case['name']}: retrieval_debug should be absent"
+            assert "retrieval_debug" not in body, (
+                f"{case['name']}: retrieval_debug should be absent"
+            )

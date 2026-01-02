@@ -111,7 +111,9 @@ def test_docs_list_requires_auth_in_dev_mode(sqlite_docs_db):
     assert resp.status_code == 401
 
 
-def test_docs_list_requires_auth_in_auth0_mode(monkeypatch: pytest.MonkeyPatch, sqlite_docs_db):
+def test_docs_list_requires_auth_in_auth0_mode(
+    monkeypatch: pytest.MonkeyPatch, sqlite_docs_db
+):
     monkeypatch.setenv("AUTH_MODE", "auth0")
     resp = client.get("/api/docs")
     assert resp.status_code == 401

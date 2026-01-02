@@ -32,6 +32,7 @@ class DummyRequest:
             self.headers["authorization"] = authorization
         self.state = SimpleNamespace(request_id=None)
 
+
 class DummyResult:
     def __init__(self, rows):
         self.rows = rows
@@ -45,6 +46,7 @@ class DummyResult:
     def all(self):
         return self.rows
 
+
 class DummyDB:
     def __init__(self, results):
         self.results = list(results)
@@ -54,12 +56,14 @@ class DummyDB:
             raise AssertionError("Unexpected SQL execute call")
         return self.results.pop(0)
 
+
 def test_dev_mode_defaults_to_non_admin(monkeypatch):
     monkeypatch.setenv("AUTH_MODE", "dev")
     monkeypatch.setenv("AUTH_DISABLED", "0")
     monkeypatch.delenv("DEV_ADMIN_SUBS", raising=False)
     principal = Principal(sub="dev|local", permissions=set())
     assert is_admin(principal) is False
+
 
 def test_dev_mode_admin_allowlist(monkeypatch):
     monkeypatch.setenv("AUTH_MODE", "dev")
@@ -68,13 +72,16 @@ def test_dev_mode_admin_allowlist(monkeypatch):
     principal = Principal(sub="dev|local", permissions=set())
     assert is_admin(principal) is True
 
+
 def test_payload_accepts_message_alias_and_strips():
     p = AskPayload(message="  hello  ", k=6)
     assert p.question == "hello"
 
+
 def test_payload_prefers_question_over_message():
     p = AskPayload(question="Q", message="M", k=6)
     assert p.question == "Q"
+
 
 def test_payload_rejects_whitespace_only():
     with pytest.raises(Exception):
@@ -82,22 +89,27 @@ def test_payload_rejects_whitespace_only():
     with pytest.raises(Exception):
         AskPayload(message="   ", k=6)
 
+
 def test_payload_deduplicates_document_ids():
     p = AskPayload(question="Q", k=6, document_ids=[" doc1 ", "doc1", "", "doc2 "])
     assert p.document_ids == ["doc1", "doc2"]
 
+
 def test_payload_disallows_run_and_doc_scope():
     with pytest.raises(Exception):
         AskPayload(question="Q", k=6, run_id="run-1", document_ids=["doc1"])
+
 
 def test_cjk_detection():
     assert contains_cjk("日本語の質問です")
     assert query_class("日本語の質問です") == "cjk"
     assert query_class("hello world") == "latin"
 
+
 def test_should_use_fts_policy():
     assert should_use_fts("hello world") is True
     assert should_use_fts("日本語の質問です") is False
+
 
 def test_should_use_trgm_policy(monkeypatch):
     monkeypatch.setattr(chat, "ENABLE_TRGM", True)
@@ -108,9 +120,11 @@ def test_should_use_trgm_policy(monkeypatch):
     monkeypatch.setattr(chat, "ENABLE_TRGM", False)
     assert should_use_trgm("日本語の質問です", trgm_available=True) is False
 
+
 def test_payload_keeps_debug_flag():
     p = AskPayload(question="Q", k=6, debug=True)
     assert p.debug is True
+
 
 def test_get_bearer_token_parses_header():
     req = DummyRequest("Bearer token123")
@@ -120,9 +134,13 @@ def test_get_bearer_token_parses_header():
     assert get_bearer_token(DummyRequest("Bearer ")) is None
     assert get_bearer_token(DummyRequest("Bearer")) is None
 
+
 def test_is_admin_debug_false_without_auth_header():
     principal = Principal(sub="user", permissions=set())
-    assert chat.is_admin_debug(principal, DummyRequest(None), is_admin_user=False) is False
+    assert (
+        chat.is_admin_debug(principal, DummyRequest(None), is_admin_user=False) is False
+    )
+
 
 def test_is_admin_debug_false_for_empty_bearer_token(monkeypatch):
     digest = hashlib.sha256(b"").hexdigest()
@@ -131,6 +149,7 @@ def test_is_admin_debug_false_for_empty_bearer_token(monkeypatch):
     req = DummyRequest("Bearer ")
     assert chat.admin_debug_via_token(req) is False
     assert chat.is_admin_debug(principal, req, is_admin_user=False) is False
+
 
 def test_is_admin_debug_via_token_hash(monkeypatch):
     token = "dummy_admin_token"
@@ -141,6 +160,7 @@ def test_is_admin_debug_via_token_hash(monkeypatch):
     assert chat.admin_debug_via_token(req) is True
     assert chat.is_admin_debug(principal, req) is True
 
+
 def test_is_admin_debug_requires_token_hash_when_flag_enabled(monkeypatch):
     token = "allowed_token"
     digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
@@ -149,11 +169,14 @@ def test_is_admin_debug_requires_token_hash_when_flag_enabled(monkeypatch):
     req_no_hash = DummyRequest("Bearer other")
     admin_principal = Principal(sub="admin-user", permissions=set())
     # admin via sub only should fail when token hash required
-    assert chat.is_admin_debug(admin_principal, req_no_hash, is_admin_user=True) is False
+    assert (
+        chat.is_admin_debug(admin_principal, req_no_hash, is_admin_user=True) is False
+    )
     # matching token should pass even without admin sub
     req_allowed = DummyRequest(f"Bearer {token}")
     user_principal = Principal(sub="user", permissions=set())
     assert chat.is_admin_debug(user_principal, req_allowed, is_admin_user=False) is True
+
 
 class FakeRunDB:
     def __init__(self, owners: dict[str, str | None]):
@@ -176,6 +199,7 @@ class FakeRunDB:
             return self._Result(None)
         return self._Result({"owner_sub": owner})
 
+
 def test_ensure_run_access_blocks_other_user():
     db = FakeRunDB({"run-user-a": "user-a"})
     principal = Principal(sub="user-b", permissions=set())
@@ -183,16 +207,19 @@ def test_ensure_run_access_blocks_other_user():
         ensure_run_access(db, "run-user-a", principal)
     assert exc.value.status_code == 404
 
+
 def test_ensure_run_access_allows_owner():
     db = FakeRunDB({"run-user-a": "user-a"})
     principal = Principal(sub="user-a", permissions=set())
     ensure_run_access(db, "run-user-a", principal)
+
 
 def test_ensure_run_access_admin_allowed(monkeypatch):
     db = FakeRunDB({"run-admin": "admin"})
     principal = Principal(sub="admin", permissions={"admin"})
     monkeypatch.setattr(run_access, "is_admin", lambda _: True)
     ensure_run_access(db, "run-admin", principal)
+
 
 def test_debug_meta_for_non_admin_debug_request():
     meta = build_debug_meta(
@@ -226,6 +253,7 @@ def test_debug_meta_for_non_admin_debug_request():
     assert meta["auth_header_present"] is False
     assert meta["bearer_token_present"] is False
 
+
 def test_debug_meta_for_admin_debug_request():
     meta = build_debug_meta(
         feature_flag_enabled=True,
@@ -251,6 +279,7 @@ def test_debug_meta_for_admin_debug_request():
     assert meta["admin_via_token_hash"] is True
     assert meta["used_fts"] is True
 
+
 def test_prod_env_forces_debug_off(monkeypatch):
     class DummyDB:
         def commit(self):
@@ -267,7 +296,18 @@ def test_prod_env_forces_debug_off(monkeypatch):
     monkeypatch.setattr(chat, "embed_query", lambda q: [0.0])
     monkeypatch.setattr(chat, "_detect_trgm_available", lambda *_: False)
 
-    def fake_fetch_chunks(db, qvec_lit, q_text, k, run_id, document_ids, p, question, trgm_available, admin_debug_hybrid):
+    def fake_fetch_chunks(
+        db,
+        qvec_lit,
+        q_text,
+        k,
+        run_id,
+        document_ids,
+        p,
+        question,
+        trgm_available,
+        admin_debug_hybrid,
+    ):
         rows = [
             {
                 "id": "chunk1",
@@ -292,8 +332,12 @@ def test_prod_env_forces_debug_off(monkeypatch):
     events: list[dict] = []
 
     monkeypatch.setattr(chat, "fetch_chunks", fake_fetch_chunks)
-    monkeypatch.setattr(chat, "answer_with_contract", lambda *args, **kwargs: ("answer", ["S1"]))
-    monkeypatch.setattr(chat, "_emit_audit_event", lambda **kwargs: events.append(kwargs))
+    monkeypatch.setattr(
+        chat, "answer_with_contract", lambda *args, **kwargs: ("answer", ["S1"])
+    )
+    monkeypatch.setattr(
+        chat, "_emit_audit_event", lambda **kwargs: events.append(kwargs)
+    )
 
     payload = AskPayload(question="Explain prod behavior", k=2, debug=True)
     request = DummyRequest(None)
@@ -324,7 +368,9 @@ def test_debug_meta_disabled_when_auth_mode_not_dev(monkeypatch):
     monkeypatch.setattr(chat, "effective_auth_mode", lambda: "auth0")
     monkeypatch.setattr(chat, "embed_query", lambda q: [0.0])
     monkeypatch.setattr(chat, "fetch_chunks", lambda *args, **kwargs: ([], {}))
-    monkeypatch.setattr(chat, "answer_with_contract", lambda *args, **kwargs: ("answer", []))
+    monkeypatch.setattr(
+        chat, "answer_with_contract", lambda *args, **kwargs: ("answer", [])
+    )
 
     payload = AskPayload(question="Explain dev auth", k=2, debug=True)
     request = DummyRequest(None)
@@ -333,6 +379,8 @@ def test_debug_meta_disabled_when_auth_mode_not_dev(monkeypatch):
     resp = chat.ask(payload, request, db=DummyDB(), p=principal)
     assert "debug_meta" not in resp
     assert "retrieval_debug" not in resp
+
+
 def test_chat_ask_blocks_run_not_owned(monkeypatch):
     class RequestStub:
         def __init__(self):
@@ -356,6 +404,7 @@ def test_chat_ask_blocks_run_not_owned(monkeypatch):
         chat.ask(payload, request, db=DummyDB(), p=principal)
     assert exc.value.status_code == 404
 
+
 def test_debug_meta_absent_when_payload_debug_false():
     meta = build_debug_meta(
         feature_flag_enabled=True,
@@ -376,6 +425,7 @@ def test_debug_meta_absent_when_payload_debug_false():
         fts_skipped=False,
     )
     assert meta is None
+
 
 def test_debug_meta_tracks_header_without_token():
     meta = build_debug_meta(
@@ -400,6 +450,7 @@ def test_debug_meta_tracks_header_without_token():
     assert meta["auth_header_present"] is True
     assert meta["bearer_token_present"] is False
 
+
 def test_debug_meta_absent_when_feature_flag_disabled():
     meta = build_debug_meta(
         feature_flag_enabled=False,
@@ -420,6 +471,7 @@ def test_debug_meta_absent_when_feature_flag_disabled():
         fts_skipped=False,
     )
     assert meta is None
+
 
 def test_build_debug_meta_returns_expected_keys():
     meta = build_debug_meta(
@@ -460,6 +512,7 @@ def test_build_debug_meta_returns_expected_keys():
     }
     assert set(meta.keys()) == expected_keys
 
+
 def test_build_error_payload_includes_debug_meta():
     meta = build_debug_meta(
         feature_flag_enabled=True,
@@ -485,10 +538,12 @@ def test_build_error_payload_includes_debug_meta():
     assert payload["debug_meta"] == meta
     assert "retrieval_debug" not in payload
 
+
 def test_build_error_payload_skips_debug_meta_when_missing():
     payload = build_error_payload("generic_query", "msg", debug_meta=None)
     assert payload["error"]["code"] == "generic_query"
     assert "debug_meta" not in payload
+
 
 def test_attach_debug_meta_wraps_string_detail():
     meta = build_debug_meta(
@@ -514,6 +569,7 @@ def test_attach_debug_meta_wraps_string_detail():
     assert detail["debug_meta"] == meta
     shaped = normalize_http_exception_detail(detail)
     assert shaped is detail
+
 
 def test_normalize_http_exception_detail_from_object():
     meta = build_debug_meta(
@@ -542,12 +598,15 @@ def test_normalize_http_exception_detail_from_object():
     assert shaped is detail
     assert shaped["debug_meta"] == meta
 
+
 def test_normalize_http_exception_detail_from_code_message():
     shaped = normalize_http_exception_detail({"code": "GENERIC", "message": "msg"})
     assert shaped == {"error": {"code": "GENERIC", "message": "msg"}}
 
+
 def test_normalize_http_exception_detail_rejects_string():
     assert normalize_http_exception_detail("bad") is None
+
 
 def test_sanitize_nonfinite_floats_records_paths():
     payload = {
@@ -562,6 +621,7 @@ def test_sanitize_nonfinite_floats_records_paths():
     assert sanitized["nested"]["d"][0] is None
     assert set(paths) == {"a", "b[1]", "b[2].c", "nested.d[0]"}
 
+
 def test_sanitize_allows_json_serialization():
     import json
 
@@ -573,13 +633,16 @@ def test_sanitize_allows_json_serialization():
     assert paths == ["retrieval_debug.vec_top5[0].score"]
     json.dumps(sanitized, allow_nan=False)
 
+
 def test_retrieval_debug_payload_sets_count_from_merged():
     payload = build_retrieval_debug_payload({"merged_count": 3, "vec_count": 5})
     assert payload["count"] == 3
 
+
 def test_retrieval_debug_payload_sets_count_from_lists():
     payload = build_retrieval_debug_payload({"vec_top5": [{"rank": 1}, {"rank": 2}]})
     assert payload["count"] == 2
+
 
 def test_admin_debug_strategy_default_firstk(monkeypatch):
     monkeypatch.setattr(chat, "is_admin", lambda p: True)
@@ -618,6 +681,7 @@ def test_admin_debug_strategy_default_firstk(monkeypatch):
     assert len(rows) == 1
     assert debug["strategy"] == "firstk_by_run_admin"
     assert debug["used_trgm"] is False
+
 
 def test_admin_debug_strategy_hybrid_overrides_summary(monkeypatch):
     monkeypatch.setattr(chat, "is_admin", lambda p: True)
@@ -669,15 +733,21 @@ def test_admin_debug_strategy_hybrid_overrides_summary(monkeypatch):
     assert debug["strategy"] == "hybrid_rrf_by_run_admin"
     assert debug["used_trgm"] is True
 
+
 @pytest.mark.parametrize(
     "payload_debug,flag,is_admin_debug,expected",
     [
-        (True, True, False, False),   # debug request but no admin-debug
-        (False, True, True, False),   # admin-debug without payload flag
-        (True, False, True, False),   # disabled feature flag
-        (True, True, True, True),     # only valid combination
+        (True, True, False, False),  # debug request but no admin-debug
+        (False, True, True, False),  # admin-debug without payload flag
+        (True, False, True, False),  # disabled feature flag
+        (True, True, True, True),  # only valid combination
     ],
 )
-def test_retrieval_debug_requires_all_gates(monkeypatch, payload_debug, flag, is_admin_debug, expected):
+def test_retrieval_debug_requires_all_gates(
+    monkeypatch, payload_debug, flag, is_admin_debug, expected
+):
     monkeypatch.setattr(chat, "ENABLE_RETRIEVAL_DEBUG", flag)
-    assert should_include_retrieval_debug(payload_debug, is_admin_debug=is_admin_debug) is expected
+    assert (
+        should_include_retrieval_debug(payload_debug, is_admin_debug=is_admin_debug)
+        is expected
+    )

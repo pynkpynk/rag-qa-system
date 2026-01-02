@@ -84,7 +84,9 @@ def cleanup_uploaded_files(paths: list[Path], nuke_upload_dir: bool) -> dict:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Dev cleanup utility for rag-qa-system.")
+    parser = argparse.ArgumentParser(
+        description="Dev cleanup utility for rag-qa-system."
+    )
     parser.add_argument(
         "--mode",
         choices=["runs", "all"],
@@ -110,7 +112,16 @@ def main() -> None:
         if args.mode == "runs":
             cleanup_runs_only(db)
             db.commit()
-            print(json.dumps({"ok": True, "mode": "runs", "note": "Deleted runs/run_documents only."}, indent=2))
+            print(
+                json.dumps(
+                    {
+                        "ok": True,
+                        "mode": "runs",
+                        "note": "Deleted runs/run_documents only.",
+                    },
+                    indent=2,
+                )
+            )
             return
 
         # mode == "all"
@@ -119,7 +130,9 @@ def main() -> None:
 
         file_report = None
         if args.delete_files:
-            file_report = cleanup_uploaded_files(file_paths, nuke_upload_dir=args.nuke_upload_dir)
+            file_report = cleanup_uploaded_files(
+                file_paths, nuke_upload_dir=args.nuke_upload_dir
+            )
 
         print(
             json.dumps(

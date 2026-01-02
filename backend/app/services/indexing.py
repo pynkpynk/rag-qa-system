@@ -9,7 +9,12 @@ EMBED_DIM = int(os.getenv("EMBED_DIM", "1536") or "1536")
 
 
 def _truthy_env(name: str, default: str = "0") -> bool:
-    return (os.getenv(name, default) or "").strip().lower() in {"1", "true", "yes", "on"}
+    return (os.getenv(name, default) or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 def _offline_embedding(text: str) -> List[float]:

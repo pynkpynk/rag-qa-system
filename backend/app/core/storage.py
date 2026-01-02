@@ -29,7 +29,11 @@ class S3Storage:
         self.bucket = os.environ["S3_BUCKET"]
         self.prefix = os.environ.get("S3_PREFIX", "uploads").strip("/")
 
-        self.region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "ap-southeast-1"
+        self.region = (
+            os.environ.get("AWS_REGION")
+            or os.environ.get("AWS_DEFAULT_REGION")
+            or "ap-southeast-1"
+        )
         self.presign_expires = int(os.environ.get("S3_PRESIGN_EXPIRES", "900"))
 
         # 署名URLはclock skewに弱いので、リトライ/タイムアウトはやや優しめ

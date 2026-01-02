@@ -24,7 +24,11 @@ class ChatAskRequest(BaseModel):
             return data
         question = data.get("question")
         message = data.get("message")
-        if (not isinstance(question, str) or not question.strip()) and isinstance(message, str) and message.strip():
+        if (
+            (not isinstance(question, str) or not question.strip())
+            and isinstance(message, str)
+            and message.strip()
+        ):
             data["question"] = message
         return data
 

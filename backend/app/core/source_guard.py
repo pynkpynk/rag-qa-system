@@ -17,6 +17,7 @@ INJECTION_PATTERNS = [
 
 _inj_re = re.compile("|".join(INJECTION_PATTERNS), re.IGNORECASE)
 
+
 def guard_source_text(text: str) -> str:
     """
     Wrap sources as 'UNTRUSTED QUOTE' and neutralize instruction-like lines.
@@ -29,6 +30,7 @@ def guard_source_text(text: str) -> str:
         else:
             out_lines.append(ln)
     return "\n".join(out_lines)
+
 
 def guard_sources_texts(texts: Iterable[str]) -> list[str]:
     return [guard_source_text(t) for t in texts]

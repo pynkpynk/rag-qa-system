@@ -3,7 +3,6 @@ from __future__ import annotations
 import logging
 import os
 import re
-from typing import Optional
 
 _REPLACEMENTS = [
     (re.compile(r"sk-[A-Za-z0-9-]{10,}"), "sk-REDACTED"),

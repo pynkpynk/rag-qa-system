@@ -31,7 +31,9 @@ def _register_vector(dbapi_connection, connection_record) -> None:  # noqa: ARG0
         # Non-psycopg connections in tests/offline mode.
         return
 
+
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
 
 def get_db() -> Generator:
     db = SessionLocal()

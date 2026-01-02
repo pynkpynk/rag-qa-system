@@ -40,17 +40,29 @@ class SearchRequest(BaseModel):
 
     limit: int = Field(20, ge=1, le=100, description="Final number of chunks to return")
     k_fts: int = Field(50, ge=1, le=500, description="Candidate count from FTS")
-    k_vec: int = Field(50, ge=1, le=500, description="Candidate count from vector search")
-    k_trgm: int = Field(50, ge=1, le=500, description="Candidate count from trigram search")
+    k_vec: int = Field(
+        50, ge=1, le=500, description="Candidate count from vector search"
+    )
+    k_trgm: int = Field(
+        50, ge=1, le=500, description="Candidate count from trigram search"
+    )
     rrf_k: int = Field(60, ge=1, le=500, description="RRF constant")
 
-    min_score: float = Field(0.02, ge=0.0, description="Drop hits below this RRF score.")
-    max_vec_distance: Optional[float] = Field(None, ge=0.0, description="Optional vec distance cutoff.")
-    return_empty_on_low_confidence: bool = Field(True, description="If filtering removes all hits, return hits=[]")
+    min_score: float = Field(
+        0.02, ge=0.0, description="Drop hits below this RRF score."
+    )
+    max_vec_distance: Optional[float] = Field(
+        None, ge=0.0, description="Optional vec distance cutoff."
+    )
+    return_empty_on_low_confidence: bool = Field(
+        True, description="If filtering removes all hits, return hits=[]"
+    )
 
     # NOTE: this is a *threshold* for pg_trgm similarity operator (%).
     # For CJK queries, code will auto-lower this value to avoid "always zero" behavior on long chunks.
-    trgm_limit: float = Field(0.12, ge=0.0, le=1.0, description="Trigram similarity threshold (pg_trgm).")
+    trgm_limit: float = Field(
+        0.12, ge=0.0, le=1.0, description="Trigram similarity threshold (pg_trgm)."
+    )
     trgm_enabled: bool = Field(True, description="Enable trigram fallback (pg_trgm).")
 
     debug: bool = Field(False, description="Include debug stats in response.")
@@ -342,7 +354,19 @@ LEFT JOIN picked p ON true;
 """
 
 
-def _extract_meta(rows: list[dict[str, Any]]) -> tuple[int, int, int, Optional[float], Optional[float], Optional[float], Optional[float], Optional[float], Optional[float]]:
+def _extract_meta(
+    rows: list[dict[str, Any]],
+) -> tuple[
+    int,
+    int,
+    int,
+    Optional[float],
+    Optional[float],
+    Optional[float],
+    Optional[float],
+    Optional[float],
+    Optional[float],
+]:
     r0 = rows[0] if rows else {}
     fts_count = int(r0.get("fts_count") or 0)
     vec_count = int(r0.get("vec_count") or 0)
@@ -364,7 +388,17 @@ def _extract_meta(rows: list[dict[str, Any]]) -> tuple[int, int, int, Optional[f
     trgm_max = float(tmax) if tmax is not None else None
     trgm_avg = float(tavg) if tavg is not None else None
 
-    return fts_count, vec_count, trgm_count, vec_min, vec_max, vec_avg, trgm_min, trgm_max, trgm_avg
+    return (
+        fts_count,
+        vec_count,
+        trgm_count,
+        vec_min,
+        vec_max,
+        vec_avg,
+        trgm_min,
+        trgm_max,
+        trgm_avg,
+    )
 
 
 @router.post("/search", response_model=SearchResponse)
@@ -379,7 +413,9 @@ def search(
 
     doc_ids_list = req.document_ids or []
     if req.mode == SearchMode.selected_docs and not doc_ids_list:
-        raise HTTPException(status_code=422, detail="document_ids is required when mode=selected_docs")
+        raise HTTPException(
+            status_code=422, detail="document_ids is required when mode=selected_docs"
+        )
 
     use_doc_filter = bool(doc_ids_list)
 
@@ -395,7 +431,9 @@ def search(
         raise HTTPException(status_code=500, detail=f"Embedding error: {e}")
 
     # trgm
-    trgm_enabled = bool(req.trgm_enabled and (os.getenv("SEARCH_TRGM_ENABLED", "1") == "1"))
+    trgm_enabled = bool(
+        req.trgm_enabled and (os.getenv("SEARCH_TRGM_ENABLED", "1") == "1")
+    )
     used_trgm_limit = _auto_trgm_limit(q, req.trgm_limit)
     q_terms = _split_terms(q)
     trgm_like_patterns = [f"%{t}%" for t in q_terms]  # ILIKE ANY patterns
@@ -422,9 +460,15 @@ def search(
     db_info = {"db_name": None, "db_host": None, "db_port": None}
     if debug_enabled:
         try:
-            info = db.execute(
-                text("select current_database() as db_name, inet_server_addr()::text as db_host, inet_server_port() as db_port")
-            ).mappings().one()
+            info = (
+                db.execute(
+                    text(
+                        "select current_database() as db_name, inet_server_addr()::text as db_host, inet_server_port() as db_port"
+                    )
+                )
+                .mappings()
+                .one()
+            )
             db_info = dict(info)
         except Exception:
             pass
@@ -434,7 +478,9 @@ def search(
         rows_list = [dict(r) for r in rows]
     except Exception as e:
         logger.exception("search sql failed")
-        raise HTTPException(status_code=500, detail=f"Search SQL error: {type(e).__name__}: {e}")
+        raise HTTPException(
+            status_code=500, detail=f"Search SQL error: {type(e).__name__}: {e}"
+        )
 
     # meta is always present as 1 row (even if no hits)
     (
@@ -487,7 +533,9 @@ def search(
                 used_use_doc_filter=use_doc_filter,
                 used_k_trgm=req.k_trgm,
                 used_trgm_limit=used_trgm_limit,
-            ) if debug_enabled else None,
+            )
+            if debug_enabled
+            else None,
         )
 
     # Filter by score
@@ -496,7 +544,11 @@ def search(
     # Optional vec distance cutoff
     if used_max_vec_distance is not None:
         m = float(used_max_vec_distance)
-        filtered = [r for r in filtered if (r.get("vec_distance") is None) or (float(r.get("vec_distance")) <= m)]
+        filtered = [
+            r
+            for r in filtered
+            if (r.get("vec_distance") is None) or (float(r.get("vec_distance")) <= m)
+        ]
 
     if req.return_empty_on_low_confidence and not filtered:
         return SearchResponse(
@@ -523,7 +575,9 @@ def search(
                 used_use_doc_filter=use_doc_filter,
                 used_k_trgm=req.k_trgm,
                 used_trgm_limit=used_trgm_limit,
-            ) if debug_enabled else None,
+            )
+            if debug_enabled
+            else None,
         )
 
     out = filtered if filtered else hit_rows
@@ -536,7 +590,9 @@ def search(
             chunk_index=int(r["chunk_index"]),
             text=str(r["text"]),
             score=float(r["score"]),
-            vec_distance=(float(r["vec_distance"]) if r.get("vec_distance") is not None else None),
+            vec_distance=(
+                float(r["vec_distance"]) if r.get("vec_distance") is not None else None
+            ),
             fts_rank=(int(r["fts_rank"]) if r.get("fts_rank") is not None else None),
             vec_rank=(int(r["vec_rank"]) if r.get("vec_rank") is not None else None),
             trgm_rank=(int(r["trgm_rank"]) if r.get("trgm_rank") is not None else None),
@@ -569,5 +625,7 @@ def search(
             used_use_doc_filter=use_doc_filter,
             used_k_trgm=req.k_trgm,
             used_trgm_limit=used_trgm_limit,
-        ) if debug_enabled else None,
+        )
+        if debug_enabled
+        else None,
     )

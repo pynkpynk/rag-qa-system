@@ -46,8 +46,8 @@ os.environ.setdefault("OPENAI_API_KEY", "dummy")
 os.environ.setdefault("DATABASE_URL", "sqlite:///smoke.db")
 os.environ.setdefault("CORS_ORIGIN", "http://localhost:3000")
 
-import app.api.routes.chat as chat
-from app.api.routes.chat import (
+import app.api.routes.chat as chat  # noqa: E402
+from app.api.routes.chat import (  # noqa: E402
     AskPayload,
     attach_debug_meta_to_detail,
     build_debug_meta,
@@ -58,9 +58,9 @@ from app.api.routes.chat import (
     should_include_retrieval_debug,
     should_use_fts,
     should_use_trgm,
-)
-from app.core.authz import Principal, is_admin
-from app.main import normalize_http_exception_detail
+)  # noqa: E402
+from app.core.authz import Principal, is_admin  # noqa: E402
+from app.main import normalize_http_exception_detail  # noqa: E402
 
 
 class DummyRequest:
@@ -90,7 +90,9 @@ def run_case(case: Case) -> None:
     original_flag = chat.ENABLE_RETRIEVAL_DEBUG
     chat.ENABLE_RETRIEVAL_DEBUG = case.flag
     try:
-        result = should_include_retrieval_debug(case.payload_debug, is_admin_debug=case.is_admin_debug)
+        result = should_include_retrieval_debug(
+            case.payload_debug, is_admin_debug=case.is_admin_debug
+        )
     finally:
         chat.ENABLE_RETRIEVAL_DEBUG = original_flag
 
@@ -235,6 +237,7 @@ def _assert_admin_debug_token_hash() -> None:
     finally:
         chat._ADMIN_DEBUG_TOKEN_HASHES = original_hashes
 
+
 def _assert_token_hash_requirement() -> None:
     original_flag = chat.RETRIEVAL_DEBUG_REQUIRE_TOKEN_HASH
     original_hashes = chat._ADMIN_DEBUG_TOKEN_HASHES
@@ -244,15 +247,22 @@ def _assert_token_hash_requirement() -> None:
     chat._ADMIN_DEBUG_TOKEN_HASHES = {digest}
     try:
         admin_principal = Principal(sub="admin-user", permissions=set())
-        if chat.is_admin_debug(admin_principal, DummyRequest("Bearer other"), is_admin_user=True):
-            raise AssertionError("Token hash requirement should block admin-sub without allowlist")
+        if chat.is_admin_debug(
+            admin_principal, DummyRequest("Bearer other"), is_admin_user=True
+        ):
+            raise AssertionError(
+                "Token hash requirement should block admin-sub without allowlist"
+            )
         allowed_req = DummyRequest(f"Bearer {token}")
         user_principal = Principal(sub="user", permissions=set())
         if not chat.is_admin_debug(user_principal, allowed_req, is_admin_user=False):
-            raise AssertionError("Token hash requirement should allow allowlisted token")
+            raise AssertionError(
+                "Token hash requirement should allow allowlisted token"
+            )
     finally:
         chat.RETRIEVAL_DEBUG_REQUIRE_TOKEN_HASH = original_flag
         chat._ADMIN_DEBUG_TOKEN_HASHES = original_hashes
+
 
 def _assert_dev_mode_admin_behavior() -> None:
     os.environ["AUTH_MODE"] = "dev"
@@ -264,6 +274,7 @@ def _assert_dev_mode_admin_behavior() -> None:
     os.environ["DEV_ADMIN_SUBS"] = "dev|local"
     if not is_admin(principal):
         raise AssertionError("DEV_ADMIN_SUBS should grant admin status when matching")
+
 
 def _assert_auth_header_flags() -> None:
     base_kwargs = dict(
@@ -288,7 +299,9 @@ def _assert_auth_header_flags() -> None:
         bearer_token_present=False,
     )
     if meta_missing is None or meta_missing["auth_header_present"]:
-        raise AssertionError("Missing Authorization header should be reflected in debug_meta")
+        raise AssertionError(
+            "Missing Authorization header should be reflected in debug_meta"
+        )
     meta_empty = build_debug_meta(
         **base_kwargs,
         auth_header_present=True,
@@ -296,6 +309,7 @@ def _assert_auth_header_flags() -> None:
     )
     if meta_empty is None or meta_empty["bearer_token_present"]:
         raise AssertionError("Empty bearer token should set bearer_token_present=False")
+
 
 def _assert_empty_bearer_never_admin() -> None:
     principal = Principal(sub="user", permissions=set())
@@ -312,6 +326,7 @@ def _assert_empty_bearer_never_admin() -> None:
             raise AssertionError("Empty bearer token must not grant admin-debug")
     finally:
         chat._ADMIN_DEBUG_TOKEN_HASHES = original_hashes
+
 
 def _assert_error_payload_helpers() -> None:
     meta = build_debug_meta(
@@ -344,10 +359,14 @@ def _assert_error_payload_helpers() -> None:
         raise AssertionError("Error payload must never contain retrieval_debug")
     shaped = normalize_http_exception_detail(payload)
     if shaped is not payload:
-        raise AssertionError("normalize_http_exception_detail should return structured payload")
+        raise AssertionError(
+            "normalize_http_exception_detail should return structured payload"
+        )
     shaped_simple = normalize_http_exception_detail({"code": "GENERIC", "message": "x"})
     if shaped_simple != {"error": {"code": "GENERIC", "message": "x"}}:
-        raise AssertionError("normalize_http_exception_detail should wrap code/message dicts")
+        raise AssertionError(
+            "normalize_http_exception_detail should wrap code/message dicts"
+        )
     if normalize_http_exception_detail("bad") is not None:
         raise AssertionError("normalize_http_exception_detail should ignore non-dicts")
 

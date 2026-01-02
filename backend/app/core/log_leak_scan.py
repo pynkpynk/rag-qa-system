@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Iterable, Union
 from os import PathLike
 
+
 @dataclass
 class Violation:
     pattern_name: str
@@ -18,6 +19,7 @@ class Violation:
         Backward-compatible alias for the rule identifier.
         """
         return self.pattern_name
+
 
 JWT_LIKE_RE = re.compile(
     r"""
@@ -35,9 +37,15 @@ FORBIDDEN_REGEXES: list[tuple[str, re.Pattern[str]]] = [
     ("bearer_header", re.compile(r"Authorization:\s*Bearer\s+\S+", re.IGNORECASE)),
     ("sk_key", re.compile(r"\bsk-[A-Za-z0-9]{20,}\b")),
     ("private_key_block", re.compile(r"BEGIN\s+(?:RSA\s+)?PRIVATE\s+KEY")),
-    ("aws_secret", re.compile(r"AWS_(?:SECRET|ACCESS)_KEY[_A-Z]*\s*=\s*\S+", re.IGNORECASE)),
+    (
+        "aws_secret",
+        re.compile(r"AWS_(?:SECRET|ACCESS)_KEY[_A-Z]*\s*=\s*\S+", re.IGNORECASE),
+    ),
     ("jwt_blob", JWT_LIKE_RE),
-    ("token_keyword", re.compile(r"(api[_-]?key|secret|token)\s*[:=]\s*\S+", re.IGNORECASE)),
+    (
+        "token_keyword",
+        re.compile(r"(api[_-]?key|secret|token)\s*[:=]\s*\S+", re.IGNORECASE),
+    ),
 ]
 
 REDACT_PREFIX = 8

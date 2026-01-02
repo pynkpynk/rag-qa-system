@@ -8,6 +8,7 @@ from app.core.authz import Principal, is_admin
 
 SQL_GET_RUN_OWNER = "SELECT owner_sub FROM runs WHERE id = :run_id"
 
+
 def ensure_run_access(db: Session, run_id: str, p: Principal) -> None:
     """
     - admin: OK

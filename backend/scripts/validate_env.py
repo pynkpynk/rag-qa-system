@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import sys
 from dataclasses import dataclass
 from typing import Iterable, Mapping
 from urllib.parse import urlparse
@@ -39,7 +38,9 @@ def format_report(results: Iterable[CheckResult]) -> str:
     return "\n".join(lines) if lines else "No checks executed."
 
 
-def validate_env(strict: bool = False, env: Mapping[str, str] | None = None) -> tuple[bool, list[CheckResult]]:
+def validate_env(
+    strict: bool = False, env: Mapping[str, str] | None = None
+) -> tuple[bool, list[CheckResult]]:
     env_map = dict(env or os.environ)
     checks: list[CheckResult] = []
 
@@ -72,7 +73,11 @@ def validate_env(strict: bool = False, env: Mapping[str, str] | None = None) -> 
 
     auth_mode = (env_map.get("AUTH_MODE") or "auth0").strip().lower()
     if auth_mode == "demo":
-        hashes = [h for h in (env_map.get("DEMO_TOKEN_SHA256_LIST") or "").split(",") if h.strip()]
+        hashes = [
+            h
+            for h in (env_map.get("DEMO_TOKEN_SHA256_LIST") or "").split(",")
+            if h.strip()
+        ]
         add(
             "demo_token_sha256_list",
             bool(hashes),
@@ -139,8 +144,12 @@ def validate_env(strict: bool = False, env: Mapping[str, str] | None = None) -> 
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Validate required environment variables.")
-    parser.add_argument("--strict", action="store_true", help="Treat warnings as failures")
+    parser = argparse.ArgumentParser(
+        description="Validate required environment variables."
+    )
+    parser.add_argument(
+        "--strict", action="store_true", help="Treat warnings as failures"
+    )
     args = parser.parse_args()
 
     ok, results = validate_env(strict=args.strict)

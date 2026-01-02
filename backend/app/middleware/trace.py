@@ -9,12 +9,15 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
 
+
 class TraceMiddleware(BaseHTTPMiddleware):
     def __init__(self, app, logger_name: str = "app") -> None:
         super().__init__(app)
         self.logger_name = logger_name
 
-    async def dispatch(self, request: Request, call_next: Callable[[Request], Response]) -> Response:
+    async def dispatch(
+        self, request: Request, call_next: Callable[[Request], Response]
+    ) -> Response:
         request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
         request.state.request_id = request_id
 

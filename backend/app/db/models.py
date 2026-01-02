@@ -20,13 +20,16 @@ from app.db.base import Base
 # Helpers / Constants
 # =========================
 
+
 def gen_uuid() -> str:
     """Primary key generator (UUID as string)."""
     return str(uuid.uuid4())
 
+
 def utcnow() -> datetime:
     # timezone-aware UTC
     return datetime.now(timezone.utc)
+
 
 EMBEDDING_DIM = 1536  # text-embedding-3-small 想定
 
@@ -39,8 +42,15 @@ EMBEDDING_DIM = 1536  # text-embedding-3-small 想定
 run_documents = Table(
     "run_documents",
     Base.metadata,
-    Column("run_id", String, ForeignKey("runs.id", ondelete="CASCADE"), primary_key=True),
-    Column("document_id", String, ForeignKey("documents.id", ondelete="CASCADE"), primary_key=True),
+    Column(
+        "run_id", String, ForeignKey("runs.id", ondelete="CASCADE"), primary_key=True
+    ),
+    Column(
+        "document_id",
+        String,
+        ForeignKey("documents.id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
     Column("created_at", DateTime(timezone=True), default=utcnow, nullable=False),
 )
 
@@ -48,6 +58,7 @@ run_documents = Table(
 # =========================
 # Models
 # =========================
+
 
 class Run(Base):
     __tablename__ = "runs"

@@ -2,7 +2,11 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app.main import create_app
-from app.middleware.security import BodySizeLimitMiddleware, RateLimitMiddleware, RequestIdMiddleware, SecurityHeadersMiddleware
+from app.middleware.security import (
+    BodySizeLimitMiddleware,
+    RateLimitMiddleware,
+    RequestIdMiddleware,
+)
 from app.core import rate_limit
 
 

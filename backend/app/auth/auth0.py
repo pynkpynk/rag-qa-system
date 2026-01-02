@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Set
+from typing import Any, Dict, Set
 
 import httpx
 from jose import jwt
@@ -19,8 +19,10 @@ ADMIN_SUBS = {s.strip() for s in os.getenv("ADMIN_SUBS", "").split(",") if s.str
 _JWKS_CACHE: Dict[str, Any] = {"jwks": None, "exp": 0.0}
 _JWKS_TTL_SEC = 60 * 60  # 1h
 
+
 class AuthError(Exception):
     pass
+
 
 @dataclass(frozen=True)
 class Principal:
@@ -28,10 +30,12 @@ class Principal:
     permissions: Set[str]
     is_admin: bool
 
+
 def _jwks_url() -> str:
     if not AUTH0_DOMAIN:
         raise AuthError("AUTH0_DOMAIN is not set")
     return f"https://{AUTH0_DOMAIN}/.well-known/jwks.json"
+
 
 def _get_jwks() -> Dict[str, Any]:
     now = time.time()
@@ -47,11 +51,13 @@ def _get_jwks() -> Dict[str, Any]:
     _JWKS_CACHE["exp"] = now + _JWKS_TTL_SEC
     return jwks
 
+
 def _pick_key(jwks: Dict[str, Any], kid: str) -> Dict[str, Any]:
     for k in jwks.get("keys", []):
         if k.get("kid") == kid:
             return k
     raise AuthError("Matching JWKS key not found")
+
 
 def _extract_permissions(payload: Dict[str, Any]) -> Set[str]:
     # Auth0 RBAC: "permissions": ["read:docs", ...]
@@ -65,6 +71,7 @@ def _extract_permissions(payload: Dict[str, Any]) -> Set[str]:
         return set(scope.split())
 
     return set()
+
 
 def decode_access_token(token: str) -> Principal:
     if not AUTH0_AUDIENCE or not AUTH0_ISSUER:

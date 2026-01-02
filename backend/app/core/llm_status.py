@@ -39,7 +39,9 @@ def is_openai_offline() -> bool:
         return True
     if not openai_key_present():
         return True
-    auto = _truthy(os.getenv("CI")) or _truthy(os.getenv("GITHUB_ACTIONS")) or _is_pytest()
+    auto = (
+        _truthy(os.getenv("CI")) or _truthy(os.getenv("GITHUB_ACTIONS")) or _is_pytest()
+    )
     if auto:
         os.environ["OPENAI_OFFLINE"] = "1"
     return auto
