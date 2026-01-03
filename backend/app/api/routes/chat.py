@@ -578,6 +578,7 @@ SELECT c.id, c.document_id, d.filename AS filename, c.page, c.chunk_index, c.tex
        (c.embedding <=> (:qvec)::vector) AS dist
 FROM chunks c
 JOIN documents d ON d.id = c.document_id
+WHERE c.embedding IS NOT NULL
 ORDER BY c.embedding <=> (:qvec)::vector
 LIMIT :k
 """
@@ -588,6 +589,7 @@ SELECT c.id, c.document_id, d.filename AS filename, c.page, c.chunk_index, c.tex
 FROM chunks c
 JOIN documents d ON d.id = c.document_id
 WHERE d.owner_sub = :owner_sub
+  AND c.embedding IS NOT NULL
 ORDER BY c.embedding <=> (:qvec)::vector
 LIMIT :k
 """
@@ -599,6 +601,7 @@ FROM chunks c
 JOIN documents d ON d.id = c.document_id
 JOIN run_documents rd ON rd.document_id = c.document_id
 WHERE rd.run_id = :run_id
+  AND c.embedding IS NOT NULL
 ORDER BY c.embedding <=> (:qvec)::vector
 LIMIT :k
 """
@@ -611,6 +614,7 @@ JOIN documents d ON d.id = c.document_id
 JOIN run_documents rd ON rd.document_id = c.document_id
 WHERE rd.run_id = :run_id
   AND d.owner_sub = :owner_sub
+  AND c.embedding IS NOT NULL
 ORDER BY c.embedding <=> (:qvec)::vector
 LIMIT :k
 """
@@ -621,6 +625,7 @@ SELECT c.id, c.document_id, d.filename AS filename, c.page, c.chunk_index, c.tex
 FROM chunks c
 JOIN documents d ON d.id = c.document_id
 WHERE c.document_id = ANY(:doc_ids)
+  AND c.embedding IS NOT NULL
 ORDER BY c.embedding <=> (:qvec)::vector
 LIMIT :k
 """
@@ -632,6 +637,7 @@ FROM chunks c
 JOIN documents d ON d.id = c.document_id
 WHERE c.document_id = ANY(:doc_ids)
   AND d.owner_sub = :owner_sub
+  AND c.embedding IS NOT NULL
 ORDER BY c.embedding <=> (:qvec)::vector
 LIMIT :k
 """
