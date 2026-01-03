@@ -23,18 +23,16 @@ from fastapi import (
     Request,
     UploadFile,
 )
-from fastapi.responses import RedirectResponse, FileResponse
+from fastapi.responses import FileResponse, RedirectResponse
 from sqlalchemy import text as sql_text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.core.authz import Principal, require_permissions, is_admin, current_user
+from app.core.authz import Principal, current_user, is_admin, require_permissions
 from app.core.config import settings
+from app.core.run_access import ensure_run_access
 from app.db.models import Chunk, Document
 from app.db.session import SessionLocal, get_db
-from app.services.indexing import embed_texts, extract_pdf_pages, simple_chunk
-
-from app.core.run_access import ensure_run_access
 from app.schemas.api_contract import (
     DocumentDetailResponse,
     DocumentListItem,
@@ -42,6 +40,7 @@ from app.schemas.api_contract import (
     DocumentReindexResponse,
     DocumentUploadResponse,
 )
+from app.services.indexing import embed_texts, extract_pdf_pages, simple_chunk
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -50,6 +49,7 @@ EMBED_BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE", "16") or "16")
 
 class PDFExtractionError(Exception):
     """Raised when a PDF cannot be processed even after normalization."""
+
 
 # =========================
 # Config (S3 only)
@@ -217,7 +217,9 @@ def _ensure_request_id(request: Request | None) -> str:
     return str(uuid.uuid4())
 
 
-def _log_stage_failure(stage: str, request_id: str, doc: Document | None, exc: Exception) -> None:
+def _log_stage_failure(
+    stage: str, request_id: str, doc: Document | None, exc: Exception
+) -> None:
     logger.exception(
         "document_stage_failed",
         extra={
@@ -279,7 +281,9 @@ def _chunk_pdf_pages(
     return texts, metas
 
 
-def embed_texts_batched(texts: list[str], batch_size: int | None = None) -> list[list[float]]:
+def embed_texts_batched(
+    texts: list[str], batch_size: int | None = None
+) -> list[list[float]]:
     if not texts:
         return []
     size = batch_size or EMBED_BATCH_SIZE
@@ -340,10 +344,8 @@ def _enforce_run_access_if_needed(
     if not run_id:
         return
 
-    # ① run所有権
     ensure_run_access(db, run_id, p)
 
-    # ② run_documentsに紐づくdocか
     row = (
         db.execute(
             sql_text(SQL_DOC_ATTACHED_TO_RUN),
@@ -358,7 +360,6 @@ def _enforce_run_access_if_needed(
 
 
 def _not_found() -> None:
-    # 他人doc/legacy doc は 404 で隠す（存在推測を防ぐ）
     raise HTTPException(status_code=404, detail="document not found")
 
 
@@ -374,7 +375,6 @@ def _get_doc_for_read(db: Session, document_id: str, p: Principal) -> Document:
             _not_found()
         return doc
 
-    # 非adminは "id AND owner_sub" で直接絞る（db.getは使わない）
     doc = (
         db.query(Document)
         .filter(Document.id == document_id, Document.owner_sub == p.sub)
@@ -502,9 +502,7 @@ def _process_document_content(
     raise_http: bool,
 ) -> None:
     try:
-        pages = _extract_pdf_pages_with_normalization(
-            pdf_path, request_id=request_id
-        )
+        pages = _extract_pdf_pages_with_normalization(pdf_path, request_id=request_id)
     except PDFExtractionError as exc:
         _handle_stage_failure(
             "extract_pdf_pages",
@@ -668,7 +666,7 @@ def index_document(doc_id: str, *, skip_embedding: bool = False) -> None:
                 tmp_download = _s3_download_to_tmp(doc.storage_key, suffix=".pdf")
                 processing_path = tmp_download
             except ClientError as e:
-                raise RuntimeError(f"S3 download failed: {e}")
+                raise RuntimeError(f"S3 download failed: {e}") from e
 
         _process_document_content(
             db=db,
@@ -1067,14 +1065,12 @@ def delete_doc(
     key = getattr(doc, "storage_key", None)
 
     try:
-        # FK ON DELETE CASCADE 前提：doc deleteだけで chunks/run_documents が消える
         db.delete(doc)
         db.commit()
     except Exception:
         db.rollback()
         raise
 
-    # Storage cleanup is best-effort.
     storage_meta = doc.meta or {}
     if storage_meta.get("storage") == "local":
         _delete_local_file(storage_meta.get("path") or key)
