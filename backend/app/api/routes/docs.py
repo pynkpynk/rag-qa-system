@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import uuid
 from datetime import datetime
+from io import BytesIO
 from pathlib import Path
 from typing import Tuple
 
 import boto3
 from botocore.exceptions import ClientError
+from pypdf import PdfReader, PdfWriter
 
 from fastapi import (
     APIRouter,
@@ -16,8 +19,9 @@ from fastapi import (
     Depends,
     File,
     HTTPException,
-    UploadFile,
     Query,
+    Request,
+    UploadFile,
 )
 from fastapi.responses import RedirectResponse, FileResponse
 from sqlalchemy import text as sql_text
@@ -40,6 +44,12 @@ from app.schemas.api_contract import (
 )
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
+EMBED_BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE", "16") or "16")
+
+
+class PDFExtractionError(Exception):
+    """Raised when a PDF cannot be processed even after normalization."""
 
 # =========================
 # Config (S3 only)
@@ -145,6 +155,147 @@ def _truncate_err(e: Exception) -> str:
     if len(msg) > ERROR_MAX_LEN:
         msg = msg[:ERROR_MAX_LEN] + "…"
     return msg
+
+
+def _normalize_pdf_bytes(raw: bytes) -> bytes:
+    reader = PdfReader(BytesIO(raw))
+    writer = PdfWriter()
+    for page in reader.pages:
+        writer.add_page(page)
+    buf = BytesIO()
+    writer.write(buf)
+    return buf.getvalue()
+
+
+def _extract_pdf_pages_with_normalization(
+    pdf_path: Path, *, request_id: str
+) -> list[tuple[int | None, str]]:
+    try:
+        return extract_pdf_pages(str(pdf_path))
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "pdf_extract_first_pass_failed",
+            extra={"request_id": request_id, "path": str(pdf_path), "error": str(exc)},
+        )
+        try:
+            raw = pdf_path.read_bytes()
+            normalized_bytes = _normalize_pdf_bytes(raw)
+        except Exception as norm_exc:  # noqa: BLE001
+            logger.exception(
+                "pdf_normalization_failed",
+                extra={"request_id": request_id, "path": str(pdf_path)},
+            )
+            raise PDFExtractionError("PDF_PARSE_FAILED") from norm_exc
+
+        normalized_path = TMP_DIR / f"normalized_{uuid.uuid4().hex}.pdf"
+        try:
+            normalized_path.write_bytes(normalized_bytes)
+            return extract_pdf_pages(str(normalized_path))
+        except Exception as second_exc:  # noqa: BLE001
+            logger.exception(
+                "pdf_extract_failed_after_normalization",
+                extra={"request_id": request_id, "path": str(pdf_path)},
+            )
+            raise PDFExtractionError("PDF_PARSE_FAILED") from second_exc
+        finally:
+            _cleanup_file(normalized_path)
+
+
+def _ensure_request_id(request: Request | None) -> str:
+    if request is None:
+        return str(uuid.uuid4())
+    rid = getattr(request.state, "request_id", None)
+    if rid:
+        return rid
+    header_id = request.headers.get("x-request-id") or request.headers.get(
+        "X-Request-ID"
+    )
+    if header_id:
+        return header_id
+    return str(uuid.uuid4())
+
+
+def _log_stage_failure(stage: str, request_id: str, doc: Document | None, exc: Exception) -> None:
+    logger.exception(
+        "document_stage_failed",
+        extra={
+            "stage": stage,
+            "request_id": request_id,
+            "document_id": getattr(doc, "id", None),
+            "owner_sub": getattr(doc, "owner_sub", None),
+        },
+    )
+
+
+def _handle_stage_failure(
+    stage: str,
+    exc: Exception,
+    *,
+    request_id: str,
+    db: Session | None,
+    doc: Document | None,
+    raise_http: bool,
+    status_code: int = 500,
+) -> None:
+    safe_message = _truncate_err(exc)
+    _log_stage_failure(stage, request_id, doc, exc)
+    if doc is not None and db is not None:
+        try:
+            doc.status = "error"
+            doc.error = f"{stage}: {safe_message}"
+            db.commit()
+        except Exception:
+            try:
+                db.rollback()
+            except Exception:
+                pass
+    detail = {
+        "error": {
+            "code": "UPLOAD_INDEX_FAILED",
+            "message": f"Document processing failed at stage '{stage}'.",
+            "stage": stage,
+            "request_id": request_id,
+            "reason": safe_message,
+        }
+    }
+    if raise_http:
+        raise HTTPException(status_code=status_code, detail=detail)
+
+
+def _chunk_pdf_pages(
+    pages: list[tuple[int | None, str]],
+) -> tuple[list[str], list[tuple[int | None, int, str]]]:
+    texts: list[str] = []
+    metas: list[tuple[int | None, int, str]] = []
+    for page_no, page_text in pages:
+        chunks = simple_chunk(page_text or "")
+        for idx, chunk in enumerate(chunks):
+            if not chunk:
+                continue
+            texts.append(chunk)
+            metas.append((page_no, idx, chunk))
+    return texts, metas
+
+
+def embed_texts_batched(texts: list[str], batch_size: int | None = None) -> list[list[float]]:
+    if not texts:
+        return []
+    size = batch_size or EMBED_BATCH_SIZE
+    try:
+        size = max(1, int(size))
+    except Exception:
+        size = EMBED_BATCH_SIZE
+
+    vectors: list[list[float]] = []
+    for start in range(0, len(texts), size):
+        batch = texts[start : start + size]
+        vec_batch = embed_texts(batch)
+        if not isinstance(vec_batch, list) or len(vec_batch) != len(batch):
+            raise RuntimeError("embedding batch size mismatch")
+        vectors.extend(vec_batch)
+    return vectors
 
 
 def _sha256_and_save_tmp(upload: UploadFile, tmp_path: Path) -> str:
@@ -341,29 +492,163 @@ def _indexing_available() -> Tuple[bool, str | None]:
     return True, None
 
 
+def _process_document_content(
+    *,
+    db: Session,
+    doc: Document,
+    pdf_path: Path,
+    skip_embedding: bool,
+    request_id: str,
+    raise_http: bool,
+) -> None:
+    try:
+        pages = _extract_pdf_pages_with_normalization(
+            pdf_path, request_id=request_id
+        )
+    except PDFExtractionError as exc:
+        _handle_stage_failure(
+            "extract_pdf_pages",
+            exc,
+            request_id=request_id,
+            db=db,
+            doc=doc,
+            raise_http=raise_http,
+            status_code=422,
+        )
+        return
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        _handle_stage_failure(
+            "extract_pdf_pages",
+            exc,
+            request_id=request_id,
+            db=db,
+            doc=doc,
+            raise_http=raise_http,
+            status_code=422,
+        )
+        return
+
+    if not pages:
+        _handle_stage_failure(
+            "extract_pdf_pages",
+            RuntimeError("No extractable content found in PDF."),
+            request_id=request_id,
+            db=db,
+            doc=doc,
+            raise_http=raise_http,
+            status_code=422,
+        )
+        return
+
+    try:
+        texts, metas = _chunk_pdf_pages(pages)
+    except Exception as exc:  # noqa: BLE001
+        _handle_stage_failure(
+            "chunk_text",
+            exc,
+            request_id=request_id,
+            db=db,
+            doc=doc,
+            raise_http=raise_http,
+            status_code=422,
+        )
+        return
+
+    if not texts:
+        _handle_stage_failure(
+            "chunk_text",
+            RuntimeError("No chunkable text found in PDF."),
+            request_id=request_id,
+            db=db,
+            doc=doc,
+            raise_http=raise_http,
+            status_code=422,
+        )
+        return
+
+    if skip_embedding:
+        embeddings: list[list[float] | None] = [None] * len(texts)
+    else:
+        try:
+            embeddings = embed_texts_batched(texts)
+        except HTTPException:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            _handle_stage_failure(
+                "embed_chunks",
+                exc,
+                request_id=request_id,
+                db=db,
+                doc=doc,
+                raise_http=raise_http,
+            )
+            return
+
+    try:
+        db.query(Chunk).filter(Chunk.document_id == doc.id).delete(
+            synchronize_session=False
+        )
+        for idx, (page_no, chunk_idx, chunk_text) in enumerate(metas):
+            db.add(
+                Chunk(
+                    document_id=doc.id,
+                    page=page_no,
+                    chunk_index=chunk_idx,
+                    text=chunk_text,
+                    embedding=embeddings[idx],
+                )
+            )
+        doc.status = "indexed_fts_only" if skip_embedding else "indexed"
+        doc.error = None
+        db.commit()
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        _handle_stage_failure(
+            "persist_chunks",
+            exc,
+            request_id=request_id,
+            db=db,
+            doc=doc,
+            raise_http=raise_http,
+        )
+
+
 # =========================
 # Background Task
 # =========================
 
 
-def index_document(doc_id: str) -> None:
+def index_document(doc_id: str, *, skip_embedding: bool = False) -> None:
     db = SessionLocal()
     tmp_download: Path | None = None
+    doc: Document | None = None
+    request_id = f"reindex-{doc_id}"
     try:
         doc = db.get(Document, doc_id)
         if not doc:
             return
 
-        ok, reason = _indexing_available()
-        if not ok:
-            doc.status = "failed"
-            doc.error = f"INDEXING_DISABLED: {reason}"
-            db.commit()
-            return
-
         doc.status = "indexing"
         doc.error = None
-        db.commit()
+        try:
+            db.commit()
+        except Exception:  # noqa: BLE001
+            db.rollback()
+
+        if not skip_embedding:
+            ok, reason = _indexing_available()
+            if not ok:
+                doc.status = "error"
+                doc.error = f"INDEXING_DISABLED: {reason}"
+                db.commit()
+                return
 
         if not doc.storage_key:
             raise RuntimeError("storage_key missing")
@@ -375,64 +660,34 @@ def index_document(doc_id: str) -> None:
 
         if storage_type == "local":
             path_value = storage_meta.get("path") or doc.storage_key
-            path = _resolve_local_path(path_value)
-            if not path.exists():
+            processing_path = _resolve_local_path(path_value)
+            if not processing_path.exists():
                 raise RuntimeError("Local document missing")
         else:
             try:
                 tmp_download = _s3_download_to_tmp(doc.storage_key, suffix=".pdf")
-                path = tmp_download
+                processing_path = tmp_download
             except ClientError as e:
                 raise RuntimeError(f"S3 download failed: {e}")
 
-        pages = extract_pdf_pages(str(path))
-
-        texts: list[str] = []
-        metas: list[tuple[int | None, int, str]] = []
-        for page_no, page_text in pages:
-            chunks = simple_chunk(page_text)
-            for idx, ch in enumerate(chunks):
-                texts.append(ch)
-                metas.append((page_no, idx, ch))
-
-        if not texts:
-            raise RuntimeError("No extractable text found in PDF.")
-
-        vecs = embed_texts(texts)
-
-        db.query(Chunk).filter(Chunk.document_id == doc_id).delete(
-            synchronize_session=False
+        _process_document_content(
+            db=db,
+            doc=doc,
+            pdf_path=processing_path,
+            skip_embedding=skip_embedding,
+            request_id=request_id,
+            raise_http=False,
         )
 
-        for (page_no, idx, ch), vec in zip(metas, vecs):
-            db.add(
-                Chunk(
-                    document_id=doc_id,
-                    page=page_no,
-                    chunk_index=idx,
-                    text=ch,
-                    embedding=vec,
-                )
-            )
-
-        doc.status = "indexed"
-        doc.error = None
-        db.commit()
-
-    except Exception as e:
-        try:
-            db.rollback()
-        except Exception:
-            pass
-
-        doc = db.get(Document, doc_id)
-        if doc:
-            doc.status = "failed"
-            doc.error = _truncate_err(e)
-            try:
-                db.commit()
-            except Exception:
-                pass
+    except Exception as exc:  # noqa: BLE001
+        _handle_stage_failure(
+            "prepare_document",
+            exc,
+            request_id=request_id,
+            db=db,
+            doc=doc,
+            raise_http=False,
+        )
     finally:
         _cleanup_file(tmp_download)
         db.close()
@@ -449,8 +704,11 @@ def index_document(doc_id: str) -> None:
     dependencies=[Depends(require_permissions("write:docs"))],
 )
 def upload_doc(
-    background: BackgroundTasks,
+    request: Request,
     file: UploadFile = File(...),
+    skip_embedding: bool = Query(
+        default=False, description="Skip vector embeddings for debugging."
+    ),
     db: Session = Depends(get_db),
     p: Principal = Depends(current_user),
 ):
@@ -458,12 +716,28 @@ def upload_doc(
     _require_pdf_extension(filename)
     _require_pdf_content_type(file)
 
+    request_id = _ensure_request_id(request)
     tmp_path = TMP_DIR / f"tmp_{uuid.uuid4().hex}_{filename}"
+    cleanup_path: Path | None = tmp_path
+    doc: Document | None = None
+    processing_path: Path = tmp_path
 
     try:
-        content_hash = _sha256_and_save_tmp(file, tmp_path)
+        try:
+            content_hash = _sha256_and_save_tmp(file, tmp_path)
+        except HTTPException:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            _handle_stage_failure(
+                "save_file",
+                exc,
+                request_id=request_id,
+                db=None,
+                doc=None,
+                raise_http=True,
+            )
+            return  # never reached
 
-        # ✅ dedup は user単位にする（安全側）
         existing = (
             db.query(Document)
             .filter(Document.content_hash == content_hash, Document.owner_sub == p.sub)
@@ -479,7 +753,6 @@ def upload_doc(
             )
 
         doc_id = str(uuid.uuid4())
-
         if _s3_configured():
             key = _s3_key_for(doc_id, content_hash, filename)
             try:
@@ -495,7 +768,6 @@ def upload_doc(
                         }
                     },
                 ) from exc
-            _cleanup_file(tmp_path)
             storage_key = key
             storage_meta = {
                 "storage": "s3",
@@ -507,13 +779,15 @@ def upload_doc(
             dest = _local_storage_path(doc_id)
             dest.parent.mkdir(parents=True, exist_ok=True)
             tmp_path.replace(dest)
+            processing_path = dest
+            cleanup_path = None
             storage_key = dest.name
             storage_meta = {"storage": "local", "path": dest.name}
 
         doc = Document(
             id=doc_id,
             filename=filename,
-            status="indexing",  # ここでindexingにして二重commitを減らす
+            status="indexing",
             content_hash=content_hash,
             storage_key=storage_key,
             owner_sub=p.sub,
@@ -529,7 +803,6 @@ def upload_doc(
                 _s3_delete_object(storage_key)
             else:
                 _delete_local_file(storage_meta.get("path") or storage_key)
-            # 競合時：同じuser+hash ができてたらそれを返す
             existing2 = (
                 db.query(Document)
                 .filter(
@@ -548,18 +821,30 @@ def upload_doc(
 
         db.refresh(doc)
         ok, reason = _indexing_available()
-        if not ok:
-            doc.status = "failed"
+        if not skip_embedding and not ok:
+            doc.status = "error"
             doc.error = f"INDEXING_DISABLED: {reason}"
             db.commit()
-            return DocumentUploadResponse(
-                document_id=doc.id,
-                filename=doc.filename,
-                status=doc.status,
-                dedup=False,
-            )
+            detail = {
+                "error": {
+                    "code": "UPLOAD_INDEX_FAILED",
+                    "message": "Embedding is not configured for this environment.",
+                    "stage": "embed_chunks",
+                    "request_id": request_id,
+                    "reason": reason,
+                }
+            }
+            raise HTTPException(status_code=503, detail=detail)
 
-        background.add_task(index_document, doc.id)
+        _process_document_content(
+            db=db,
+            doc=doc,
+            pdf_path=processing_path,
+            skip_embedding=skip_embedding,
+            request_id=request_id,
+            raise_http=True,
+        )
+        db.refresh(doc)
 
         return DocumentUploadResponse(
             document_id=doc.id,
@@ -569,6 +854,8 @@ def upload_doc(
         )
 
     finally:
+        if cleanup_path:
+            _cleanup_file(cleanup_path)
         try:
             file.file.close()
         except Exception:
