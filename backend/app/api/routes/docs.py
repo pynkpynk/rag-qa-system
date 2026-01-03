@@ -344,8 +344,10 @@ def _enforce_run_access_if_needed(
     if not run_id:
         return
 
+    # ① run所有権
     ensure_run_access(db, run_id, p)
 
+    # ② run_documentsに紐づくdocか
     row = (
         db.execute(
             sql_text(SQL_DOC_ATTACHED_TO_RUN),
