@@ -6,6 +6,7 @@ import { clearToken, getToken, setToken } from "../lib/authToken";
 import {
   attachDocsToRun,
   createRun,
+  deleteRun,
   getRun,
   listRuns,
   type RunDetail,
@@ -13,6 +14,7 @@ import {
 } from "../lib/runClient";
 import { getChunk, type ChunkDetail } from "../lib/chunkClient";
 import { deleteDoc } from "../lib/docClient";
+import { searchChunks, type SearchHit } from "../lib/searchClient";
 
 type HealthResponse = {
   status: string;
@@ -88,6 +90,19 @@ export default function HomePage() {
   );
   const [deletingDocId, setDeletingDocId] = useState<string | null>(null);
   const [docsActionError, setDocsActionError] = useState<string | null>(null);
+  const [deletingRunId, setDeletingRunId] = useState<string | null>(null);
+  const [autoAttachToRun, setAutoAttachToRun] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchLimit, setSearchLimit] = useState(8);
+  const [searchMode, setSearchMode] =
+    useState<"selected_docs" | "library">("selected_docs");
+  const [searchResults, setSearchResults] = useState<SearchHit[]>([]);
+  const [searchLoading, setSearchLoading] = useState(false);
+  const [searchError, setSearchError] = useState<string | null>(null);
+  const [lastAskExport, setLastAskExport] = useState<{
+    request: Record<string, unknown>;
+    response: ChatAskResponse;
+  } | null>(null);
 
   useEffect(() => {
     let mounted = true;
@@ -195,6 +210,7 @@ export default function HomePage() {
       setSelectedRunId(null);
       setRunDetail(null);
       setUseRunScope(false);
+      setAutoAttachToRun(false);
     }
   }, [hasToken, fetchDocsList, fetchRunsList]);
 
@@ -245,6 +261,7 @@ export default function HomePage() {
     setSelectedRunId(null);
     setRuns([]);
     setRunDetail(null);
+    setAutoAttachToRun(false);
   };
 
   const toggleDocSelection = (documentId: string) => {
@@ -262,6 +279,25 @@ export default function HomePage() {
     setRunActionError(null);
     setRunActionMessage(null);
     setSelectedRunId(runId);
+  };
+
+  const handleDeleteRun = async (runId: string) => {
+    setRunActionError(null);
+    setRunActionMessage(null);
+    setDeletingRunId(runId);
+    try {
+      await deleteRun(runId);
+      await fetchRunsList();
+      if (selectedRunId === runId) {
+        setSelectedRunId(null);
+        setRunDetail(null);
+      }
+      setRunActionMessage(`Run ${runId} deleted.`);
+    } catch (err) {
+      setRunActionError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setDeletingRunId(null);
+    }
   };
 
   const handleDeleteDoc = async (documentId: string) => {
@@ -291,6 +327,24 @@ export default function HomePage() {
       await navigator.clipboard.writeText(text);
     } catch {
       // ignore clipboard errors (browser may block)
+    }
+  };
+
+  const downloadJson = (filename: string, data: unknown) => {
+    try {
+      const blob = new Blob([JSON.stringify(data, null, 2)], {
+        type: "application/json",
+      });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+    } catch {
+      // ignore download errors
     }
   };
 
@@ -344,8 +398,52 @@ export default function HomePage() {
       setUploadResp(data);
       setUploadFile(null);
       await fetchDocsList();
+      if (autoAttachToRun && selectedRunId) {
+        try {
+          const detail = await attachDocsToRun(selectedRunId, [data.document_id]);
+          setRunDetail(detail);
+          setRunActionMessage("Uploaded doc attached to run.");
+        } catch (err) {
+          setRunActionError(
+            err instanceof Error
+              ? `Auto-attach failed: ${err.message}`
+              : "Auto-attach failed",
+          );
+        }
+      }
     } catch (err) {
       setUploadError(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const runSearch = async () => {
+    setSearchError(null);
+    if (!getToken()) {
+      setSearchError("Set a demo token before searching.");
+      return;
+    }
+    if (!searchQuery.trim()) {
+      setSearchError("Enter a search query first.");
+      return;
+    }
+    if (searchMode === "selected_docs" && selectedDocs.length === 0) {
+      setSearchError("Select at least one document or switch mode to library.");
+      return;
+    }
+    setSearchLoading(true);
+    try {
+      const resp = await searchChunks({
+        query: searchQuery,
+        mode: searchMode,
+        documentIds: searchMode === "selected_docs" ? selectedDocs : undefined,
+        limit: searchLimit,
+      });
+      setSearchResults(resp.hits);
+    } catch (err) {
+      setSearchResults([]);
+      setSearchError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSearchLoading(false);
     }
   };
 
@@ -412,8 +510,7 @@ export default function HomePage() {
       return;
     }
     setAskLoading(true);
-    try {
-      const payload: Record<string, unknown> = {
+    const payload: Record<string, unknown> = {
         mode: askMode,
         question: askQuestion,
       };
@@ -422,6 +519,7 @@ export default function HomePage() {
       } else if (selectedDocs.length > 0) {
         payload.document_ids = selectedDocs;
       }
+    try {
       const resp = await authFetch("/chat/ask", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -433,6 +531,7 @@ export default function HomePage() {
       }
       const data = JSON.parse(body) as ChatAskResponse;
       setAskResult(data);
+      setLastAskExport({ request: payload, response: data });
     } catch (err) {
       setAskError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -478,6 +577,14 @@ export default function HomePage() {
               Ask using run scope (<code>{selectedRunId}</code>)
             </label>
           )}
+          <label style={{ display: "inline-flex", alignItems: "center", gap: "0.25rem" }}>
+            <input
+              type="checkbox"
+              checked={autoAttachToRun}
+              onChange={(e) => setAutoAttachToRun(e.target.checked)}
+            />
+            Auto-attach uploaded doc to selected run
+          </label>
         </div>
         {runsError && (
           <p style={{ color: "#f87171" }}>
@@ -500,6 +607,13 @@ export default function HomePage() {
                   {selectedRunId === run.run_id ? "Selected" : "Select"}
                 </button>{" "}
                 <code>{run.run_id}</code> – {run.status} ({run.document_ids.length} docs)
+                <button
+                  style={{ marginLeft: "0.5rem" }}
+                  onClick={() => void handleDeleteRun(run.run_id)}
+                  disabled={deletingRunId === run.run_id}
+                >
+                  {deletingRunId === run.run_id ? "Deleting…" : "Delete"}
+                </button>
               </li>
             ))}
           </ul>
@@ -620,6 +734,103 @@ export default function HomePage() {
           <pre style={{ marginTop: "1rem", overflowX: "auto" }}>
             {docsData}
           </pre>
+        )}
+      </section>
+      <section>
+        <h2>Search</h2>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: "0.5rem" }}>
+          <input
+            type="text"
+            placeholder="Search query"
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            style={{ flex: "2 1 200px", padding: "0.5rem" }}
+          />
+          <label style={{ display: "inline-flex", alignItems: "center", gap: "0.25rem" }}>
+            Top K:
+            <input
+              type="number"
+              min={1}
+              max={100}
+              value={searchLimit}
+              onChange={(e) =>
+                setSearchLimit(Math.max(1, Math.min(100, Number(e.target.value) || 1)))
+              }
+              style={{ width: "4rem" }}
+            />
+          </label>
+          <label style={{ display: "inline-flex", alignItems: "center", gap: "0.25rem" }}>
+            Mode:
+            <select
+              value={searchMode}
+              onChange={(e) =>
+                setSearchMode(e.target.value === "library" ? "library" : "selected_docs")
+              }
+            >
+              <option value="selected_docs">selected_docs</option>
+              <option value="library">library</option>
+            </select>
+          </label>
+          <button onClick={() => void runSearch()} disabled={searchLoading}>
+            {searchLoading ? "Searching…" : "Search"}
+          </button>
+        </div>
+        {searchError && (
+          <p style={{ color: "#f87171" }}>
+            <strong>Search error:</strong> {searchError}
+          </p>
+        )}
+        {searchResults.length > 0 ? (
+          <ul style={{ marginTop: "1rem" }}>
+            {searchResults.map((hit, idx) => {
+              const chunkId = hit.chunk_id;
+              const detail = chunkDetails[chunkId];
+              const chunkLoading = chunkLoadingState[chunkId];
+              const chunkErr = chunkErrors[chunkId];
+              const label = `[Hit ${idx + 1}]`;
+              return (
+                <li key={chunkId} style={{ marginBottom: "0.75rem" }}>
+                  <p>
+                    {label} score {hit.score.toFixed(3)} – doc {hit.document_id}, chunk{" "}
+                    {chunkId}, page {hit.page ?? "?"}
+                  </p>
+                  <p style={{ fontStyle: "italic" }}>{hit.text}</p>
+                  <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap" }}>
+                    <button
+                      onClick={() => void fetchCitationChunk(chunkId)}
+                      disabled={chunkLoading}
+                    >
+                      {chunkLoading
+                        ? "Loading…"
+                        : detail
+                          ? "Refresh excerpt"
+                          : "Show excerpt"}
+                    </button>
+                    <button onClick={() => void copyText(chunkId)}>Copy chunk_id</button>
+                  </div>
+                  {chunkErr && (
+                    <p style={{ color: "#f87171" }}>
+                      <strong>Chunk error:</strong> {chunkErr}
+                    </p>
+                  )}
+                  {detail && (
+                    <pre
+                      style={{
+                        marginTop: "0.5rem",
+                        padding: "0.5rem",
+                        background: "#1e293b",
+                        borderRadius: "4px",
+                      }}
+                    >
+                      {detail.text}
+                    </pre>
+                  )}
+                </li>
+              );
+            })}
+          </ul>
+        ) : (
+          <p style={{ marginTop: "1rem" }}>No search results yet.</p>
         )}
       </section>
       <section>
@@ -744,6 +955,20 @@ export default function HomePage() {
                   );
                 })}
               </ul>
+            )}
+            {lastAskExport && (
+              <div style={{ marginTop: "1rem", display: "flex", gap: "0.5rem", flexWrap: "wrap" }}>
+                <button
+                  onClick={() =>
+                    void copyText(JSON.stringify(lastAskExport, null, 2))
+                  }
+                >
+                  Copy JSON
+                </button>
+                <button onClick={() => downloadJson("ask-response.json", lastAskExport)}>
+                  Download JSON
+                </button>
+              </div>
             )}
           </div>
         )}

@@ -64,3 +64,17 @@ export async function attachDocsToRun(
   });
   return parseJson<RunDetail>(resp);
 }
+
+export async function deleteRun(runId: string): Promise<void> {
+  const resp = await authFetch(`/runs/${runId}?confirm=DELETE`, {
+    method: "DELETE",
+  });
+  const text = await resp.text();
+  if (!resp.ok) {
+    const message = text || resp.statusText;
+    if (resp.status === 404 || resp.status === 405) {
+      throw new Error(`Run delete unsupported: HTTP ${resp.status} ${message}`);
+    }
+    throw new Error(`HTTP ${resp.status}: ${message}`);
+  }
+}
