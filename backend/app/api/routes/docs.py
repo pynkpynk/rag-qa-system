@@ -705,6 +705,7 @@ def index_document(doc_id: str, *, skip_embedding: bool = False) -> None:
 )
 def upload_doc(
     request: Request,
+    _background: BackgroundTasks,
     file: UploadFile = File(...),
     skip_embedding: bool = Query(
         default=False, description="Skip vector embeddings for debugging."
@@ -817,7 +818,14 @@ def upload_doc(
                     status=existing2.status,
                     dedup=True,
                 )
-            raise
+            detail = {
+                "error": {
+                    "code": "DUPLICATE_DOCUMENT",
+                    "message": "Document already exists.",
+                    "request_id": request_id,
+                }
+            }
+            raise HTTPException(status_code=409, detail=detail)
 
         db.refresh(doc)
         ok, reason = _indexing_available()

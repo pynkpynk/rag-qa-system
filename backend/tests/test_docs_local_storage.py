@@ -17,6 +17,7 @@ from app.core import config as config_module
 
 
 client = TestClient(app)
+SAMPLE_PDF = b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\nxref\n0 1\n0000000000 65535 f \ntrailer\n<<>>\nstartxref\n9\n%%EOF"
 
 
 def _dev_headers(sub: str = "dev|local") -> dict[str, str]:
@@ -82,12 +83,11 @@ def sqlite_docs_storage(monkeypatch: pytest.MonkeyPatch, tmp_path):
 
 def test_upload_and_view_local_storage(sqlite_docs_storage):
     session_factory, local_dir = sqlite_docs_storage
-    sample_pdf = b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\nxref\n0 1\n0000000000 65535 f \ntrailer\n<<>>\nstartxref\n9\n%%EOF"
 
     resp = client.post(
         "/api/docs/upload",
         headers=_dev_headers(),
-        files={"file": ("sample.pdf", BytesIO(sample_pdf), "application/pdf")},
+        files={"file": ("sample.pdf", BytesIO(SAMPLE_PDF), "application/pdf")},
     )
     assert resp.status_code == 200
     payload = resp.json()
@@ -116,12 +116,10 @@ def test_upload_marks_failed_when_openai_missing(
         config_module.settings, "openai_api_key", SecretStr(""), raising=False
     )
 
-    sample_pdf = b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\nxref\n0 1\n0000000000 65535 f \ntrailer\n<<>>\nstartxref\n9\n%%EOF"
-
     resp = client.post(
         "/api/docs/upload",
         headers=_dev_headers(),
-        files={"file": ("sample.pdf", BytesIO(sample_pdf), "application/pdf")},
+        files={"file": ("sample.pdf", BytesIO(SAMPLE_PDF), "application/pdf")},
     )
     assert resp.status_code == 503
     payload = resp.json()
@@ -171,6 +169,56 @@ def test_upload_rejects_oversize(monkeypatch: pytest.MonkeyPatch, sqlite_docs_st
     assert "File too large" in payload["error"]["message"]
 
 
+def test_upload_same_pdf_different_users(sqlite_docs_storage):
+    session_factory, _ = sqlite_docs_storage
+
+    resp_a = client.post(
+        "/api/docs/upload",
+        headers=_dev_headers("dev|user-a"),
+        files={"file": ("sample.pdf", BytesIO(SAMPLE_PDF), "application/pdf")},
+    )
+    assert resp_a.status_code == 200
+    data_a = resp_a.json()
+    assert data_a["dedup"] is False
+    with session_factory() as db:
+        doc = db.get(Document, data_a["document_id"])
+        assert doc.owner_sub == "dev|user-a"
+
+    resp_b = client.post(
+        "/api/docs/upload",
+        headers=_dev_headers("dev|user-b"),
+        files={"file": ("sample.pdf", BytesIO(SAMPLE_PDF), "application/pdf")},
+    )
+    assert resp_b.status_code == 200
+    data_b = resp_b.json()
+    assert data_b["dedup"] is False
+    assert data_a["document_id"] != data_b["document_id"]
+
+    with session_factory() as db:
+        docs = db.query(Document).all()
+        assert len(docs) == 2
+        owners = {doc.owner_sub for doc in docs}
+        assert owners == {"dev|user-a", "dev|user-b"}
+
+
+def test_upload_same_pdf_same_user_dedup(sqlite_docs_storage):
+    resp1 = client.post(
+        "/api/docs/upload",
+        headers=_dev_headers("dev|same"),
+        files={"file": ("sample.pdf", BytesIO(SAMPLE_PDF), "application/pdf")},
+    )
+    assert resp1.status_code == 200
+    data1 = resp1.json()
+
+    resp2 = client.post(
+        "/api/docs/upload",
+        headers=_dev_headers("dev|same"),
+        files={"file": ("sample.pdf", BytesIO(SAMPLE_PDF), "application/pdf")},
+    )
+    assert resp2.status_code == 200
+    data2 = resp2.json()
+    assert data2["dedup"] is True
+    assert data1["document_id"] == data2["document_id"]
 def test_upload_returns_structured_error_on_embedding_failure(
     monkeypatch: pytest.MonkeyPatch, sqlite_docs_storage
 ):
