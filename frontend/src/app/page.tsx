@@ -282,6 +282,9 @@ export default function HomePage() {
   };
 
   const handleDeleteRun = async (runId: string) => {
+    if (!window.confirm("Delete this run? This cannot be undone.")) {
+      return;
+    }
     setRunActionError(null);
     setRunActionMessage(null);
     setDeletingRunId(runId);
@@ -301,6 +304,9 @@ export default function HomePage() {
   };
 
   const handleDeleteDoc = async (documentId: string) => {
+    if (!window.confirm("Delete this document? This cannot be undone.")) {
+      return;
+    }
     setDocsActionError(null);
     setDeletingDocId(documentId);
     try {
@@ -392,6 +398,15 @@ export default function HomePage() {
       });
       const body = await resp.text();
       if (!resp.ok) {
+        if (resp.status === 401) {
+          throw new Error("Unauthorized. Check your token.");
+        }
+        if (resp.status === 413) {
+          throw new Error("File too large (413). Please choose a smaller PDF.");
+        }
+        if (resp.status === 422) {
+          throw new Error(`Validation error: ${body || resp.statusText}`);
+        }
         throw new Error(`HTTP ${resp.status}: ${body || resp.statusText}`);
       }
       const data = JSON.parse(body) as DocumentUploadResponse;
@@ -511,9 +526,9 @@ export default function HomePage() {
     }
     setAskLoading(true);
     const payload: Record<string, unknown> = {
-        mode: askMode,
-        question: askQuestion,
-      };
+      mode: askMode,
+      question: askQuestion,
+    };
       if (useRunScope && selectedRunId) {
         payload.run_id = selectedRunId;
       } else if (selectedDocs.length > 0) {
@@ -527,6 +542,15 @@ export default function HomePage() {
       });
       const body = await resp.text();
       if (!resp.ok) {
+        if (resp.status === 401) {
+          throw new Error("Unauthorized. Check your token.");
+        }
+        if (resp.status === 413) {
+          throw new Error("Request too large (413).");
+        }
+        if (resp.status === 422) {
+          throw new Error(`Validation error: ${body || resp.statusText}`);
+        }
         throw new Error(`HTTP ${resp.status}: ${body || resp.statusText}`);
       }
       const data = JSON.parse(body) as ChatAskResponse;
