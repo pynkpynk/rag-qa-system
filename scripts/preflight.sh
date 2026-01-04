@@ -12,6 +12,7 @@ fi
 export APP_ENV="dev"
 export AUTH_MODE="dev"
 export DEV_SUB="test-user"
+export CORS_ORIGIN="http://localhost:5173"
 
 compile_targets=()
 for target in "backend/app" "backend/tests"; do
