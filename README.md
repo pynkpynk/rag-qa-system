@@ -3,6 +3,10 @@
 - Codex installs/tests: switch to the `rag_net` profile first so dependency downloads (e.g., `pytest`, `auth0-fastapi-api`) succeed, then run the same commands.
 - Fallback when pytest can’t be installed: `cd backend && python scripts/smoke_chat_debug_gate.py` ensures the retrieval debug gate logic still passes its four-case contract.
 
+## Preflight
+- Run `make preflight` from the repo root to compile backend Python files and execute `pytest backend/tests` with deterministic env vars.
+- Optional: `git config core.hooksPath .githooks` enables the provided `pre-push` hook so pushes run `make preflight` automatically.
+
 ## API docs
 - Swagger UI: `/api/swagger`
 - OpenAPI JSON: `/api/openapi.json`
