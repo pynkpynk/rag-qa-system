@@ -16,8 +16,9 @@ from fastapi import (
     Depends,
     File,
     HTTPException,
-    UploadFile,
     Query,
+    Request,
+    UploadFile,
 )
 from fastapi.responses import RedirectResponse, FileResponse
 from sqlalchemy import text as sql_text
@@ -449,6 +450,7 @@ def index_document(doc_id: str) -> None:
     dependencies=[Depends(require_permissions("write:docs"))],
 )
 def upload_doc(
+    request: Request,
     background: BackgroundTasks,
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
@@ -459,6 +461,12 @@ def upload_doc(
     _require_pdf_content_type(file)
 
     tmp_path = TMP_DIR / f"tmp_{uuid.uuid4().hex}_{filename}"
+    request_id = (
+        getattr(request.state, "request_id", None)
+        or request.headers.get("x-request-id")
+        or request.headers.get("X-Request-ID")
+        or str(uuid.uuid4())
+    )
 
     try:
         content_hash = _sha256_and_save_tmp(file, tmp_path)
@@ -544,7 +552,14 @@ def upload_doc(
                     status=existing2.status,
                     dedup=True,
                 )
-            raise
+            detail = {
+                "error": {
+                    "code": "DUPLICATE_DOCUMENT",
+                    "message": "Document already exists.",
+                    "request_id": request_id,
+                }
+            }
+            raise HTTPException(status_code=409, detail=detail)
 
         db.refresh(doc)
         ok, reason = _indexing_available()

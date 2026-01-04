@@ -2,16 +2,7 @@ import uuid
 from datetime import datetime, timezone
 
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import (
-    JSON,
-    Column,
-    DateTime,
-    ForeignKey,
-    Integer,
-    String,
-    Table,
-    Text,
-)
+from sqlalchemy import JSON, Column, DateTime, ForeignKey, Index, Integer, String, Table, Text
 from sqlalchemy.orm import relationship
 
 from app.db.base import Base
@@ -89,6 +80,14 @@ class Run(Base):
 
 class Document(Base):
     __tablename__ = "documents"
+    __table_args__ = (
+        Index(
+            "ux_documents_owner_sub_content_hash",
+            "owner_sub",
+            "content_hash",
+            unique=True,
+        ),
+    )
 
     id = Column(String, primary_key=True, default=gen_uuid)
     filename = Column(String, nullable=False)
@@ -96,7 +95,7 @@ class Document(Base):
     status = Column(String, default="uploaded", nullable=False)
     error = Column(String, nullable=True)
 
-    content_hash = Column(String(64), unique=True, index=True, nullable=True)
+    content_hash = Column(String(64), nullable=True, index=True)
 
     owner_sub = Column(String, index=True, nullable=True)
 
