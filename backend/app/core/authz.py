@@ -72,6 +72,10 @@ def demo_owner_sub_from_token(token: str) -> str:
     return f"demo|{digest[:12]}"
 
 
+def _demo_tokens_configured() -> bool:
+    return bool(_env("DEMO_TOKEN_SHA256_LIST") or _env("DEMO_TOKEN_PLAINTEXT"))
+
+
 def _demo_token_hashes() -> Set[str]:
     hashes: Set[str] = set()
     for part in _parse_csv(_env("DEMO_TOKEN_SHA256_LIST")):
@@ -79,7 +83,7 @@ def _demo_token_hashes() -> Set[str]:
         if _SHA256_RE.fullmatch(lower):
             hashes.add(lower)
     plaintext = _env("DEMO_TOKEN_PLAINTEXT")
-    if plaintext and not _is_production():
+    if plaintext:
         digest = _demo_digest(plaintext)
         hashes.add(digest)
     return hashes
@@ -375,6 +379,11 @@ def get_principal(
 
     if mode == "demo":
         token = _require_bearer_token()
+        if _is_production() and not _demo_tokens_configured():
+            raise HTTPException(
+                status_code=401,
+                detail=_unauth_detail("Demo tokens not configured"),
+            )
         digest = _demo_digest(token)
         allowed_hashes = _demo_token_hashes()
         allowed = any(hmac.compare_digest(digest, h) for h in allowed_hashes)

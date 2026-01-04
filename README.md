@@ -17,6 +17,16 @@
 - This unlocks `retrieval_debug` only when `debug=true` and the global flag is enabled; it does **not** expand document/data access.
 - When `debug=true` and the feature flag is enabled, error responses (e.g., `run not found`) now include `debug_meta` so you can diagnose why `retrieval_debug` was excluded; `retrieval_debug` itself remains admin-only and sanitized.
 
+## Demo tokens (AUTH_MODE=demo)
+- Production deployments using `AUTH_MODE=demo` **must** configure an allowlist: either set `DEMO_TOKEN_SHA256_LIST` (preferred, comma-separated SHA256 digests) or `DEMO_TOKEN_PLAINTEXT` for a single shared token.
+- Generate a digest with `echo -n "my-demo-token" | shasum -a 256 | cut -d' ' -f1`, then set `DEMO_TOKEN_SHA256_LIST=<digest>` on Render. You can still use `DEMO_TOKEN_PLAINTEXT` for staging/dev, but hashes are safer in prod.
+- Verify access with `curl -H "Authorization: Bearer my-demo-token" https://<host>/api/health`; invalid tokens should return `401 {"error":{"code":"NOT_AUTHENTICATED",...}}`.
+
+## Production smoke test
+- Set `API_BASE`, `TOKEN_A`, `TOKEN_B`, and `PDF` (path to a test PDF) in your environment.
+- Run `make prod-smoke` (or `bash scripts/prod_smoke.sh`). The script uploads the PDF, validates tenant isolation for docs/runs/chunks, runs an Ask call, and prints PASS/FAIL.
+- Example: `API_BASE=https://rag.example.com/api TOKEN_A=... TOKEN_B=... PDF=./sample.pdf make prod-smoke`
+
 ## Local dev workflow (deterministic)
 1. Copy `backend/.env.example` to `backend/.env.local`, fill in required keys, and quote any values containing `|` (e.g., `DEV_SUB="auth0|local-user"`). In dev mode, only `DEV_ADMIN_SUBS` grants admin rights; leave it empty to stay non-admin by default.
 2. Verify the environment with `python backend/scripts/dev_env_status.py` (all required keys should show `SET`).

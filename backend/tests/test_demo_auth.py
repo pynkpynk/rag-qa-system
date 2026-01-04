@@ -132,7 +132,7 @@ def test_demo_token_allows_chat(
 
 def test_demo_plaintext_token_allowed(monkeypatch: pytest.MonkeyPatch, stub_chat):
     monkeypatch.setenv("AUTH_MODE", "demo")
-    monkeypatch.setenv("APP_ENV", "dev")
+    monkeypatch.setenv("APP_ENV", "prod")
     monkeypatch.setenv("DEMO_TOKEN_PLAINTEXT", "plain-demo-token")
     monkeypatch.delenv("DEMO_TOKEN_SHA256_LIST", raising=False)
     resp = client.post(
@@ -146,6 +146,19 @@ def test_demo_plaintext_token_allowed(monkeypatch: pytest.MonkeyPatch, stub_chat
     assert resp.status_code in (200, 201)
     data = resp.json()
     assert "answer" in data
+
+
+def test_demo_mode_requires_allowlist_in_prod(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("AUTH_MODE", "demo")
+    monkeypatch.setenv("APP_ENV", "prod")
+    monkeypatch.delenv("DEMO_TOKEN_PLAINTEXT", raising=False)
+    monkeypatch.delenv("DEMO_TOKEN_SHA256_LIST", raising=False)
+    resp = client.get(
+        "/api/docs", headers={"Authorization": "Bearer random-demo-token"}
+    )
+    assert resp.status_code == 401
+    body = resp.json()
+    assert body["error"]["message"] == "Demo tokens not configured"
 
 
 def test_demo_docs_upload_not_forbidden(demo_env: str, demo_docs_env):

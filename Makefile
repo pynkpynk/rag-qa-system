@@ -45,3 +45,7 @@ docs:
 .PHONY: preflight
 preflight:
 	@./scripts/preflight.sh
+
+.PHONY: prod-smoke
+prod-smoke:
+	@./scripts/prod_smoke.sh
