@@ -12,6 +12,7 @@ import {
   type RunListItem,
 } from "../lib/runClient";
 import { getChunk, type ChunkDetail } from "../lib/chunkClient";
+import { deleteDoc } from "../lib/docClient";
 
 type HealthResponse = {
   status: string;
@@ -85,6 +86,8 @@ export default function HomePage() {
   const [chunkLoadingState, setChunkLoadingState] = useState<Record<string, boolean>>(
     {},
   );
+  const [deletingDocId, setDeletingDocId] = useState<string | null>(null);
+  const [docsActionError, setDocsActionError] = useState<string | null>(null);
 
   useEffect(() => {
     let mounted = true;
@@ -259,6 +262,20 @@ export default function HomePage() {
     setRunActionError(null);
     setRunActionMessage(null);
     setSelectedRunId(runId);
+  };
+
+  const handleDeleteDoc = async (documentId: string) => {
+    setDocsActionError(null);
+    setDeletingDocId(documentId);
+    try {
+      await deleteDoc(documentId);
+      await fetchDocsList();
+      setSelectedDocs((prev) => prev.filter((id) => id !== documentId));
+    } catch (err) {
+      setDocsActionError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setDeletingDocId(null);
+    }
   };
 
   const handleFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
@@ -569,6 +586,11 @@ export default function HomePage() {
             <strong>Docs error:</strong> {docsError}
           </p>
         )}
+        {docsActionError && (
+          <p style={{ color: "#f97316" }}>
+            <strong>Doc action error:</strong> {docsActionError}
+          </p>
+        )}
         {docsList.length > 0 ? (
           <ul style={{ marginTop: "1rem" }}>
             {docsList.map((doc) => (
@@ -581,6 +603,13 @@ export default function HomePage() {
                   />{" "}
                   {doc.filename} ({doc.status})
                 </label>
+                <button
+                  style={{ marginLeft: "0.5rem" }}
+                  onClick={() => void handleDeleteDoc(doc.document_id)}
+                  disabled={deletingDocId === doc.document_id}
+                >
+                  {deletingDocId === doc.document_id ? "Deleting…" : "Delete"}
+                </button>
               </li>
             ))}
           </ul>
