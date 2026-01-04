@@ -3,6 +3,11 @@
 - Codex installs/tests: switch to the `rag_net` profile first so dependency downloads (e.g., `pytest`, `auth0-fastapi-api`) succeed, then run the same commands.
 - Fallback when pytest can’t be installed: `cd backend && python scripts/smoke_chat_debug_gate.py` ensures the retrieval debug gate logic still passes its four-case contract.
 
+## API docs
+- Swagger UI: `/api/swagger`
+- OpenAPI JSON: `/api/openapi.json`
+- ReDoc: `/api/redoc`
+
 ## Admin debug token allowlist
 - To allow an opaque admin token to enable `retrieval_debug`, compute its SHA256 digest (e.g., `echo -n "$ADMIN_TOKEN" | shasum -a 256 | cut -d' ' -f1`) and set `ADMIN_DEBUG_TOKEN_SHA256_LIST=<digest>` (comma-separated for multiple tokens).
 - This unlocks `retrieval_debug` only when `debug=true` and the global flag is enabled; it does **not** expand document/data access.

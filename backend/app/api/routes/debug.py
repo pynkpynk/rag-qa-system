@@ -42,7 +42,8 @@ def _s3_bucket() -> str:
     return bucket
 
 
-@router.get("/_debug/aws-whoami", response_model=DebugAwsWhoAmIResponse)
+# keep debug endpoints out of OpenAPI per hardening
+@router.get("/_debug/aws-whoami", response_model=DebugAwsWhoAmIResponse, include_in_schema=False)
 def aws_whoami(
     x_debug_token: Optional[str] = Header(default=None, alias="X-Debug-Token"),
 ) -> DebugAwsWhoAmIResponse:
@@ -72,7 +73,7 @@ def aws_whoami(
     }
 
 
-@router.get("/_debug/s3-head", response_model=DebugS3HeadResponse)
+@router.get("/_debug/s3-head", response_model=DebugS3HeadResponse, include_in_schema=False)
 def s3_head(
     key: str = Query(..., description="S3 object key"),
     x_debug_token: Optional[str] = Header(default=None, alias="X-Debug-Token"),

@@ -92,7 +92,23 @@ def create_app() -> FastAPI:
     - Keeps setup (CORS / routers) centralized and readable.
     - Makes future testing and extension easier.
     """
-    app = FastAPI(title="RAG QA System", version="0.1.0")
+    openapi_enabled = (os.getenv("OPENAPI_ENABLED", "1") or "1").lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+    openapi_url = "/api/openapi.json" if openapi_enabled else None
+    docs_url = "/api/swagger" if openapi_enabled else None
+    redoc_url = "/api/redoc" if openapi_enabled else None
+
+    app = FastAPI(
+        title="RAG QA System",
+        version="0.1.0",
+        openapi_url=openapi_url,
+        docs_url=docs_url,
+        redoc_url=redoc_url,
+    )
     app.add_middleware(RequestIdMiddleware)
     app.add_middleware(BodySizeLimitMiddleware)
     app.add_middleware(RateLimitMiddleware)
@@ -231,7 +247,7 @@ def create_app() -> FastAPI:
 
     if smoke_endpoint_enabled():
 
-        @app.post("/api/_smoke/echo")
+        @app.post("/api/_smoke/echo", include_in_schema=False)
         async def smoke_echo(payload: SmokeEchoPayload):
             return {"ok": True, "echo_length": len(payload.question)}
 
