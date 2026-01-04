@@ -3,6 +3,14 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { authFetch } from "../lib/apiClient";
 import { clearToken, getToken, setToken } from "../lib/authToken";
+import {
+  attachDocsToRun,
+  createRun,
+  getRun,
+  listRuns,
+  type RunDetail,
+  type RunListItem,
+} from "../lib/runClient";
 
 type HealthResponse = {
   status: string;
@@ -61,6 +69,16 @@ export default function HomePage() {
   const [askResult, setAskResult] = useState<ChatAskResponse | null>(null);
   const [askError, setAskError] = useState<string | null>(null);
   const [askLoading, setAskLoading] = useState(false);
+  const [runs, setRuns] = useState<RunListItem[]>([]);
+  const [runsError, setRunsError] = useState<string | null>(null);
+  const [runsLoading, setRunsLoading] = useState(false);
+  const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
+  const [runDetail, setRunDetail] = useState<RunDetail | null>(null);
+  const [runDetailError, setRunDetailError] = useState<string | null>(null);
+  const [runDetailLoading, setRunDetailLoading] = useState(false);
+  const [runActionMessage, setRunActionMessage] = useState<string | null>(null);
+  const [runActionError, setRunActionError] = useState<string | null>(null);
+  const [useRunScope, setUseRunScope] = useState(false);
 
   useEffect(() => {
     let mounted = true;
@@ -121,21 +139,73 @@ export default function HomePage() {
     }
   }, []);
 
+  const fetchRunsList = useCallback(async () => {
+    const token = getToken();
+    if (!token) {
+      setRunsError("Set a demo token first.");
+      setRuns([]);
+      return;
+    }
+    setRunsError(null);
+    setRunsLoading(true);
+    try {
+      const data = await listRuns();
+      setRuns(data);
+    } catch (err) {
+      setRuns([]);
+      setRunsError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setRunsLoading(false);
+    }
+  }, []);
+
+  const loadRunDetail = useCallback(async (runId: string) => {
+    setRunDetailError(null);
+    setRunDetailLoading(true);
+    try {
+      const data = await getRun(runId);
+      setRunDetail(data);
+    } catch (err) {
+      setRunDetail(null);
+      setRunDetailError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setRunDetailLoading(false);
+    }
+  }, []);
+
   useEffect(() => {
     if (hasToken) {
       void fetchDocsList();
+      void fetchRunsList();
     } else {
       setDocsList([]);
       setDocsData(null);
       setDocsError(null);
+      setRuns([]);
+      setRunsError(null);
+      setSelectedRunId(null);
+      setRunDetail(null);
+      setUseRunScope(false);
     }
-  }, [hasToken, fetchDocsList]);
+  }, [hasToken, fetchDocsList, fetchRunsList]);
 
   useEffect(() => {
     setSelectedDocs((prev) =>
       prev.filter((id) => docsList.some((doc) => doc.document_id === id)),
     );
   }, [docsList]);
+
+  useEffect(() => {
+    if (!selectedRunId) {
+      setRunDetail(null);
+      setRunDetailError(null);
+      setRunDetailLoading(false);
+      setUseRunScope(false);
+      return;
+    }
+    setUseRunScope((prev) => (prev ? prev : true));
+    void loadRunDetail(selectedRunId);
+  }, [selectedRunId, loadRunDetail]);
 
   const tokenStatus = useMemo(() => {
     if (!hasToken) {
@@ -154,6 +224,7 @@ export default function HomePage() {
     setHasToken(active);
     if (active) {
       void fetchDocsList();
+      void fetchRunsList();
     }
   };
 
@@ -162,6 +233,9 @@ export default function HomePage() {
     setTokenValue("");
     setHasToken(false);
     setSelectedDocs([]);
+    setSelectedRunId(null);
+    setRuns([]);
+    setRunDetail(null);
   };
 
   const toggleDocSelection = (documentId: string) => {
@@ -170,6 +244,15 @@ export default function HomePage() {
         ? prev.filter((id) => id !== documentId)
         : [...prev, documentId],
     );
+  };
+
+  const selectRun = (runId: string) => {
+    if (runId === selectedRunId) {
+      return;
+    }
+    setRunActionError(null);
+    setRunActionMessage(null);
+    setSelectedRunId(runId);
   };
 
   const handleFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
@@ -208,6 +291,44 @@ export default function HomePage() {
     }
   };
 
+  const handleCreateRun = async () => {
+    setRunActionError(null);
+    setRunActionMessage(null);
+    if (!getToken()) {
+      setRunActionError("Set a demo token before creating runs.");
+      return;
+    }
+    try {
+      const run = await createRun({ mode: askMode }, selectedDocs);
+      setRunActionMessage(`Run ${run.run_id} created.`);
+      await fetchRunsList();
+      setSelectedRunId(run.run_id);
+    } catch (err) {
+      setRunActionError(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const handleAttachDocs = async () => {
+    setRunActionError(null);
+    setRunActionMessage(null);
+    if (!selectedRunId) {
+      setRunActionError("Select a run before attaching documents.");
+      return;
+    }
+    if (selectedDocs.length === 0) {
+      setRunActionError("Select at least one document to attach.");
+      return;
+    }
+    try {
+      const detail = await attachDocsToRun(selectedRunId, selectedDocs);
+      setRunDetail(detail);
+      setRunActionMessage("Documents attached to run.");
+      await fetchRunsList();
+    } catch (err) {
+      setRunActionError(err instanceof Error ? err.message : String(err));
+    }
+  };
+
   const runAsk = async () => {
     setAskError(null);
     setAskResult(null);
@@ -219,13 +340,21 @@ export default function HomePage() {
       setAskError("Enter a question first.");
       return;
     }
+    if (useRunScope && !selectedRunId) {
+      setAskError("Select a run or disable run scope.");
+      return;
+    }
     setAskLoading(true);
     try {
-      const payload = {
+      const payload: Record<string, unknown> = {
         mode: askMode,
         question: askQuestion,
-        document_ids: selectedDocs.length > 0 ? selectedDocs : undefined,
       };
+      if (useRunScope && selectedRunId) {
+        payload.run_id = selectedRunId;
+      } else if (selectedDocs.length > 0) {
+        payload.document_ids = selectedDocs;
+      }
       const resp = await authFetch("/chat/ask", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -264,6 +393,84 @@ export default function HomePage() {
           <button onClick={saveToken}>Save</button>
           <button onClick={removeToken}>Clear</button>
         </div>
+      </section>
+      <section>
+        <h2>Runs</h2>
+        <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap" }}>
+          <button onClick={() => void fetchRunsList()} disabled={runsLoading}>
+            {runsLoading ? "Loading…" : "Fetch Runs"}
+          </button>
+          <button onClick={() => void handleCreateRun()}>Create Run</button>
+          {selectedRunId && (
+            <label style={{ display: "inline-flex", alignItems: "center", gap: "0.25rem" }}>
+              <input
+                type="checkbox"
+                checked={useRunScope}
+                onChange={(e) => setUseRunScope(e.target.checked)}
+              />
+              Ask using run scope (<code>{selectedRunId}</code>)
+            </label>
+          )}
+        </div>
+        {runsError && (
+          <p style={{ color: "#f87171" }}>
+            <strong>Runs error:</strong> {runsError}
+          </p>
+        )}
+        {runActionError && (
+          <p style={{ color: "#f97316" }}>
+            <strong>Run action error:</strong> {runActionError}
+          </p>
+        )}
+        {runActionMessage && (
+          <p style={{ color: "#4ade80" }}>{runActionMessage}</p>
+        )}
+        {runs.length > 0 ? (
+          <ul style={{ marginTop: "1rem" }}>
+            {runs.map((run) => (
+              <li key={run.run_id} style={{ marginBottom: "0.25rem" }}>
+                <button onClick={() => selectRun(run.run_id)}>
+                  {selectedRunId === run.run_id ? "Selected" : "Select"}
+                </button>{" "}
+                <code>{run.run_id}</code> – {run.status} ({run.document_ids.length} docs)
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <p style={{ marginTop: "1rem" }}>No runs yet.</p>
+        )}
+        {selectedRunId && (
+          <div style={{ marginTop: "1rem" }}>
+            <p>
+              <strong>Run detail:</strong>{" "}
+              <code>{selectedRunId}</code>
+            </p>
+            {runDetailLoading && <p>Loading run…</p>}
+            {runDetailError && (
+              <p style={{ color: "#f87171" }}>
+                <strong>Run detail error:</strong> {runDetailError}
+              </p>
+            )}
+            {runDetail && (
+              <>
+                <ul>
+                  <li>Status: {runDetail.status}</li>
+                  <li>Error: {runDetail.error || "none"}</li>
+                  <li>Documents: {runDetail.document_ids.join(", ") || "none"}</li>
+                </ul>
+                <button
+                  onClick={() => void handleAttachDocs()}
+                  disabled={selectedDocs.length === 0}
+                >
+                  Attach selected docs
+                </button>
+                <pre style={{ marginTop: "0.5rem", overflowX: "auto" }}>
+                  {JSON.stringify(runDetail, null, 2)}
+                </pre>
+              </>
+            )}
+          </div>
+        )}
       </section>
       {health ? (
         <section>
