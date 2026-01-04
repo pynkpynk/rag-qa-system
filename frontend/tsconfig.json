@@ -37,6 +37,8 @@
   ],
   "exclude": [
     "node_modules",
-    ".next"
+    ".next",
+    "vite_legacy",
+    "vite_legacy/**"
   ]
 }
