@@ -11,6 +11,7 @@ import {
   type RunDetail,
   type RunListItem,
 } from "../lib/runClient";
+import { getChunk, type ChunkDetail } from "../lib/chunkClient";
 
 type HealthResponse = {
   status: string;
@@ -79,6 +80,11 @@ export default function HomePage() {
   const [runActionMessage, setRunActionMessage] = useState<string | null>(null);
   const [runActionError, setRunActionError] = useState<string | null>(null);
   const [useRunScope, setUseRunScope] = useState(false);
+  const [chunkDetails, setChunkDetails] = useState<Record<string, ChunkDetail>>({});
+  const [chunkErrors, setChunkErrors] = useState<Record<string, string | null>>({});
+  const [chunkLoadingState, setChunkLoadingState] = useState<Record<string, boolean>>(
+    {},
+  );
 
   useEffect(() => {
     let mounted = true;
@@ -260,6 +266,41 @@ export default function HomePage() {
     setUploadFile(file);
   };
 
+  const copyText = async (text: string) => {
+    if (!text) {
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      // ignore clipboard errors (browser may block)
+    }
+  };
+
+  const fetchCitationChunk = async (chunkId: string) => {
+    if (!chunkId) {
+      return;
+    }
+    setChunkErrors((prev) => ({ ...prev, [chunkId]: null }));
+    setChunkLoadingState((prev) => ({ ...prev, [chunkId]: true }));
+    try {
+      const detail = await getChunk(chunkId);
+      setChunkDetails((prev) => ({ ...prev, [chunkId]: detail }));
+    } catch (err) {
+      setChunkDetails((prev) => {
+        const next = { ...prev };
+        delete next[chunkId];
+        return next;
+      });
+      setChunkErrors((prev) => ({
+        ...prev,
+        [chunkId]: err instanceof Error ? err.message : String(err),
+      }));
+    } finally {
+      setChunkLoadingState((prev) => ({ ...prev, [chunkId]: false }));
+    }
+  };
+
   const uploadDocument = async () => {
     setUploadError(null);
     setUploadResp(null);
@@ -327,6 +368,15 @@ export default function HomePage() {
     } catch (err) {
       setRunActionError(err instanceof Error ? err.message : String(err));
     }
+  };
+
+  const formatCitationLabel = (citation: ChatCitation, idx: number): string => {
+    const base = citation.source_id || `S${idx + 1}`;
+    const pagePart =
+      typeof citation.page === "number" && Number.isFinite(citation.page)
+        ? ` p.${citation.page}`
+        : "";
+    return `[${base}${pagePart}]`;
   };
 
   const runAsk = async () => {
@@ -609,13 +659,61 @@ export default function HomePage() {
               <p>No citations returned.</p>
             ) : (
               <ul>
-                {askResult.citations.map((c, idx) => (
-                  <li key={`${c.chunk_id || c.document_id || idx}`}>
-                    Source {c.source_id || idx + 1} – doc{" "}
-                    {c.document_id || "n/a"}, chunk {c.chunk_id || "n/a"}, page{" "}
-                    {c.page ?? "?"} {c.filename ? `(${c.filename})` : ""}
-                  </li>
-                ))}
+                {askResult.citations.map((c, idx) => {
+                  const chunkId = c.chunk_id || "";
+                  const detail = chunkId ? chunkDetails[chunkId] : undefined;
+                  const chunkLoading = chunkId
+                    ? chunkLoadingState[chunkId]
+                    : false;
+                  const chunkErr = chunkId ? chunkErrors[chunkId] : null;
+                  const label = formatCitationLabel(c, idx);
+                  return (
+                    <li key={`${chunkId || c.document_id || idx}`}>
+                      <p>
+                        {label}: doc {c.document_id || "n/a"}, chunk{" "}
+                        {chunkId || "n/a"}, page {c.page ?? "?"}{" "}
+                        {c.filename ? `(${c.filename})` : ""}
+                      </p>
+                      {chunkId && (
+                        <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap" }}>
+                          <button
+                            onClick={() => void fetchCitationChunk(chunkId)}
+                            disabled={chunkLoading}
+                          >
+                            {chunkLoading
+                              ? "Loading…"
+                              : detail
+                                ? "Refresh excerpt"
+                                : "Show excerpt"}
+                          </button>
+                          <button onClick={() => void copyText(chunkId)}>
+                            Copy chunk_id
+                          </button>
+                          <button onClick={() => void copyText(label)}>
+                            Copy label
+                          </button>
+                        </div>
+                      )}
+                      {chunkErr && (
+                        <p style={{ color: "#f87171" }}>
+                          <strong>Chunk error:</strong> {chunkErr}
+                        </p>
+                      )}
+                      {detail && chunkId === detail.chunk_id && (
+                        <pre
+                          style={{
+                            marginTop: "0.5rem",
+                            padding: "0.5rem",
+                            background: "#1e293b",
+                            borderRadius: "4px",
+                          }}
+                        >
+                          {detail.text}
+                        </pre>
+                      )}
+                    </li>
+                  );
+                })}
               </ul>
             )}
           </div>
