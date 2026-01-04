@@ -10,7 +10,7 @@ from sqlalchemy.pool import StaticPool
 from pydantic import SecretStr
 
 from app.main import app
-from app.db.models import Base, Document
+from app.db.models import Base, Document, Chunk, EMBEDDING_DIM
 from app.db.session import get_db
 from app.api.routes import docs as docs_module
 from app.core import config as config_module
@@ -55,6 +55,16 @@ def sqlite_docs_storage(monkeypatch: pytest.MonkeyPatch, tmp_path):
     local_dir.mkdir(parents=True, exist_ok=True)
     monkeypatch.setattr(docs_module, "LOCAL_STORAGE_DIR", local_dir)
     monkeypatch.setattr(docs_module, "index_document", lambda doc_id: None)
+    monkeypatch.setattr(
+        docs_module,
+        "extract_pdf_pages",
+        lambda path: [(1, "Sample PDF body for indexing tests.")],
+    )
+
+    def _fake_embed(texts: list[str]):
+        return [[0.0] * EMBEDDING_DIM for _ in texts]
+
+    monkeypatch.setattr(docs_module, "embed_texts", _fake_embed)
     monkeypatch.setenv("OPENAI_OFFLINE", "1")
     monkeypatch.setattr(
         config_module.settings,
@@ -81,6 +91,7 @@ def test_upload_and_view_local_storage(sqlite_docs_storage):
     )
     assert resp.status_code == 200
     payload = resp.json()
+    assert payload["status"] == "indexed"
     doc_id = payload["document_id"]
     stored_path = local_dir / f"{doc_id}.pdf"
     assert stored_path.exists()
@@ -110,15 +121,17 @@ def test_upload_marks_failed_when_openai_missing(
         headers=_dev_headers(),
         files={"file": ("sample.pdf", BytesIO(SAMPLE_PDF), "application/pdf")},
     )
-    assert resp.status_code == 200
+    assert resp.status_code == 503
     payload = resp.json()
-    assert payload["status"] == "failed"
+    assert payload["error"]["code"] == "UPLOAD_INDEX_FAILED"
+    assert payload["error"]["stage"] == "embed_chunks"
 
     with session_factory() as db:
-        doc = db.get(Document, payload["document_id"])
-        assert doc is not None
-        assert doc.status == "failed"
-        assert "INDEXING_DISABLED" in (doc.error or "")
+        docs = db.query(Document).all()
+        assert docs, "document record should still exist"
+        stored = docs[0]
+        assert stored.status == "error"
+        assert "INDEXING_DISABLED" in (stored.error or "")
 
 
 def test_upload_rejects_non_pdf_content_type(sqlite_docs_storage):
@@ -206,3 +219,124 @@ def test_upload_same_pdf_same_user_dedup(sqlite_docs_storage):
     data2 = resp2.json()
     assert data2["dedup"] is True
     assert data1["document_id"] == data2["document_id"]
+def test_upload_returns_structured_error_on_embedding_failure(
+    monkeypatch: pytest.MonkeyPatch, sqlite_docs_storage
+):
+    session_factory, _ = sqlite_docs_storage
+
+    def _boom(texts: list[str]):
+        raise RuntimeError("Embedding service unavailable")
+
+    monkeypatch.setattr(docs_module, "embed_texts", _boom)
+
+    sample_pdf = b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\nxref\n0 1\n0000000000 65535 f \ntrailer\n<<>>\nstartxref\n9\n%%EOF"
+
+    resp = client.post(
+        "/api/docs/upload",
+        headers=_dev_headers(),
+        files={"file": ("sample.pdf", BytesIO(sample_pdf), "application/pdf")},
+    )
+    assert resp.status_code == 500
+    body = resp.json()
+    assert body["error"]["code"] == "UPLOAD_INDEX_FAILED"
+    assert body["error"]["stage"] == "embed_chunks"
+    assert body["error"]["request_id"]
+
+    with session_factory() as db:
+        doc = db.query(Document).first()
+        assert doc is not None
+        assert doc.status == "error"
+        assert "embed_chunks" in (doc.error or "")
+
+
+def test_upload_skip_embedding_creates_text_only_chunks(
+    monkeypatch: pytest.MonkeyPatch, sqlite_docs_storage
+):
+    session_factory, _ = sqlite_docs_storage
+
+    def _should_not_embed(texts: list[str]):
+        raise AssertionError("embed_texts should not run when skip_embedding=1")
+
+    monkeypatch.setattr(docs_module, "embed_texts", _should_not_embed)
+
+    sample_pdf = b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\nxref\n0 1\n0000000000 65535 f \ntrailer\n<<>>\nstartxref\n9\n%%EOF"
+
+    resp = client.post(
+        "/api/docs/upload?skip_embedding=1",
+        headers=_dev_headers(),
+        files={"file": ("sample.pdf", BytesIO(sample_pdf), "application/pdf")},
+    )
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["status"] == "indexed_fts_only"
+
+    with session_factory() as db:
+        doc = db.get(Document, payload["document_id"])
+        assert doc is not None
+        assert doc.status == "indexed_fts_only"
+        chunks = db.query(Chunk).filter(Chunk.document_id == doc.id).all()
+        assert chunks
+        assert all(chunk.embedding is None for chunk in chunks)
+
+
+def test_upload_pdf_normalization_fallback(
+    monkeypatch: pytest.MonkeyPatch, sqlite_docs_storage
+):
+    session_factory, _ = sqlite_docs_storage
+    calls: list[str] = []
+
+    def _extract(path: str):
+        calls.append(path)
+        if "normalized" in path:
+            return [(1, "Normalized text")]
+        raise ValueError("broken pdf")
+
+    monkeypatch.setattr(docs_module, "extract_pdf_pages", _extract)
+    monkeypatch.setattr(docs_module, "_normalize_pdf_bytes", lambda raw: raw)
+
+    sample_pdf = b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\nxref\n0 1\n0000000000 65535 f \ntrailer\n<<>>\nstartxref\n9\n%%EOF"
+
+    resp = client.post(
+        "/api/docs/upload?skip_embedding=1",
+        headers=_dev_headers(),
+        files={"file": ("sample.pdf", BytesIO(sample_pdf), "application/pdf")},
+    )
+    assert resp.status_code == 200
+    assert any("normalized" in path for path in calls)
+    payload = resp.json()
+    with session_factory() as db:
+        doc = db.get(Document, payload["document_id"])
+        assert doc is not None
+        assert doc.status == "indexed_fts_only"
+
+
+def test_upload_returns_422_when_pdf_irrecoverable(
+    monkeypatch: pytest.MonkeyPatch, sqlite_docs_storage
+):
+    session_factory, _ = sqlite_docs_storage
+
+    def _extract(path: str):
+        raise ValueError("still broken")
+
+    def _norm(raw: bytes) -> bytes:
+        raise ValueError("normalize failed")
+
+    monkeypatch.setattr(docs_module, "extract_pdf_pages", _extract)
+    monkeypatch.setattr(docs_module, "_normalize_pdf_bytes", _norm)
+
+    sample_pdf = b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\nxref\n0 1\n0000000000 65535 f \ntrailer\n<<>>\nstartxref\n9\n%%EOF"
+
+    resp = client.post(
+        "/api/docs/upload?skip_embedding=1",
+        headers=_dev_headers(),
+        files={"file": ("sample.pdf", BytesIO(sample_pdf), "application/pdf")},
+    )
+    assert resp.status_code == 422
+    body = resp.json()
+    assert body["error"]["code"] == "UPLOAD_INDEX_FAILED"
+    assert body["error"]["stage"] == "extract_pdf_pages"
+
+    with session_factory() as db:
+        doc = db.query(Document).first()
+        assert doc is not None
+        assert doc.status == "error"

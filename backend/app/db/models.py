@@ -138,7 +138,7 @@ class Chunk(Base):
     chunk_index = Column(Integer, nullable=False)
     text = Column(Text, nullable=False)
 
-    embedding = Column(Vector(EMBEDDING_DIM), nullable=False)
+    embedding = Column(Vector(EMBEDDING_DIM), nullable=True)
 
     created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
 
