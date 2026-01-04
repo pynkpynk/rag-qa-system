@@ -705,7 +705,7 @@ def index_document(doc_id: str, *, skip_embedding: bool = False) -> None:
 )
 def upload_doc(
     request: Request,
-    background: BackgroundTasks,
+    _background: BackgroundTasks,
     file: UploadFile = File(...),
     skip_embedding: bool = Query(
         default=False, description="Skip vector embeddings for debugging."
@@ -718,10 +718,10 @@ def upload_doc(
     _require_pdf_content_type(file)
 
     request_id = _ensure_request_id(request)
-tmp_path = TMP_DIR / f"tmp_{uuid.uuid4().hex}_{filename}"
-cleanup_path: Path | None = tmp_path
-doc: Document | None = None
-processing_path: Path = tmp_path
+    tmp_path = TMP_DIR / f"tmp_{uuid.uuid4().hex}_{filename}"
+    cleanup_path: Path | None = tmp_path
+    doc: Document | None = None
+    processing_path: Path = tmp_path
 
     try:
         try:
