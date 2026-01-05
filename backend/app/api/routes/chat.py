@@ -24,7 +24,7 @@ from app.core.output_contract import sanitize_nonfinite_floats
 from app.core.run_access import ensure_run_access
 from app.core.text_utils import strip_control_chars
 from app.db.hybrid_search import HybridHit, HybridMeta, hybrid_search_chunks_rrf
-from app.db.models import Run, Document
+from app.db.models import Run, Document, Chunk
 from app.db.session import get_db
 from app.schemas.api_contract import ChatAskResponse
 
@@ -367,6 +367,22 @@ def should_use_trgm(text: str, *, trgm_available: bool | None = None) -> bool:
             True if _TRGM_AVAILABLE_FLAG is None else bool(_TRGM_AVAILABLE_FLAG)
         )
     return bool(trgm_available) and query_class(t) == "cjk"
+
+
+EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+
+
+def question_targets_email(text: str | None) -> bool:
+    if not text:
+        return False
+    lowered = text.lower()
+    if "email" in lowered or "e-mail" in lowered:
+        return True
+    if "support email" in lowered:
+        return True
+    if "contact" in lowered:
+        return True
+    return "@" in text
 
 
 def _split_trgm_terms(q: str, max_terms: int = 8) -> list[str]:
@@ -1172,6 +1188,10 @@ def fetch_chunks(
     is_cjk_query = qc == "cjk"
     use_fts = should_use_fts(q_text)
     use_trgm_flag = should_use_trgm(q_text, trgm_available=trgm_available)
+    email_query = question_targets_email(question)
+    offline_mode = is_openai_offline()
+    if email_query and trgm_available:
+        use_trgm_flag = True
     debug: dict[str, Any] | None = None
     force_admin_hybrid = bool(admin_debug_hybrid and is_admin(p))
 
@@ -1198,6 +1218,24 @@ def fetch_chunks(
             continue
         seen_docs.add(cleaned)
         doc_scope.append(cleaned)
+    email_doc_scope = bool(email_query and doc_scope)
+    if offline_mode and trgm_available and doc_scope:
+        use_trgm_flag = True
+    if email_doc_scope:
+        use_trgm_flag = True
+    q_trgm_text = q_text or (question or "")
+    if email_query:
+        lower_q = (question or "").lower()
+        if "support" in lower_q:
+            q_trgm_text = "support"
+        elif "contact" in lower_q:
+            q_trgm_text = "contact"
+        else:
+            q_trgm_text = "email"
+    if not q_trgm_text:
+        q_trgm_text = q_text or (question or "")
+    if email_doc_scope and trgm_available:
+        use_trgm_flag = True
 
     summary_intent = _is_summary_question(question)
     if force_admin_hybrid:
@@ -1342,15 +1380,30 @@ def fetch_chunks(
 
     owner_sub_for_query = None if is_admin(p) else getattr(p, "sub", None)
     allow_all_without_owner = bool(is_admin(p) and not doc_scope)
+    use_trgm_flag = bool(use_trgm_flag)
     use_fts_final = bool(use_fts and (ENABLE_HYBRID or force_admin_hybrid))
-    use_trgm_final = bool(use_trgm_flag and ENABLE_TRGM)
-    fts_skipped = not use_fts_final
+    use_trgm_final = bool(use_trgm_flag and ENABLE_TRGM and trgm_available)
     vec_k = HYBRID_VEC_K if (ENABLE_HYBRID or force_admin_hybrid) else max(k, 1)
     fts_k = HYBRID_FTS_K if use_fts_final else 0
     trgm_k = TRGM_K if use_trgm_final else 0
+    if email_doc_scope:
+        use_fts_final = False
+        fts_k = 0
+        vec_k = 0
+    fts_skipped = not use_fts_final
     trgm_patterns = (
         [f"%{term}%" for term in _split_trgm_terms(q_text)] if use_trgm_final else []
     )
+    if use_trgm_final and email_query:
+        required_patterns = ["%@%"]
+        lower_q = (question or "").lower()
+        if "support" in lower_q:
+            required_patterns.append("%support%")
+        if "contact" in lower_q:
+            required_patterns.append("%contact%")
+        for pattern in required_patterns:
+            if pattern not in trgm_patterns:
+                trgm_patterns.append(pattern)
     strategy = "hybrid_rrf_all_docs_admin" if is_admin(p) else "hybrid_rrf_all_docs_user"
     if run_id:
         strategy = (
@@ -1367,6 +1420,7 @@ def fetch_chunks(
             document_ids=doc_scope if doc_scope else None,
             query_text=q_text,
             query_embedding=qvec_values,
+            q_trgm=q_trgm_text if use_trgm_final else None,
             top_k=k,
             fts_k=fts_k,
             vec_k=vec_k,
@@ -2333,6 +2387,7 @@ def ask(
     retrieval_debug_raw: dict[str, Any] | None = None
     run: Run | None = None
     doc_scope: list[str] = []
+    direct_email_result: dict[str, Any] | None = None
 
     effective_run_id = payload.run_id
 
@@ -2442,6 +2497,7 @@ def ask(
             run.t0 = _utcnow()
             db.commit()
 
+        email_query_selected = False
         if not summary_mode:
             if (
                 REJECT_AMBIGUOUS_REFERENCE_WITHOUT_RUN
@@ -2470,22 +2526,32 @@ def ask(
                     ),
                 )
 
-            qvec = embed_query(q_clean)
-            qvec_lit = to_pgvector_literal(qvec)
+            email_query_selected = bool(doc_scope and question_targets_email(q_clean))
+            if email_query_selected:
+                direct_email_result = _retrieve_selected_docs_email_answer(
+                    db, doc_scope, p, payload.question
+                )
 
-            rows, retrieval_debug_raw = fetch_chunks(
-                db,
-                qvec_lit=qvec_lit,
-                qvec_list=qvec,
-                q_text=q_clean,
-                k=payload.k,
-                run_id=effective_run_id,
-                document_ids=doc_scope,
-                p=p,
-                question=payload.question,
-                trgm_available=trgm_available_flag,
-                admin_debug_hybrid=force_admin_hybrid,
-            )
+            if direct_email_result is None:
+                qvec = embed_query(q_clean)
+                qvec_lit = to_pgvector_literal(qvec)
+
+                rows, retrieval_debug_raw = fetch_chunks(
+                    db,
+                    qvec_lit=qvec_lit,
+                    qvec_list=qvec,
+                    q_text=q_clean,
+                    k=payload.k,
+                    run_id=effective_run_id,
+                    document_ids=doc_scope,
+                    p=p,
+                    question=payload.question,
+                    trgm_available=trgm_available_flag,
+                    admin_debug_hybrid=force_admin_hybrid,
+                )
+            else:
+                rows = direct_email_result["rows"]
+                retrieval_debug_raw = {"strategy": "selected_docs_email"}
         else:
             rows, retrieval_debug_raw = fetch_summary_chunks(
                 db,
@@ -2577,7 +2643,7 @@ def ask(
             allowed_ids = {s["source_id"] for s in sources}
 
         # 2) retrieval信頼度ゲート（summary以外）
-        if rows and not offline_mode and not summary_request:
+        if rows and not offline_mode and not summary_request and direct_email_result is None:
             best = _best_vec_dist(rows)
             fts_count = int((retrieval_debug_raw or {}).get("fts_count", 0) or 0)
             if best is not None and float(best) > VEC_MAX_COS_DIST and fts_count == 0:
@@ -2703,34 +2769,42 @@ def ask(
             )
             return ChatAskResponse(**resp).model_dump(exclude_none=True)
 
-        model, gen = get_model_and_gen_from_run(run)
+        if direct_email_result is None:
+            model, gen = get_model_and_gen_from_run(run)
 
-        if run:
-            run.t1 = _utcnow()
-            db.commit()
+            if run:
+                run.t1 = _utcnow()
+                db.commit()
 
-        if offline_mode:
-            answer, used_ids = _offline_answer_from_rows(
-                rows, sources, summary_hint=summary_request
-            )
-        else:
-            try:
-                llm_called = True
-                answer, used_ids = answer_with_contract(
-                    model, gen, payload.question, context, allowed_ids
-                )
-            except Exception as exc:
-                llm_error = type(exc).__name__
-                logger.exception(
-                    "answer_with_contract_failed", extra={"request_id": req_id}
-                )
+            if offline_mode:
                 answer, used_ids = _offline_answer_from_rows(
                     rows, sources, summary_hint=summary_request
                 )
+            else:
+                try:
+                    llm_called = True
+                    answer, used_ids = answer_with_contract(
+                        model, gen, payload.question, context, allowed_ids
+                    )
+                except Exception as exc:
+                    llm_error = type(exc).__name__
+                    logger.exception(
+                        "answer_with_contract_failed", extra={"request_id": req_id}
+                    )
+                    answer, used_ids = _offline_answer_from_rows(
+                        rows, sources, summary_hint=summary_request
+                    )
 
-        if run:
-            run.t2 = _utcnow()
-            db.commit()
+            if run:
+                run.t2 = _utcnow()
+                db.commit()
+        else:
+            answer = direct_email_result["answer"]
+            used_ids = list(direct_email_result["used_source_ids"])
+            if run:
+                now = _utcnow()
+                run.t1 = run.t2 = run.t3 = now
+                db.commit()
 
         used_sources = filter_sources(sources, used_ids)
         guardrail_reason = None
@@ -2882,3 +2956,57 @@ def ask(
             status_code=500,
             detail=detail,
         )
+def _retrieve_selected_docs_email_answer(
+    db: Session, doc_ids: list[str], principal: Principal, question: str
+) -> dict[str, Any] | None:
+    lower_q = (question or "").lower()
+    stmt = (
+        select(
+            Chunk.id.label("id"),
+            Chunk.document_id,
+            Chunk.page,
+            Chunk.chunk_index,
+            Chunk.text,
+            Document.filename,
+        )
+        .join(Document, Document.id == Chunk.document_id)
+        .where(Chunk.document_id.in_(doc_ids))
+        .where(Chunk.text.ilike("%@%"))
+    )
+    if not is_admin(principal):
+        stmt = stmt.where(Document.owner_sub == principal.sub)
+    if "support" in lower_q:
+        stmt = stmt.where(Chunk.text.ilike("%support%"))
+    elif "contact" in lower_q:
+        stmt = stmt.where(Chunk.text.ilike("%contact%"))
+    stmt = stmt.order_by(
+        Chunk.page.asc().nulls_last(), Chunk.chunk_index.asc(), Chunk.id.asc()
+    ).limit(50)
+    rows = db.execute(stmt).mappings().all()
+    for row in rows:
+        chunk_text = row.get("text") or ""
+        match = EMAIL_RE.search(chunk_text)
+        if not match:
+            continue
+        email = match.group(0)
+        row_dict = {
+            "id": row["id"],
+            "document_id": row["document_id"],
+            "page": row["page"],
+            "chunk_index": row["chunk_index"],
+            "text": chunk_text,
+            "filename": row.get("filename"),
+            "score": 1.0,
+            "rank_vec": None,
+            "rank_fts": None,
+            "rank_trgm": None,
+            "vec_distance": None,
+        }
+        prefix = "support email" if "support" in lower_q else "contact email"
+        answer = f"The {prefix} is {email}."
+        return {
+            "rows": [row_dict],
+            "answer": answer,
+            "used_source_ids": {"S1"},
+        }
+    return None
