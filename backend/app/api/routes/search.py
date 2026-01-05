@@ -8,11 +8,14 @@ from typing import Any, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
-from app.core.authz import Principal, require_permissions
+from app.core.authz import Principal, is_admin, require_permissions
+from app.core.text_utils import strip_control_chars
+from app.db.hybrid_search import hybrid_search_chunks_rrf
 from app.db.session import get_db
+from app.db.models import Document
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -137,10 +140,6 @@ def _embed_query(q: str) -> List[float]:
     return emb
 
 
-def _to_pgvector_literal(vec: List[float]) -> str:
-    return "[" + ",".join(f"{float(x):.10f}" for x in vec) + "]"
-
-
 def _get_default_max_vec_distance() -> Optional[float]:
     v = (os.getenv("SEARCH_DEFAULT_MAX_VEC_DISTANCE") or "").strip()
     if not v:
@@ -205,200 +204,33 @@ def _auto_trgm_limit(q: str, requested: float) -> float:
     return max(0.0, min(1.0, lim))
 
 
-# ----------------------------
-# Hybrid SQL (FTS + Vec + Trgm + RRF)
-# ----------------------------
-_HYBRID_SQL = """
-WITH
-params AS (
-  SELECT
-    websearch_to_tsquery('simple', :q) AS tsq,
-    CAST(:qvec AS vector) AS qvec,
-    CAST(:rrf_k AS int) AS rrf_k,
-    CAST(:trgm_enabled AS boolean) AS trgm_enabled,
-    -- IMPORTANT: set pg_trgm threshold locally for this statement
-    set_config('pg_trgm.similarity_threshold', CAST(:trgm_limit AS text), true) AS _trgm_limit_set
-),
-fts AS (
-  SELECT
-    c.id AS chunk_id,
-    row_number() OVER (ORDER BY ts_rank_cd(c.fts, p.tsq) DESC) AS rnk
-  FROM chunks c
-  JOIN documents d ON d.id = c.document_id
-  CROSS JOIN params p
-  WHERE
-    (
-      d.owner_sub = :owner_sub
-      OR (
-        CAST(:owner_sub_alt AS text) IS NOT NULL
-        AND d.owner_sub = CAST(:owner_sub_alt AS text)
-      )
-    )
-    AND (
-      :use_doc_filter = false
-      OR CAST(c.document_id AS text) = ANY(CAST(:doc_ids AS text[]))
-    )
-    AND c.fts @@ p.tsq
-  ORDER BY ts_rank_cd(c.fts, p.tsq) DESC
-  LIMIT :k_fts
-),
-vec AS (
-  SELECT
-    c.id AS chunk_id,
-    row_number() OVER (ORDER BY (c.embedding <=> p.qvec) ASC) AS rnk,
-    (c.embedding <=> p.qvec) AS dist
-  FROM chunks c
-  JOIN documents d ON d.id = c.document_id
-  CROSS JOIN params p
-  WHERE
-    (
-      d.owner_sub = :owner_sub
-      OR (
-        CAST(:owner_sub_alt AS text) IS NOT NULL
-        AND d.owner_sub = CAST(:owner_sub_alt AS text)
-      )
-    )
-    AND (
-      :use_doc_filter = false
-      OR CAST(c.document_id AS text) = ANY(CAST(:doc_ids AS text[]))
-    )
-    AND c.embedding IS NOT NULL
-  ORDER BY (c.embedding <=> p.qvec) ASC
-  LIMIT :k_vec
-),
-trgm AS (
-  SELECT
-    c.id AS chunk_id,
-    row_number() OVER (ORDER BY similarity(c.text, :q) DESC) AS rnk,
-    similarity(c.text, :q) AS sim
-  FROM chunks c
-  JOIN documents d ON d.id = c.document_id
-  CROSS JOIN params p
-  WHERE
-    p.trgm_enabled = true
-    AND (
-      d.owner_sub = :owner_sub
-      OR (
-        CAST(:owner_sub_alt AS text) IS NOT NULL
-        AND d.owner_sub = CAST(:owner_sub_alt AS text)
-      )
-    )
-    AND (
-      :use_doc_filter = false
-      OR CAST(c.document_id AS text) = ANY(CAST(:doc_ids AS text[]))
-    )
-    -- Reduce junk: require at least one term literal-hit (pg_trgm GIN can accelerate ILIKE)
-    AND (
-      cardinality(CAST(:trgm_like_patterns AS text[])) = 0
-      OR c.text ILIKE ANY(CAST(:trgm_like_patterns AS text[]))
-    )
-    -- Now apply similarity operator (%) with locally-set threshold
-    AND c.text % :q
-  ORDER BY similarity(c.text, :q) DESC
-  LIMIT :k_trgm
-),
-rrf AS (
-  SELECT
-    chunk_id,
-    SUM(1.0 / ((SELECT rrf_k FROM params) + rnk)) AS score
-  FROM (
-    SELECT chunk_id, rnk FROM fts
-    UNION ALL
-    SELECT chunk_id, rnk FROM vec
-    UNION ALL
-    SELECT chunk_id, rnk FROM trgm
-  ) s
-  GROUP BY chunk_id
-),
-picked AS (
-  SELECT
-    c.id AS chunk_id,
-    c.document_id,
-    c.page,
-    c.chunk_index,
-    c.text,
-    r.score,
-    vf.dist AS vec_distance,
-    ff.rnk AS fts_rank,
-    vf.rnk AS vec_rank,
-    tf.rnk AS trgm_rank,
-    tf.sim AS trgm_sim
-  FROM rrf r
-  JOIN chunks c ON c.id = r.chunk_id
-  LEFT JOIN vec vf ON vf.chunk_id = c.id
-  LEFT JOIN fts ff ON ff.chunk_id = c.id
-  LEFT JOIN trgm tf ON tf.chunk_id = c.id
-  ORDER BY r.score DESC
-  LIMIT :limit
-),
-meta AS (
-  SELECT
-    (SELECT count(*) FROM fts) AS fts_count,
-    (SELECT count(*) FROM vec) AS vec_count,
-    (SELECT count(*) FROM trgm) AS trgm_count,
-    (SELECT min(dist) FROM vec) AS vec_min_distance,
-    (SELECT max(dist) FROM vec) AS vec_max_distance,
-    (SELECT avg(dist) FROM vec) AS vec_avg_distance,
-    (SELECT min(sim) FROM trgm) AS trgm_min_sim,
-    (SELECT max(sim) FROM trgm) AS trgm_max_sim,
-    (SELECT avg(sim) FROM trgm) AS trgm_avg_sim
-)
-SELECT
-  p.chunk_id, p.document_id, p.page, p.chunk_index, p.text, p.score,
-  p.vec_distance, p.fts_rank, p.vec_rank, p.trgm_rank, p.trgm_sim,
-  m.fts_count, m.vec_count, m.trgm_count,
-  m.vec_min_distance, m.vec_max_distance, m.vec_avg_distance,
-  m.trgm_min_sim, m.trgm_max_sim, m.trgm_avg_sim
-FROM meta m
-LEFT JOIN picked p ON true;
-"""
+def _ensure_document_scope(
+    db: Session, document_ids: list[str], principal: Principal
+) -> list[str]:
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for raw in document_ids or []:
+        doc_id = (raw or "").strip()
+        if not doc_id or doc_id in seen:
+            continue
+        seen.add(doc_id)
+        cleaned.append(doc_id)
+    if not cleaned:
+        raise HTTPException(
+            status_code=422, detail="document_ids must contain at least one id."
+        )
 
+    stmt = select(Document.id).where(Document.id.in_(cleaned))
+    if not is_admin(principal):
+        if not principal.sub:
+            raise HTTPException(status_code=404, detail="document not found")
+        stmt = stmt.where(Document.owner_sub == principal.sub)
 
-def _extract_meta(
-    rows: list[dict[str, Any]],
-) -> tuple[
-    int,
-    int,
-    int,
-    Optional[float],
-    Optional[float],
-    Optional[float],
-    Optional[float],
-    Optional[float],
-    Optional[float],
-]:
-    r0 = rows[0] if rows else {}
-    fts_count = int(r0.get("fts_count") or 0)
-    vec_count = int(r0.get("vec_count") or 0)
-    trgm_count = int(r0.get("trgm_count") or 0)
-
-    vmin = r0.get("vec_min_distance")
-    vmax = r0.get("vec_max_distance")
-    vavg = r0.get("vec_avg_distance")
-
-    tmin = r0.get("trgm_min_sim")
-    tmax = r0.get("trgm_max_sim")
-    tavg = r0.get("trgm_avg_sim")
-
-    vec_min = float(vmin) if vmin is not None else None
-    vec_max = float(vmax) if vmax is not None else None
-    vec_avg = float(vavg) if vavg is not None else None
-
-    trgm_min = float(tmin) if tmin is not None else None
-    trgm_max = float(tmax) if tmax is not None else None
-    trgm_avg = float(tavg) if tavg is not None else None
-
-    return (
-        fts_count,
-        vec_count,
-        trgm_count,
-        vec_min,
-        vec_max,
-        vec_avg,
-        trgm_min,
-        trgm_max,
-        trgm_avg,
-    )
+    rows = [row[0] for row in db.execute(stmt)]
+    missing = [doc_id for doc_id in cleaned if doc_id not in rows]
+    if missing:
+        raise HTTPException(status_code=404, detail="document not found")
+    return cleaned
 
 
 @router.post("/search", response_model=SearchResponse)
@@ -412,10 +244,13 @@ def search(
         raise HTTPException(status_code=422, detail="q must not be empty")
 
     doc_ids_list = req.document_ids or []
-    if req.mode == SearchMode.selected_docs and not doc_ids_list:
-        raise HTTPException(
-            status_code=422, detail="document_ids is required when mode=selected_docs"
-        )
+    if req.mode == SearchMode.selected_docs:
+        if not doc_ids_list:
+            raise HTTPException(
+                status_code=422,
+                detail="document_ids is required when mode=selected_docs",
+            )
+        doc_ids_list = _ensure_document_scope(db, doc_ids_list, p)
 
     use_doc_filter = bool(doc_ids_list)
 
@@ -426,7 +261,6 @@ def search(
     # embedding
     try:
         qvec_list = _embed_query(q)
-        qvec = _to_pgvector_literal(qvec_list)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Embedding error: {e}")
 
@@ -437,23 +271,6 @@ def search(
     used_trgm_limit = _auto_trgm_limit(q, req.trgm_limit)
     q_terms = _split_terms(q)
     trgm_like_patterns = [f"%{t}%" for t in q_terms]  # ILIKE ANY patterns
-
-    params: dict[str, Any] = {
-        "q": q,
-        "qvec": qvec,
-        "rrf_k": req.rrf_k,
-        "owner_sub": owner_sub_used,
-        "owner_sub_alt": owner_sub_alt,
-        "use_doc_filter": use_doc_filter,
-        "doc_ids": doc_ids_list,  # always list
-        "k_fts": req.k_fts,
-        "k_vec": req.k_vec,
-        "k_trgm": req.k_trgm,
-        "limit": req.limit,
-        "trgm_enabled": trgm_enabled,
-        "trgm_limit": used_trgm_limit,
-        "trgm_like_patterns": trgm_like_patterns,
-    }
 
     debug_enabled = req.debug or (os.getenv("SEARCH_DEBUG") == "1")
 
@@ -474,28 +291,56 @@ def search(
             pass
 
     try:
-        rows = db.execute(text(_HYBRID_SQL), params).mappings().all()
-        rows_list = [dict(r) for r in rows]
-    except Exception as e:
-        logger.exception("search sql failed")
-        raise HTTPException(
-            status_code=500, detail=f"Search SQL error: {type(e).__name__}: {e}"
+        hits_raw, meta = hybrid_search_chunks_rrf(
+            db,
+            owner_sub=owner_sub_used,
+            owner_sub_alt=owner_sub_alt,
+            document_ids=doc_ids_list if use_doc_filter else None,
+            query_text=q,
+            query_embedding=qvec_list,
+            top_k=req.limit,
+            fts_k=req.k_fts,
+            vec_k=req.k_vec,
+            rrf_k=req.rrf_k,
+            trgm_k=req.k_trgm if trgm_enabled else 0,
+            trgm_limit=used_trgm_limit,
+            trgm_like_patterns=trgm_like_patterns,
+            use_fts=True,
+            use_trgm=trgm_enabled,
+            allow_all_without_owner=is_admin(p),
         )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        logger.exception("hybrid search failed")
+        raise HTTPException(status_code=500, detail=f"Search error: {exc}")
 
-    # meta is always present as 1 row (even if no hits)
-    (
-        fts_count,
-        vec_count,
-        trgm_count,
-        vec_min,
-        vec_max,
-        vec_avg,
-        trgm_min,
-        trgm_max,
-        trgm_avg,
-    ) = _extract_meta(rows_list)
+    hit_rows = [
+        {
+            "chunk_id": hit.chunk_id,
+            "document_id": hit.document_id,
+            "page": hit.page,
+            "chunk_index": hit.chunk_index,
+            "text": strip_control_chars(hit.text),
+            "score": hit.score,
+            "vec_distance": hit.vec_distance,
+            "fts_rank": hit.rank_fts,
+            "vec_rank": hit.rank_vec,
+            "trgm_rank": hit.rank_trgm,
+            "trgm_sim": hit.trgm_sim,
+        }
+        for hit in hits_raw
+    ]
 
-    hit_rows = [r for r in rows_list if r.get("chunk_id") is not None]
+    fts_count = meta.fts_count
+    vec_count = meta.vec_count
+    trgm_count = meta.trgm_count
+    vec_min = meta.vec_min_distance
+    vec_max = meta.vec_max_distance
+    vec_avg = meta.vec_avg_distance
+    trgm_min = meta.trgm_min_sim
+    trgm_max = meta.trgm_max_sim
+    trgm_avg = meta.trgm_avg_sim
 
     present_sources = int(fts_count > 0) + int(vec_count > 0) + int(trgm_count > 0)
 
@@ -531,7 +376,7 @@ def search(
                 used_min_score=used_min_score,
                 used_max_vec_distance=used_max_vec_distance,
                 used_use_doc_filter=use_doc_filter,
-                used_k_trgm=req.k_trgm,
+                used_k_trgm=req.k_trgm if trgm_enabled else 0,
                 used_trgm_limit=used_trgm_limit,
             )
             if debug_enabled
@@ -573,7 +418,7 @@ def search(
                 used_min_score=used_min_score,
                 used_max_vec_distance=used_max_vec_distance,
                 used_use_doc_filter=use_doc_filter,
-                used_k_trgm=req.k_trgm,
+                used_k_trgm=req.k_trgm if trgm_enabled else 0,
                 used_trgm_limit=used_trgm_limit,
             )
             if debug_enabled
@@ -623,7 +468,7 @@ def search(
             used_min_score=used_min_score,
             used_max_vec_distance=used_max_vec_distance,
             used_use_doc_filter=use_doc_filter,
-            used_k_trgm=req.k_trgm,
+            used_k_trgm=req.k_trgm if trgm_enabled else 0,
             used_trgm_limit=used_trgm_limit,
         )
         if debug_enabled

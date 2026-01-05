@@ -19,12 +19,14 @@ from sqlalchemy.orm import Session
 
 from app.core.authz import Principal, is_admin, require_permissions, effective_auth_mode
 from app.core.config import settings
-from app.core.run_access import ensure_run_access
+from app.core.llm_status import is_openai_offline, is_llm_enabled
 from app.core.output_contract import sanitize_nonfinite_floats
+from app.core.run_access import ensure_run_access
+from app.core.text_utils import strip_control_chars
+from app.db.hybrid_search import HybridHit, HybridMeta, hybrid_search_chunks_rrf
 from app.db.models import Run, Document
 from app.db.session import get_db
-from app.schemas.api_contract import ChatResponse
-from app.core.llm_status import is_openai_offline, is_llm_enabled
+from app.schemas.api_contract import ChatAskResponse
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -365,6 +367,39 @@ def should_use_trgm(text: str, *, trgm_available: bool | None = None) -> bool:
             True if _TRGM_AVAILABLE_FLAG is None else bool(_TRGM_AVAILABLE_FLAG)
         )
     return bool(trgm_available) and query_class(t) == "cjk"
+
+
+def _split_trgm_terms(q: str, max_terms: int = 8) -> list[str]:
+    parts = [p.strip() for p in re.split(r"\s+", q or "") if p.strip()]
+    parts = [p for p in parts if len(p) >= 2]
+    out: list[str] = []
+    seen: set[str] = set()
+    for p in parts:
+        if p in seen:
+            continue
+        seen.add(p)
+        out.append(p)
+        if len(out) >= max_terms:
+            break
+    return out
+
+
+def _parse_pgvector_literal(lit: str | None) -> list[float]:
+    if not lit:
+        return []
+    raw = lit.strip()
+    if raw.startswith("[") and raw.endswith("]"):
+        raw = raw[1:-1]
+    values: list[float] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            values.append(float(part))
+        except ValueError:
+            continue
+    return values
 
 
 def get_bearer_token(request: Request | None) -> str | None:
@@ -914,6 +949,22 @@ WHERE rd.run_id = :run_id
   AND d.owner_sub = :owner_sub
 """
 
+SQL_RUN_DOC_IDS_ADMIN = """
+SELECT document_id
+FROM run_documents
+WHERE run_id = :run_id
+ORDER BY document_id
+"""
+
+SQL_RUN_DOC_IDS_USER = """
+SELECT rd.document_id
+FROM run_documents rd
+JOIN documents d ON d.id = rd.document_id
+WHERE rd.run_id = :run_id
+  AND d.owner_sub = :owner_sub
+ORDER BY rd.document_id
+"""
+
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
@@ -991,6 +1042,109 @@ def _best_vec_dist(rows: list[dict[str, Any]]) -> float | None:
     return min(dists) if dists else None
 
 
+def _list_run_document_ids(db: Session, run_id: str, p: Principal) -> list[str]:
+    params = {"run_id": run_id}
+    if is_admin(p):
+        sql = sql_text(SQL_RUN_DOC_IDS_ADMIN)
+    else:
+        sql = sql_text(SQL_RUN_DOC_IDS_USER)
+        params["owner_sub"] = p.sub
+    rows = db.execute(sql, params).mappings().all()
+    doc_ids = [str(row["document_id"]) for row in rows if row.get("document_id")]
+    if not doc_ids:
+        raise HTTPException(
+            status_code=400,
+            detail="This run_id has no attached documents. Attach docs first.",
+        )
+    return doc_ids
+
+
+def _hybrid_hits_to_rows(hits: list[HybridHit]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for hit in hits:
+        rows.append(
+            {
+                "id": hit.chunk_id,
+                "document_id": hit.document_id,
+                "filename": hit.filename,
+                "page": hit.page,
+                "chunk_index": hit.chunk_index,
+                "text": strip_control_chars(hit.text),
+                "dist": hit.vec_distance,
+            }
+        )
+    return rows
+
+
+def _preview_hits_by_rank(
+    hits: list[HybridHit], *, attr: str
+) -> list[dict[str, Any]]:
+    ranked: list[tuple[int, dict[str, Any]]] = []
+    for hit in hits:
+        rank = getattr(hit, attr, None)
+        if rank is None:
+            continue
+        ranked.append(
+            (
+                int(rank),
+                {
+                    "filename": hit.filename,
+                    "page": hit.page,
+                    "chunk_index": hit.chunk_index,
+                    "dist": hit.vec_distance,
+                },
+            )
+        )
+    ranked.sort(key=lambda item: item[0])
+    rows = [entry for _, entry in ranked]
+    return _preview(rows) if rows else []
+
+
+def _build_hybrid_debug(
+    *,
+    base_debug: dict[str, Any] | None,
+    strategy: str,
+    requested_k: int,
+    hits: list[HybridHit],
+    rows: list[dict[str, Any]],
+    meta: HybridMeta,
+    use_fts: bool,
+    use_trgm: bool,
+    trgm_available: bool,
+    fts_skipped: bool,
+) -> dict[str, Any] | None:
+    if base_debug is None:
+        return None
+    debug = dict(base_debug)
+    debug.update(
+        {
+            "strategy": strategy,
+            "requested_k": requested_k,
+            "vec_count": int(meta.vec_count),
+            "fts_count": int(meta.fts_count),
+            "trgm_count": int(meta.trgm_count),
+            "merged_count": len(rows),
+            "used_fts": bool(meta.fts_count and use_fts),
+            "used_trgm": bool(meta.trgm_count and use_trgm),
+            "fts_skipped": bool(fts_skipped),
+            "trgm_available": bool(trgm_available),
+            "vec_best_dist": meta.vec_min_distance,
+        }
+    )
+    if rows:
+        debug["merged_top5"] = _preview(rows)
+    vec_preview = _preview_hits_by_rank(hits, attr="rank_vec")
+    if vec_preview:
+        debug["vec_top5"] = vec_preview
+    fts_preview = _preview_hits_by_rank(hits, attr="rank_fts")
+    if fts_preview:
+        debug["fts_top5"] = fts_preview
+    trgm_preview = _preview_hits_by_rank(hits, attr="rank_trgm")
+    if trgm_preview:
+        debug["trgm_top5"] = trgm_preview
+    return debug
+
+
 def fetch_chunks(
     db: Session,
     qvec_lit: str,
@@ -1003,13 +1157,21 @@ def fetch_chunks(
     *,
     trgm_available: bool,
     admin_debug_hybrid: bool = False,
+    qvec_list: list[float] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
     q_text = (q_text or "").strip()
+    qvec_values = list(qvec_list or [])
+    if not qvec_values:
+        qvec_values = _parse_pgvector_literal(qvec_lit)
+    if not qvec_values:
+        raise HTTPException(
+            status_code=500, detail="Failed to embed question for retrieval."
+        )
 
     qc = query_class(q_text)
     is_cjk_query = qc == "cjk"
     use_fts = should_use_fts(q_text)
-    use_trgm = should_use_trgm(q_text, trgm_available=trgm_available)
+    use_trgm_flag = should_use_trgm(q_text, trgm_available=trgm_available)
     debug: dict[str, Any] | None = None
     force_admin_hybrid = bool(admin_debug_hybrid and is_admin(p))
 
@@ -1027,7 +1189,16 @@ def fetch_chunks(
         }
         if not use_fts:
             debug["fts_skip_reason"] = "cjk"
-    doc_scope = list(document_ids or [])
+
+    doc_scope: list[str] = []
+    seen_docs: set[str] = set()
+    for raw_id in document_ids or []:
+        cleaned = (raw_id or "").strip()
+        if not cleaned or cleaned in seen_docs:
+            continue
+        seen_docs.add(cleaned)
+        doc_scope.append(cleaned)
+
     summary_intent = _is_summary_question(question)
     if force_admin_hybrid:
         summary_intent = False
@@ -1063,203 +1234,41 @@ def fetch_chunks(
                     rows, db=db, run_id=run_id, document_ids=None, p=p, k=k, debug=debug
                 )
 
-            if q_text and (ENABLE_HYBRID or use_trgm or force_admin_hybrid):
-                vec_k = HYBRID_VEC_K if ENABLE_HYBRID else k
-                vec = [
+            doc_scope = _list_run_document_ids(db, run_id, p)
+        else:
+            cnt_row = (
+                db.execute(
+                    sql_text(SQL_RUN_DOC_COUNT_USER),
+                    {"run_id": run_id, "owner_sub": p.sub},
+                )
+                .mappings()
+                .first()
+            )
+            if not cnt_row or int(cnt_row["cnt"]) == 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail="This run_id has no attached documents. Attach docs first.",
+                )
+
+            if summary_intent:
+                k_eff = min(max(k, 20), 50)
+                rows = [
                     dict(r)
                     for r in db.execute(
-                        sql_text(SQL_TOPK_BY_RUN_ADMIN),
-                        {"qvec": qvec_lit, "k": vec_k, "run_id": run_id},
+                        sql_text(SQL_FIRSTK_BY_RUN_USER),
+                        {"run_id": run_id, "k": k_eff, "owner_sub": p.sub},
                     )
                     .mappings()
                     .all()
                 ]
-                aux_rows: list[dict[str, Any]] = []
-                aux_kind: str | None = None
-                if ENABLE_HYBRID and use_fts:
-                    aux_rows = [
-                        dict(r)
-                        for r in db.execute(
-                            sql_text(SQL_FTS_BY_RUN_ADMIN),
-                            {"q": q_text, "k": HYBRID_FTS_K, "run_id": run_id},
-                        )
-                        .mappings()
-                        .all()
-                    ]
-                    aux_kind = "fts"
-                elif use_trgm:
-                    aux_rows = [
-                        dict(r)
-                        for r in db.execute(
-                            sql_text(SQL_TRGM_BY_RUN_ADMIN),
-                            {"q": q_text, "k": TRGM_K, "run_id": run_id},
-                        )
-                        .mappings()
-                        .all()
-                    ]
-                    aux_kind = "trgm"
-                merged = _rrf_merge(vec, aux_rows, k, rrf_k=RRF_K)
-
                 if debug is not None:
-                    debug["strategy"] = "hybrid_rrf_by_run_admin"
-                    debug["vec_count"] = len(vec)
-                    debug["vec_best_dist"] = _best_vec_dist(vec)
-                    debug["merged_count"] = len(merged)
-                    debug["vec_top5"] = _preview(vec)
-                    if aux_kind == "fts":
-                        debug["used_fts"] = bool(aux_rows)
-                        debug["fts_count"] = len(aux_rows)
-                        debug["fts_top5"] = _preview(aux_rows) if aux_rows else []
-                    elif aux_kind == "trgm":
-                        debug["used_trgm"] = True
-                        debug["trgm_count"] = len(aux_rows)
-                        debug["trgm_top5"] = _preview(aux_rows) if aux_rows else []
-                    debug["merged_top5"] = _preview(merged)
-
-                rows = merged if merged else vec[:k]
+                    debug["strategy"] = "firstk_by_run_user"
+                    debug["count"] = len(rows)
                 return _apply_offline_fallback(
                     rows, db=db, run_id=run_id, document_ids=None, p=p, k=k, debug=debug
                 )
 
-            rows = [
-                dict(r)
-                for r in db.execute(
-                    sql_text(SQL_TOPK_BY_RUN_ADMIN),
-                    {"qvec": qvec_lit, "k": k, "run_id": run_id},
-                )
-                .mappings()
-                .all()
-            ]
-            if debug is not None:
-                debug["strategy"] = "vector_by_run_admin"
-                debug["count"] = len(rows)
-                debug["vec_best_dist"] = _best_vec_dist(rows)
-                debug["top5"] = _preview(rows)
-            return _apply_offline_fallback(
-                rows, db=db, run_id=run_id, document_ids=None, p=p, k=k, debug=debug
-            )
-
-        cnt_row = (
-            db.execute(
-                sql_text(SQL_RUN_DOC_COUNT_USER), {"run_id": run_id, "owner_sub": p.sub}
-            )
-            .mappings()
-            .first()
-        )
-        if not cnt_row or int(cnt_row["cnt"]) == 0:
-            raise HTTPException(
-                status_code=400,
-                detail="This run_id has no attached documents. Attach docs first.",
-            )
-
-        if summary_intent:
-            k_eff = min(max(k, 20), 50)
-            rows = [
-                dict(r)
-                for r in db.execute(
-                    sql_text(SQL_FIRSTK_BY_RUN_USER),
-                    {"run_id": run_id, "k": k_eff, "owner_sub": p.sub},
-                )
-                .mappings()
-                .all()
-            ]
-            if debug is not None:
-                debug["strategy"] = "firstk_by_run_user"
-                debug["count"] = len(rows)
-            return _apply_offline_fallback(
-                rows, db=db, run_id=run_id, document_ids=None, p=p, k=k, debug=debug
-            )
-
-        if q_text and (ENABLE_HYBRID or use_trgm):
-            vec_k = HYBRID_VEC_K if ENABLE_HYBRID else k
-            vec = [
-                dict(r)
-                for r in db.execute(
-                    sql_text(SQL_TOPK_BY_RUN_USER),
-                    {
-                        "qvec": qvec_lit,
-                        "k": vec_k,
-                        "run_id": run_id,
-                        "owner_sub": p.sub,
-                    },
-                )
-                .mappings()
-                .all()
-            ]
-            aux_rows: list[dict[str, Any]] = []
-            aux_kind: str | None = None
-            if ENABLE_HYBRID and use_fts:
-                aux_rows = [
-                    dict(r)
-                    for r in db.execute(
-                        sql_text(SQL_FTS_BY_RUN_USER),
-                        {
-                            "q": q_text,
-                            "k": HYBRID_FTS_K,
-                            "run_id": run_id,
-                            "owner_sub": p.sub,
-                        },
-                    )
-                    .mappings()
-                    .all()
-                ]
-                aux_kind = "fts"
-            elif use_trgm:
-                aux_rows = [
-                    dict(r)
-                    for r in db.execute(
-                        sql_text(SQL_TRGM_BY_RUN_USER),
-                        {
-                            "q": q_text,
-                            "k": TRGM_K,
-                            "run_id": run_id,
-                            "owner_sub": p.sub,
-                        },
-                    )
-                    .mappings()
-                    .all()
-                ]
-                aux_kind = "trgm"
-            merged = _rrf_merge(vec, aux_rows, k, rrf_k=RRF_K)
-
-            if debug is not None:
-                debug["strategy"] = "hybrid_rrf_by_run_user"
-                debug["vec_count"] = len(vec)
-                debug["vec_best_dist"] = _best_vec_dist(vec)
-                debug["merged_count"] = len(merged)
-                debug["vec_top5"] = _preview(vec)
-                if aux_kind == "fts":
-                    debug["used_fts"] = bool(aux_rows)
-                    debug["fts_count"] = len(aux_rows)
-                    debug["fts_top5"] = _preview(aux_rows) if aux_rows else []
-                elif aux_kind == "trgm":
-                    debug["used_trgm"] = True
-                    debug["trgm_count"] = len(aux_rows)
-                    debug["trgm_top5"] = _preview(aux_rows) if aux_rows else []
-                debug["merged_top5"] = _preview(merged)
-
-            rows = merged if merged else vec[:k]
-            return _apply_offline_fallback(
-                rows, db=db, run_id=run_id, document_ids=None, p=p, k=k, debug=debug
-            )
-
-        rows = [
-            dict(r)
-            for r in db.execute(
-                sql_text(SQL_TOPK_BY_RUN_USER),
-                {"qvec": qvec_lit, "k": k, "run_id": run_id, "owner_sub": p.sub},
-            )
-            .mappings()
-            .all()
-        ]
-        if debug is not None:
-            debug["strategy"] = "vector_by_run_user"
-            debug["count"] = len(rows)
-            debug["vec_best_dist"] = _best_vec_dist(rows)
-            debug["top5"] = _preview(rows)
-        return _apply_offline_fallback(
-            rows, db=db, run_id=run_id, document_ids=None, p=p, k=k, debug=debug
-        )
+            doc_scope = _list_run_document_ids(db, run_id, p)
 
     if doc_scope:
         scope_params = {"doc_ids": doc_scope}
@@ -1300,135 +1309,6 @@ def fetch_chunks(
                 debug=debug,
             )
 
-        if q_text and (ENABLE_HYBRID or use_trgm or force_admin_hybrid):
-            vec_k = HYBRID_VEC_K if ENABLE_HYBRID else k
-            if is_admin(p):
-                vec = [
-                    dict(r)
-                    for r in db.execute(
-                        sql_text(SQL_TOPK_BY_DOCS_ADMIN),
-                        {**scope_params, "qvec": qvec_lit, "k": vec_k},
-                    )
-                    .mappings()
-                    .all()
-                ]
-            else:
-                vec = [
-                    dict(r)
-                    for r in db.execute(
-                        sql_text(SQL_TOPK_BY_DOCS_USER),
-                        {**scope_params_with_owner, "qvec": qvec_lit, "k": vec_k},
-                    )
-                    .mappings()
-                    .all()
-                ]
-            aux_rows: list[dict[str, Any]] = []
-            aux_kind: str | None = None
-            if ENABLE_HYBRID and use_fts:
-                if is_admin(p):
-                    aux_rows = [
-                        dict(r)
-                        for r in db.execute(
-                            sql_text(SQL_FTS_BY_DOCS_ADMIN),
-                            {**scope_params, "q": q_text, "k": HYBRID_FTS_K},
-                        )
-                        .mappings()
-                        .all()
-                    ]
-                else:
-                    aux_rows = [
-                        dict(r)
-                        for r in db.execute(
-                            sql_text(SQL_FTS_BY_DOCS_USER),
-                            {**scope_params_with_owner, "q": q_text, "k": HYBRID_FTS_K},
-                        )
-                        .mappings()
-                        .all()
-                    ]
-                aux_kind = "fts"
-            elif use_trgm:
-                if is_admin(p):
-                    aux_rows = [
-                        dict(r)
-                        for r in db.execute(
-                            sql_text(SQL_TRGM_BY_DOCS_ADMIN),
-                            {**scope_params, "q": q_text, "k": TRGM_K},
-                        )
-                        .mappings()
-                        .all()
-                    ]
-                else:
-                    aux_rows = [
-                        dict(r)
-                        for r in db.execute(
-                            sql_text(SQL_TRGM_BY_DOCS_USER),
-                            {**scope_params_with_owner, "q": q_text, "k": TRGM_K},
-                        )
-                        .mappings()
-                        .all()
-                    ]
-                aux_kind = "trgm"
-            merged = _rrf_merge(vec, aux_rows, k, rrf_k=RRF_K)
-            strat = (
-                "hybrid_rrf_by_docs_admin" if is_admin(p) else "hybrid_rrf_by_docs_user"
-            )
-            if debug is not None:
-                debug["strategy"] = strat
-                debug["vec_count"] = len(vec)
-                debug["vec_best_dist"] = _best_vec_dist(vec)
-                debug["merged_count"] = len(merged)
-                debug["vec_top5"] = _preview(vec)
-                if aux_kind == "fts":
-                    debug["used_fts"] = bool(aux_rows)
-                    debug["fts_count"] = len(aux_rows)
-                    debug["fts_top5"] = _preview(aux_rows) if aux_rows else []
-                elif aux_kind == "trgm":
-                    debug["used_trgm"] = True
-                    debug["trgm_count"] = len(aux_rows)
-                    debug["trgm_top5"] = _preview(aux_rows) if aux_rows else []
-                debug["merged_top5"] = _preview(merged)
-            rows = merged if merged else vec[:k]
-            return _apply_offline_fallback(
-                rows,
-                db=db,
-                run_id=run_id,
-                document_ids=doc_scope,
-                p=p,
-                k=k,
-                debug=debug,
-            )
-
-        if is_admin(p):
-            rows = [
-                dict(r)
-                for r in db.execute(
-                    sql_text(SQL_TOPK_BY_DOCS_ADMIN),
-                    {**scope_params, "qvec": qvec_lit, "k": k},
-                )
-                .mappings()
-                .all()
-            ]
-            strat = "vector_by_docs_admin"
-        else:
-            rows = [
-                dict(r)
-                for r in db.execute(
-                    sql_text(SQL_TOPK_BY_DOCS_USER),
-                    {**scope_params_with_owner, "qvec": qvec_lit, "k": k},
-                )
-                .mappings()
-                .all()
-            ]
-            strat = "vector_by_docs_user"
-        if debug is not None:
-            debug["strategy"] = strat
-            debug["count"] = len(rows)
-            debug["vec_best_dist"] = _best_vec_dist(rows)
-            debug["top5"] = _preview(rows)
-        return _apply_offline_fallback(
-            rows, db=db, run_id=run_id, document_ids=doc_scope, p=p, k=k, debug=debug
-        )
-
     if summary_intent:
         k_eff = min(max(k, 20), 50)
         if is_admin(p):
@@ -1460,156 +1340,73 @@ def fetch_chunks(
             rows, db=db, run_id=run_id, document_ids=None, p=p, k=k, debug=debug
         )
 
-    if is_admin(p):
-        if q_text and (ENABLE_HYBRID or use_trgm or force_admin_hybrid):
-            vec_k = HYBRID_VEC_K if ENABLE_HYBRID else k
-            vec = [
-                dict(r)
-                for r in db.execute(
-                    sql_text(SQL_TOPK_ALL_DOCS_ADMIN), {"qvec": qvec_lit, "k": vec_k}
-                )
-                .mappings()
-                .all()
-            ]
-            aux_rows: list[dict[str, Any]] = []
-            aux_kind: str | None = None
-            if ENABLE_HYBRID and use_fts:
-                aux_rows = [
-                    dict(r)
-                    for r in db.execute(
-                        sql_text(SQL_FTS_ALL_DOCS_ADMIN),
-                        {"q": q_text, "k": HYBRID_FTS_K},
-                    )
-                    .mappings()
-                    .all()
-                ]
-                aux_kind = "fts"
-            elif use_trgm:
-                aux_rows = [
-                    dict(r)
-                    for r in db.execute(
-                        sql_text(SQL_TRGM_ALL_DOCS_ADMIN), {"q": q_text, "k": TRGM_K}
-                    )
-                    .mappings()
-                    .all()
-                ]
-                aux_kind = "trgm"
-            merged = _rrf_merge(vec, aux_rows, k, rrf_k=RRF_K)
-
-            if debug is not None:
-                debug["strategy"] = "hybrid_rrf_all_docs_admin"
-                debug["vec_count"] = len(vec)
-                debug["vec_best_dist"] = _best_vec_dist(vec)
-                debug["merged_count"] = len(merged)
-                debug["vec_top5"] = _preview(vec)
-                if aux_kind == "fts":
-                    debug["used_fts"] = bool(aux_rows)
-                    debug["fts_count"] = len(aux_rows)
-                    debug["fts_top5"] = _preview(aux_rows) if aux_rows else []
-                elif aux_kind == "trgm":
-                    debug["used_trgm"] = True
-                    debug["trgm_count"] = len(aux_rows)
-                    debug["trgm_top5"] = _preview(aux_rows) if aux_rows else []
-                debug["merged_top5"] = _preview(merged)
-
-            rows = merged if merged else vec[:k]
-            return _apply_offline_fallback(
-                rows, db=db, run_id=run_id, document_ids=None, p=p, k=k, debug=debug
-            )
-
-        rows = [
-            dict(r)
-            for r in db.execute(
-                sql_text(SQL_TOPK_ALL_DOCS_ADMIN), {"qvec": qvec_lit, "k": k}
-            )
-            .mappings()
-            .all()
-        ]
-        if debug is not None:
-            debug["strategy"] = "vector_all_docs_admin"
-            debug["count"] = len(rows)
-            debug["vec_best_dist"] = _best_vec_dist(rows)
-            debug["top5"] = _preview(rows)
-        return _apply_offline_fallback(
-            rows, db=db, run_id=run_id, document_ids=None, p=p, k=k, debug=debug
-        )
-
-    if q_text and (ENABLE_HYBRID or use_trgm):
-        vec_k = HYBRID_VEC_K if ENABLE_HYBRID else k
-        vec = [
-            dict(r)
-            for r in db.execute(
-                sql_text(SQL_TOPK_ALL_DOCS_USER),
-                {"qvec": qvec_lit, "k": vec_k, "owner_sub": p.sub},
-            )
-            .mappings()
-            .all()
-        ]
-        aux_rows: list[dict[str, Any]] = []
-        aux_kind: str | None = None
-        if ENABLE_HYBRID and use_fts:
-            aux_rows = [
-                dict(r)
-                for r in db.execute(
-                    sql_text(SQL_FTS_ALL_DOCS_USER),
-                    {"q": q_text, "k": HYBRID_FTS_K, "owner_sub": p.sub},
-                )
-                .mappings()
-                .all()
-            ]
-            aux_kind = "fts"
-        elif use_trgm:
-            aux_rows = [
-                dict(r)
-                for r in db.execute(
-                    sql_text(SQL_TRGM_ALL_DOCS_USER),
-                    {"q": q_text, "k": TRGM_K, "owner_sub": p.sub},
-                )
-                .mappings()
-                .all()
-            ]
-            aux_kind = "trgm"
-        merged = _rrf_merge(vec, aux_rows, k, rrf_k=RRF_K)
-
-        if debug is not None:
-            debug["strategy"] = "hybrid_rrf_all_docs_user"
-            debug["vec_count"] = len(vec)
-            debug["vec_best_dist"] = _best_vec_dist(vec)
-            debug["merged_count"] = len(merged)
-            debug["vec_top5"] = _preview(vec)
-            if aux_kind == "fts":
-                debug["used_fts"] = bool(aux_rows)
-                debug["fts_count"] = len(aux_rows)
-                debug["fts_top5"] = _preview(aux_rows) if aux_rows else []
-            elif aux_kind == "trgm":
-                debug["used_trgm"] = True
-                debug["trgm_count"] = len(aux_rows)
-                debug["trgm_top5"] = _preview(aux_rows) if aux_rows else []
-            debug["merged_top5"] = _preview(merged)
-
-        rows = merged if merged else vec[:k]
-        return _apply_offline_fallback(
-            rows, db=db, run_id=run_id, document_ids=None, p=p, k=k, debug=debug
-        )
-
-    rows = [
-        dict(r)
-        for r in db.execute(
-            sql_text(SQL_TOPK_ALL_DOCS_USER),
-            {"qvec": qvec_lit, "k": k, "owner_sub": p.sub},
-        )
-        .mappings()
-        .all()
-    ]
-    if debug is not None:
-        debug["strategy"] = "vector_all_docs_user"
-        debug["count"] = len(rows)
-        debug["vec_best_dist"] = _best_vec_dist(rows)
-        debug["top5"] = _preview(rows)
-    return _apply_offline_fallback(
-        rows, db=db, run_id=run_id, document_ids=None, p=p, k=k, debug=debug
+    owner_sub_for_query = None if is_admin(p) else getattr(p, "sub", None)
+    allow_all_without_owner = bool(is_admin(p) and not doc_scope)
+    use_fts_final = bool(use_fts and (ENABLE_HYBRID or force_admin_hybrid))
+    use_trgm_final = bool(use_trgm_flag and ENABLE_TRGM)
+    fts_skipped = not use_fts_final
+    vec_k = HYBRID_VEC_K if (ENABLE_HYBRID or force_admin_hybrid) else max(k, 1)
+    fts_k = HYBRID_FTS_K if use_fts_final else 0
+    trgm_k = TRGM_K if use_trgm_final else 0
+    trgm_patterns = (
+        [f"%{term}%" for term in _split_trgm_terms(q_text)] if use_trgm_final else []
     )
+    strategy = "hybrid_rrf_all_docs_admin" if is_admin(p) else "hybrid_rrf_all_docs_user"
+    if run_id:
+        strategy = (
+            "hybrid_rrf_by_run_admin" if is_admin(p) else "hybrid_rrf_by_run_user"
+        )
+    elif doc_scope:
+        strategy = (
+            "hybrid_rrf_by_docs_admin" if is_admin(p) else "hybrid_rrf_by_docs_user"
+        )
+    try:
+        hits, meta = hybrid_search_chunks_rrf(
+            db,
+            owner_sub=owner_sub_for_query,
+            document_ids=doc_scope if doc_scope else None,
+            query_text=q_text,
+            query_embedding=qvec_values,
+            top_k=k,
+            fts_k=fts_k,
+            vec_k=vec_k,
+            rrf_k=RRF_K,
+            trgm_k=trgm_k,
+            trgm_limit=0.0,
+            trgm_like_patterns=trgm_patterns,
+            use_fts=use_fts_final,
+            use_trgm=use_trgm_final,
+            allow_all_without_owner=allow_all_without_owner,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception:
+        logger.exception("hybrid_search_failed")
+        raise HTTPException(status_code=500, detail="retrieval failed")
 
+    rows = _hybrid_hits_to_rows(hits)
+    debug = _build_hybrid_debug(
+        base_debug=debug,
+        strategy=strategy,
+        requested_k=k,
+        hits=hits,
+        rows=rows,
+        meta=meta,
+        use_fts=use_fts_final,
+        use_trgm=use_trgm_final,
+        trgm_available=trgm_available,
+        fts_skipped=fts_skipped,
+    )
+    fallback_doc_scope = None if run_id else (doc_scope if doc_scope else None)
+    return _apply_offline_fallback(
+        rows,
+        db=db,
+        run_id=run_id,
+        document_ids=fallback_doc_scope,
+        p=p,
+        k=k,
+        debug=debug,
+    )
 
 # ============================================================
 # Embedding helpers (lazy init)
@@ -2088,6 +1885,15 @@ def public_citations(citations: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return out
 
 
+def _limit_sources_for_citations(
+    sources: list[dict[str, Any]], limit: int
+) -> list[dict[str, Any]]:
+    if not sources:
+        return []
+    safe_limit = max(1, min(len(sources), max(limit, 1)))
+    return sources[:safe_limit]
+
+
 # ============================================================
 # Run config
 # ============================================================
@@ -2305,12 +2111,36 @@ def build_error_payload(
     code: str,
     message: str,
     *,
-    debug_meta: dict[str, bool] | None,
+    debug_meta: dict[str, Any] | None,
+    include_debug: bool = False,
+    retrieval_debug: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {"error": {"code": code, "message": message}}
     if debug_meta is not None:
         payload["debug_meta"] = debug_meta
+    payload = _finalize_debug_sections(
+        payload,
+        include_debug=include_debug,
+        debug_meta_payload=debug_meta,
+        retrieval_debug_payload=retrieval_debug,
+    )
     payload, _ = sanitize_nonfinite_floats(payload)
+    return payload
+
+
+def _finalize_debug_sections(
+    payload: Any,
+    *,
+    include_debug: bool,
+    debug_meta_payload: dict[str, Any] | None = None,
+    retrieval_debug_payload: dict[str, Any] | None = None,
+) -> Any:
+    if not include_debug or not isinstance(payload, dict):
+        return payload
+    if payload.get("debug_meta") is None:
+        payload["debug_meta"] = debug_meta_payload or {}
+    if payload.get("retrieval_debug") is None:
+        payload["retrieval_debug"] = retrieval_debug_payload or {}
     return payload
 
 
@@ -2407,7 +2237,49 @@ def build_retrieval_debug_payload(
     return sanitize_retrieval_debug(merged)
 
 
-@router.post("/chat/ask", response_model=ChatResponse, response_model_exclude_none=True)
+def _enrich_debug_meta(
+    data: dict[str, Any] | None,
+    *,
+    retrieval_hit_count: int,
+    citations_count: int,
+    used_min_score: float,
+    used_max_vec_distance: float | None,
+    used_use_doc_filter: bool,
+    fts_count: int,
+    vec_count: int,
+    trgm_count: int,
+    llm_called: bool,
+    llm_error: str | None,
+    guardrail_reason: str | None,
+) -> dict[str, Any] | None:
+    if data is None:
+        return None
+    enriched = dict(data)
+    enriched.update(
+        {
+            "retrieval_hit_count": int(retrieval_hit_count),
+            "citations_count": int(citations_count),
+            "used_min_score": float(used_min_score),
+            "used_max_vec_distance": used_max_vec_distance,
+            "used_use_doc_filter": bool(used_use_doc_filter),
+            "fts_count": int(fts_count),
+            "vec_count": int(vec_count),
+            "trgm_count": int(trgm_count),
+            "llm_called": bool(llm_called),
+        }
+    )
+    if llm_error:
+        enriched["llm_error"] = llm_error
+    elif "llm_error" in enriched:
+        enriched.pop("llm_error", None)
+    if guardrail_reason:
+        enriched["guardrail_fallback_reason"] = guardrail_reason
+    return enriched
+
+
+@router.post(
+    "/chat/ask", response_model=ChatAskResponse, response_model_exclude_none=True
+)
 def ask(
     payload: AskPayload,
     request: Request,
@@ -2462,6 +2334,8 @@ def ask(
     run: Run | None = None
     doc_scope: list[str] = []
 
+    effective_run_id = payload.run_id
+
     try:
         q_clean = sanitize_question_for_llm(payload.question)
         is_cjk_query = query_class(q_clean) == "cjk"
@@ -2471,7 +2345,6 @@ def ask(
         if payload.document_ids:
             doc_scope = _ensure_document_scope(db, payload.document_ids, p)
 
-        effective_run_id = payload.run_id
         summary_run_created = False
         summary_query_run_id: str | None = None
         summary_run_has_docs = False
@@ -2487,6 +2360,11 @@ def ask(
                             continue
                         exc.detail = attach_debug_meta_to_detail(
                             exc.detail, debug_meta_for_errors
+                        )
+                        exc.detail = _finalize_debug_sections(
+                            exc.detail,
+                            include_debug=payload_debug_requested,
+                            debug_meta_payload=debug_meta_for_errors if include_debug else None,
                         )
                         raise
 
@@ -2540,6 +2418,11 @@ def ask(
                 exc.detail = attach_debug_meta_to_detail(
                     exc.detail, debug_meta_for_errors
                 )
+                exc.detail = _finalize_debug_sections(
+                    exc.detail,
+                    include_debug=payload_debug_requested,
+                    debug_meta_payload=debug_meta_for_errors if include_debug else None,
+                )
                 raise
             run = db.get(Run, effective_run_id)
             if not run:
@@ -2549,6 +2432,7 @@ def ask(
                         "run_not_found",
                         "run not found",
                         debug_meta=debug_meta_for_errors,
+                        include_debug=payload_debug_requested,
                     ),
                 )
 
@@ -2571,6 +2455,7 @@ def ask(
                         "ambiguous_reference",
                         "Ambiguous reference detected (e.g., 'this PDF'). Please specify run_id (attach target PDF(s) to a run) before asking.",
                         debug_meta=debug_meta_for_errors,
+                        include_debug=payload_debug_requested,
                     ),
                 )
 
@@ -2581,6 +2466,7 @@ def ask(
                         "generic_query",
                         "Query is too generic. Please ask a specific question (e.g., include what, where, and which document/topic).",
                         debug_meta=debug_meta_for_errors,
+                        include_debug=payload_debug_requested,
                     ),
                 )
 
@@ -2590,6 +2476,7 @@ def ask(
             rows, retrieval_debug_raw = fetch_chunks(
                 db,
                 qvec_lit=qvec_lit,
+                qvec_list=qvec,
                 q_text=q_clean,
                 k=payload.k,
                 run_id=effective_run_id,
@@ -2609,6 +2496,16 @@ def ask(
                 base_k=SUMMARY_BASE_CHUNKS,
                 anchor_k=SUMMARY_ANCHOR_CHUNKS,
             )
+        retrieval_hit_count = len(rows)
+        fts_count_raw = int((retrieval_debug_raw or {}).get("fts_count", 0) or 0)
+        vec_count_raw = int((retrieval_debug_raw or {}).get("vec_count", 0) or 0)
+        trgm_count_raw = int((retrieval_debug_raw or {}).get("trgm_count", 0) or 0)
+        used_use_doc_filter = bool(doc_scope)
+        used_min_score = 0.0
+        used_max_vec_distance = VEC_MAX_COS_DIST
+        llm_called = False
+        llm_error: str | None = None
+
         used_fts_flag = bool((retrieval_debug_raw or {}).get("used_fts"))
         used_trgm_flag = bool((retrieval_debug_raw or {}).get("used_trgm"))
         fts_skipped_flag = bool((retrieval_debug_raw or {}).get("fts_skipped"))
@@ -2639,6 +2536,46 @@ def ask(
         )
         debug_meta_for_errors = debug_meta
 
+        def _prepare_debug_payload(
+            *,
+            citations_count: int,
+            guardrail_reason: str | None,
+            llm_called_override: bool | None = None,
+            llm_error_override: str | None = None,
+            extra_debug: dict[str, Any] | None = None,
+        ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+            if not include_debug:
+                return None, None
+            debug_payload = (
+                build_retrieval_debug_payload(retrieval_debug_raw, extra_debug) or {}
+            )
+            meta_payload = _enrich_debug_meta(
+                debug_meta,
+                retrieval_hit_count=retrieval_hit_count,
+                citations_count=citations_count,
+                used_min_score=used_min_score,
+                used_max_vec_distance=used_max_vec_distance,
+                used_use_doc_filter=used_use_doc_filter,
+                fts_count=fts_count_raw,
+                vec_count=vec_count_raw,
+                trgm_count=trgm_count_raw,
+                llm_called=(
+                    llm_called_override if llm_called_override is not None else llm_called
+                ),
+                llm_error=llm_error_override if llm_error_override else llm_error,
+                guardrail_reason=guardrail_reason,
+            )
+            if meta_payload is None:
+                meta_payload = {}
+            return debug_payload, meta_payload
+
+        context = ""
+        sources: list[dict[str, Any]] = []
+        allowed_ids: set[str] = set()
+        if rows:
+            context, sources = build_sources(rows)
+            allowed_ids = {s["source_id"] for s in sources}
+
         # 2) retrieval信頼度ゲート（summary以外）
         if rows and not offline_mode and not summary_request:
             best = _best_vec_dist(rows)
@@ -2647,25 +2584,41 @@ def ask(
                 if run:
                     run.t3 = _utcnow()
                     db.commit()
+                fallback_sources = _limit_sources_for_citations(sources, payload.k)
+                citations_out = (
+                    fallback_sources
+                    if is_admin_user
+                    else public_citations(fallback_sources)
+                )
                 resp = {
                     "answer": "I don't know based on the provided sources.",
-                    "citations": [],
+                    "citations": citations_out,
                     "run_id": effective_run_id,
                     "request_id": req_id,
                 }
-                included_retrieval_debug = False
-                included_debug_meta = False
+                included_retrieval_debug = include_debug
+                included_debug_meta = include_debug and debug_meta is not None
+                debug_payload_extra: dict[str, Any] | None = None
+                debug_meta_payload_extra: dict[str, Any] | None = None
                 if include_debug:
-                    debug_payload = build_retrieval_debug_payload(
-                        retrieval_debug_raw,
-                        {"early_abort": "low_relevance", "best_vec_dist": best},
+                    debug_payload_extra, debug_meta_payload_extra = _prepare_debug_payload(
+                        citations_count=len(fallback_sources),
+                        guardrail_reason="low_relevance",
+                        llm_called_override=False,
+                        extra_debug={"early_abort": "low_relevance", "best_vec_dist": best},
                     )
-                    if debug_payload:
-                        resp["retrieval_debug"] = debug_payload
-                        included_retrieval_debug = True
-                if debug_meta is not None:
-                    resp["debug_meta"] = debug_meta
-                    included_debug_meta = True
+                    resp["retrieval_debug"] = debug_payload_extra or {}
+                    resp["debug_meta"] = debug_meta_payload_extra or {}
+                resp = _finalize_debug_sections(
+                    resp,
+                    include_debug=payload_debug_requested,
+                    debug_meta_payload=(
+                        debug_meta_payload_extra if include_debug else None
+                    ),
+                    retrieval_debug_payload=(
+                        debug_payload_extra if include_debug else None
+                    ),
+                )
                 resp, sanitized_paths = sanitize_nonfinite_floats(resp)
                 if sanitized_paths and payload_debug_flag:
                     logger.info(
@@ -2685,7 +2638,7 @@ def ask(
                     chunk_count=len(rows),
                     status="success",
                 )
-                return ChatResponse(**resp).model_dump(exclude_none=True)
+                return ChatAskResponse(**resp).model_dump(exclude_none=True)
 
         if not rows:
             if run:
@@ -2707,14 +2660,28 @@ def ask(
                 }
             included_retrieval_debug = False
             included_debug_meta = False
+            debug_payload_extra: dict[str, Any] | None = None
+            debug_meta_payload_extra: dict[str, Any] | None = None
             if include_debug:
-                debug_payload = build_retrieval_debug_payload(retrieval_debug_raw)
-                if debug_payload:
-                    resp["retrieval_debug"] = debug_payload
-                    included_retrieval_debug = True
-            if debug_meta is not None:
-                resp["debug_meta"] = debug_meta
+                debug_payload_extra, debug_meta_payload_extra = _prepare_debug_payload(
+                    citations_count=0,
+                    guardrail_reason="no_hits",
+                    llm_called_override=False,
+                )
+                resp["retrieval_debug"] = debug_payload_extra or {}
+                resp["debug_meta"] = debug_meta_payload_extra or {}
+                included_retrieval_debug = True
                 included_debug_meta = True
+            resp = _finalize_debug_sections(
+                resp,
+                include_debug=payload_debug_requested,
+                debug_meta_payload=(
+                    debug_meta_payload_extra if include_debug else None
+                ),
+                retrieval_debug_payload=(
+                    debug_payload_extra if include_debug else None
+                ),
+            )
             resp, sanitized_paths = sanitize_nonfinite_floats(resp)
             if sanitized_paths and payload_debug_flag:
                 logger.info(
@@ -2734,10 +2701,7 @@ def ask(
                 chunk_count=len(rows),
                 status="success",
             )
-            return ChatResponse(**resp).model_dump(exclude_none=True)
-
-        context, sources = build_sources(rows)
-        allowed_ids = {s["source_id"] for s in sources}
+            return ChatAskResponse(**resp).model_dump(exclude_none=True)
 
         model, gen = get_model_and_gen_from_run(run)
 
@@ -2751,10 +2715,12 @@ def ask(
             )
         else:
             try:
+                llm_called = True
                 answer, used_ids = answer_with_contract(
                     model, gen, payload.question, context, allowed_ids
                 )
-            except Exception:
+            except Exception as exc:
+                llm_error = type(exc).__name__
                 logger.exception(
                     "answer_with_contract_failed", extra={"request_id": req_id}
                 )
@@ -2767,6 +2733,11 @@ def ask(
             db.commit()
 
         used_sources = filter_sources(sources, used_ids)
+        guardrail_reason = None
+        if not used_sources and sources:
+            fallback_limit = max(1, min(len(sources), payload.k))
+            used_sources = sources[:fallback_limit]
+            guardrail_reason = "missing_llm_citations"
         if summary_mode and run:
             doc_ids_for_run = {
                 str(src.get("document_id"))
@@ -2808,16 +2779,27 @@ def ask(
             "run_id": effective_run_id,
             "request_id": req_id,
         }
-        included_retrieval_debug = False
-        included_debug_meta = False
+        included_retrieval_debug = include_debug
+        included_debug_meta = include_debug and debug_meta is not None
+        debug_payload_extra: dict[str, Any] | None = None
+        debug_meta_payload_extra: dict[str, Any] | None = None
         if include_debug:
-            debug_payload = build_retrieval_debug_payload(retrieval_debug_raw)
-            if debug_payload:
-                resp["retrieval_debug"] = debug_payload
-                included_retrieval_debug = True
-        if debug_meta is not None:
-            resp["debug_meta"] = debug_meta
-            included_debug_meta = True
+            debug_payload_extra, debug_meta_payload_extra = _prepare_debug_payload(
+                citations_count=len(used_sources),
+                guardrail_reason=guardrail_reason,
+            )
+            resp["retrieval_debug"] = debug_payload_extra or {}
+            resp["debug_meta"] = debug_meta_payload_extra or {}
+        resp = _finalize_debug_sections(
+            resp,
+            include_debug=payload_debug_requested,
+            debug_meta_payload=(
+                debug_meta_payload_extra if include_debug else None
+            ),
+            retrieval_debug_payload=(
+                debug_payload_extra if include_debug else None
+            ),
+        )
         resp, sanitized_paths = sanitize_nonfinite_floats(resp)
         if sanitized_paths and payload_debug_flag:
             logger.info(
@@ -2837,7 +2819,7 @@ def ask(
             chunk_count=len(rows),
             status="success",
         )
-        return ChatResponse(**resp).model_dump(exclude_none=True)
+        return ChatAskResponse(**resp).model_dump(exclude_none=True)
 
     except HTTPException as exc:
         if debug_meta_for_errors is not None:
@@ -2849,6 +2831,13 @@ def ask(
                     extra={"request_id": req_id, "paths": paths},
                 )
             exc.detail = detail_sanitized
+        exc.detail = _finalize_debug_sections(
+            exc.detail,
+            include_debug=payload_debug_requested,
+            debug_meta_payload=(
+                debug_meta_for_errors if include_debug else None
+            ),
+        )
         _emit_audit_event(
             request_id=req_id,
             run_id=effective_run_id,
@@ -2870,7 +2859,10 @@ def ask(
         )
         message = str(e) if include_debug else "internal server error"
         detail = build_error_payload(
-            "internal_error", message, debug_meta=debug_meta_for_errors
+            "internal_error",
+            message,
+            debug_meta=debug_meta_for_errors,
+            include_debug=payload_debug_requested,
         )
         _emit_audit_event(
             request_id=req_id,

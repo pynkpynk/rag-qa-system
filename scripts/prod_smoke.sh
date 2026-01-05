@@ -8,6 +8,9 @@ for var in API_BASE TOKEN_A TOKEN_B PDF; do
   fi
 done
 
+API_ROOT="${API_BASE%/}/api"
+[[ -f "$PDF" ]] || { echo "PDF not found: $PDF" >&2; exit 1; }
+
 tmp_dir="$(mktemp -d)"
 cleanup() {
   rm -rf "$tmp_dir"
@@ -15,15 +18,7 @@ cleanup() {
 trap cleanup EXIT
 
 log() {
-  echo "[$(date -u +"%H:%M:%S")] $*"
-}
-
-api_call() {
-  local method="$1"
-  local url="$2"
-  shift 2
-  HTTP_STATUS=$(curl -sS -o "$tmp_dir/body.json" -w "%{http_code}" -X "$method" "$url" "$@")
-  BODY="$(cat "$tmp_dir/body.json")"
+  echo "[$(date -u +"%H:%M:%S")] $*" >&2
 }
 
 fail() {
@@ -35,20 +30,59 @@ pass() {
   log "PASS: $*"
 }
 
+api_call() {
+  local method="$1"
+  local url="$2"
+  shift 2 || true
+  local body="$tmp_dir/body.json"
+  local err="$tmp_dir/curl.err"
+  set +e
+  local http_code
+  http_code=$(curl -sS -o "$body" -w "%{http_code}" -X "$method" "$url" "$@" 2>"$err")
+  local rc=$?
+  set -e
+  HTTP_STATUS="$http_code"
+  BODY="$(cat "$body")"
+  if [[ "$rc" -ne 0 ]]; then
+    log "[CURL_ERROR rc=$rc] $method $url"
+    cat "$err" >&2
+    return "$rc"
+  fi
+  return 0
+}
+
+curl_json() {
+  local method="$1"
+  local url="$2"
+  shift 2 || true
+  if ! api_call "$method" "$url" "$@"; then
+    exit 1
+  fi
+  if [[ ! "$HTTP_STATUS" =~ ^2 ]]; then
+    log "[HTTP_FAIL $HTTP_STATUS] $method $url"
+    if echo "$BODY" | jq . >/dev/null 2>&1; then
+      echo "$BODY" | jq . >&2
+    else
+      echo "$BODY" >&2
+    fi
+    if [[ "$HTTP_STATUS" == "401" ]] && echo "$BODY" | grep -qi "Invalid token"; then
+      echo "Hint: Demo bearer token must be the plaintext value, not the SHA256 hash." >&2
+    fi
+    exit 1
+  fi
+  cat "$tmp_dir/body.json"
+}
+
 upload_doc() {
   local token="$1"
-  api_call POST "$API_BASE/docs/upload" \
+  curl_json POST "$API_ROOT/docs/upload" \
     -H "Authorization: Bearer $token" \
-    -F "file=@${PDF};type=application/pdf"
-  if [[ "$HTTP_STATUS" != "200" ]]; then
-    fail "Upload failed ($HTTP_STATUS): $BODY"
-  fi
-  echo "$BODY" | jq -r '.document_id'
+    -F "file=@${PDF};type=application/pdf" | jq -r '.document_id'
 }
 
 list_docs() {
   local token="$1"
-  api_call GET "$API_BASE/docs" -H "Authorization: Bearer $token"
+  api_call GET "$API_ROOT/docs" -H "Authorization: Bearer $token"
   if [[ "$HTTP_STATUS" != "200" ]]; then
     fail "List docs failed for token ($HTTP_STATUS): $BODY"
   fi
@@ -58,10 +92,10 @@ list_docs() {
 ask_doc() {
   local token="$1"
   local doc_id="$2"
-  api_call POST "$API_BASE/chat/ask" \
+  api_call POST "$API_ROOT/chat/ask" \
     -H "Authorization: Bearer $token" \
     -H "Content-Type: application/json" \
-    -d "{\"question\":\"Smoke test question\",\"document_ids\":[\"$doc_id\"],\"k\":3}"
+    -d "{\"question\":\"Return one bullet with at least one citation in [S? p.?] format.\",\"document_ids\":[\"$doc_id\"],\"mode\":\"library\",\"k\":3}"
   if [[ "$HTTP_STATUS" != "200" ]]; then
     fail "Ask failed ($HTTP_STATUS): $BODY"
   fi
@@ -71,14 +105,14 @@ ask_doc() {
 fetch_chunk() {
   local token="$1"
   local chunk_id="$2"
-  api_call GET "$API_BASE/chunks/$chunk_id" -H "Authorization: Bearer $token"
+  api_call GET "$API_ROOT/chunks/$chunk_id" -H "Authorization: Bearer $token"
   echo "$HTTP_STATUS"
 }
 
 create_run() {
   local token="$1"
   local doc_id="$2"
-  api_call POST "$API_BASE/runs" \
+  api_call POST "$API_ROOT/runs" \
     -H "Authorization: Bearer $token" \
     -H "Content-Type: application/json" \
     -d "{\"config\":{\"label\":\"smoke\"},\"document_ids\":[\"$doc_id\"]}"
@@ -91,7 +125,7 @@ create_run() {
 get_run_as() {
   local token="$1"
   local run_id="$2"
-  api_call GET "$API_BASE/runs/$run_id" -H "Authorization: Bearer $token"
+  api_call GET "$API_ROOT/runs/$run_id" -H "Authorization: Bearer $token"
   echo "$HTTP_STATUS"
 }
 
@@ -112,6 +146,12 @@ log "Running ask as TOKEN_A"
 ask_resp="$(ask_doc "$TOKEN_A" "$doc_id")"
 chunk_id="$(echo "$ask_resp" | jq -r '.citations[0].chunk_id')"
 if [[ -z "$chunk_id" || "$chunk_id" == "null" ]]; then
+  log "Ask response missing chunk_id. Full response:"
+  if echo "$ask_resp" | jq . >/dev/null 2>&1; then
+    echo "$ask_resp" | jq . >&2
+  else
+    echo "$ask_resp" >&2
+  fi
   fail "Ask response missing chunk_id"
 fi
 pass "Ask succeeded with chunk $chunk_id"

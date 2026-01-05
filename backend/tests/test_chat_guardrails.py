@@ -18,6 +18,7 @@ from app.api.routes.chat import (
     should_use_fts,
     should_use_trgm,
 )
+from app.db.hybrid_search import HybridHit, HybridMeta
 from app.core.output_contract import sanitize_nonfinite_floats
 from app.core.authz import Principal, is_admin
 from app.main import normalize_http_exception_detail
@@ -307,6 +308,7 @@ def test_prod_env_forces_debug_off(monkeypatch):
         question,
         trgm_available,
         admin_debug_hybrid,
+        **_kwargs,
     ):
         rows = [
             {
@@ -345,8 +347,8 @@ def test_prod_env_forces_debug_off(monkeypatch):
     principal = Principal(sub="prod|admin", permissions={"read:docs"})
 
     resp = chat.ask(payload, request, db=DummyDB(), p=principal)
-    assert "retrieval_debug" not in resp
-    assert "debug_meta" not in resp
+    assert resp["retrieval_debug"] == {}
+    assert resp["debug_meta"] == {}
     assert events, "audit events should be emitted in prod"
     for ev in events:
         assert ev["retrieval_debug_included"] is False
@@ -377,8 +379,8 @@ def test_debug_meta_disabled_when_auth_mode_not_dev(monkeypatch):
     principal = Principal(sub="user|auth0", permissions={"read:docs"})
 
     resp = chat.ask(payload, request, db=DummyDB(), p=principal)
-    assert "debug_meta" not in resp
-    assert "retrieval_debug" not in resp
+    assert resp["debug_meta"] == {}
+    assert resp["retrieval_debug"] == {}
 
 
 def test_chat_ask_blocks_run_not_owned(monkeypatch):
@@ -543,6 +545,32 @@ def test_build_error_payload_skips_debug_meta_when_missing():
     payload = build_error_payload("generic_query", "msg", debug_meta=None)
     assert payload["error"]["code"] == "generic_query"
     assert "debug_meta" not in payload
+
+
+def test_build_error_payload_adds_debug_sections_when_enabled():
+    meta = build_debug_meta(
+        feature_flag_enabled=True,
+        payload_debug=True,
+        is_admin=False,
+        is_admin_debug=False,
+        auth_mode_dev=True,
+        admin_via_sub=False,
+        admin_via_token_hash=False,
+        include_debug=True,
+        is_cjk=False,
+        auth_header_present=False,
+        bearer_token_present=False,
+        trgm_enabled=True,
+        trgm_available=False,
+        used_trgm=False,
+        used_fts=False,
+        fts_skipped=False,
+    )
+    payload = build_error_payload(
+        "example", "oops", debug_meta=meta, include_debug=True
+    )
+    assert payload["debug_meta"] == meta
+    assert payload["retrieval_debug"] == {}
 
 
 def test_attach_debug_meta_wraps_string_detail():
@@ -718,6 +746,36 @@ def test_admin_debug_strategy_hybrid_overrides_summary(monkeypatch):
         ]
     )
     principal = Principal(sub="admin", permissions=set())
+    fake_hit = HybridHit(
+        chunk_id="vec1",
+        document_id="doc1",
+        filename="en",
+        page=1,
+        chunk_index=0,
+        text="vec",
+        score=1.0,
+        rank_fts=1,
+        rank_vec=1,
+        vec_distance=0.1,
+        rank_trgm=1,
+        trgm_sim=0.8,
+    )
+    fake_meta = HybridMeta(
+        fts_count=1,
+        vec_count=1,
+        trgm_count=1,
+        vec_min_distance=0.1,
+        vec_max_distance=0.1,
+        vec_avg_distance=0.1,
+        trgm_min_sim=0.8,
+        trgm_max_sim=0.8,
+        trgm_avg_sim=0.8,
+    )
+
+    def fake_hybrid(*args, **kwargs):
+        return [fake_hit], fake_meta
+
+    monkeypatch.setattr(chat, "hybrid_search_chunks_rrf", fake_hybrid)
     rows, debug = chat.fetch_chunks(
         db,
         qvec_lit="[0]",
@@ -732,6 +790,180 @@ def test_admin_debug_strategy_hybrid_overrides_summary(monkeypatch):
     )
     assert debug["strategy"] == "hybrid_rrf_by_run_admin"
     assert debug["used_trgm"] is True
+
+
+def test_guardrail_low_relevance_keeps_citations(monkeypatch):
+    class DummyDB:
+        def commit(self):
+            return None
+
+    monkeypatch.setenv("APP_ENV", "dev")
+    monkeypatch.setenv("ALLOW_PROD_DEBUG", "1")
+    monkeypatch.setattr(chat, "effective_auth_mode", lambda: "dev")
+    monkeypatch.setattr(chat, "_detect_trgm_available", lambda *_: False)
+    monkeypatch.setattr(chat, "is_llm_enabled", lambda: True)
+    monkeypatch.setattr(chat, "embed_query", lambda q: [0.0])
+    monkeypatch.setattr(chat, "_ensure_document_scope", lambda db, docs, p: docs)
+    monkeypatch.setattr(chat, "is_admin", lambda _: True)
+
+    def fake_fetch_chunks(
+        db,
+        qvec_lit,
+        q_text,
+        k,
+        run_id,
+        document_ids,
+        p,
+        question,
+        trgm_available,
+        admin_debug_hybrid,
+        **_kwargs,
+    ):
+        row = {
+            "id": "chunk-1",
+            "document_id": "doc-1",
+            "filename": "demo.pdf",
+            "page": 1,
+            "chunk_index": 0,
+            "text": "chunk content",
+            "dist": 0.9,
+        }
+        debug = {
+            "strategy": "vector_all_docs_admin",
+            "vec_count": 1,
+            "fts_count": 0,
+            "trgm_count": 0,
+            "used_fts": False,
+            "used_trgm": False,
+        }
+        return [row], debug
+
+    monkeypatch.setattr(chat, "fetch_chunks", fake_fetch_chunks)
+    monkeypatch.setattr(chat, "answer_with_contract", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("LLM called")))
+
+    payload = AskPayload(question="what?", document_ids=["doc-1"], k=2, debug=True)
+    request = DummyRequest("Bearer demo")
+    request.state.request_id = "req-guardrail"
+    principal = Principal(sub="dev|admin", permissions={"read:docs"})
+
+    resp = chat.ask(payload, request, db=DummyDB(), p=principal)
+    assert resp["answer"].startswith("I don't know")
+    assert len(resp["citations"]) >= 1
+    assert "retrieval_debug" in resp
+    assert "debug_meta" in resp
+    assert resp["debug_meta"]["guardrail_fallback_reason"] == "low_relevance"
+    assert resp["debug_meta"]["retrieval_hit_count"] == 1
+    assert resp["debug_meta"]["citations_count"] == len(resp["citations"])
+
+
+def test_offline_mode_with_debug_includes_debug_sections(monkeypatch):
+    class DummyDB:
+        def commit(self):
+            return None
+
+    monkeypatch.setenv("APP_ENV", "dev")
+    monkeypatch.setenv("ALLOW_PROD_DEBUG", "1")
+    monkeypatch.setattr(chat, "effective_auth_mode", lambda: "dev")
+    monkeypatch.setattr(chat, "_detect_trgm_available", lambda *_: False)
+    monkeypatch.setattr(chat, "is_llm_enabled", lambda: False)
+    monkeypatch.setattr(chat, "embed_query", lambda q: [0.0])
+    monkeypatch.setattr(chat, "_ensure_document_scope", lambda db, docs, p: docs)
+    monkeypatch.setattr(chat, "is_admin", lambda _: True)
+
+    def fake_fetch_chunks(
+        db,
+        qvec_lit,
+        q_text,
+        k,
+        run_id,
+        document_ids,
+        p,
+        question,
+        trgm_available,
+        admin_debug_hybrid,
+        **_kwargs,
+    ):
+        row = {
+            "id": "chunk-1",
+            "document_id": "doc-1",
+            "filename": "demo.pdf",
+            "page": 1,
+            "chunk_index": 0,
+            "text": "chunk content",
+            "dist": 0.2,
+        }
+        debug = {
+            "strategy": "vector_all_docs_admin",
+            "vec_count": 1,
+            "fts_count": 0,
+            "trgm_count": 0,
+            "used_fts": False,
+            "used_trgm": False,
+        }
+        return [row], debug
+
+    monkeypatch.setattr(chat, "fetch_chunks", fake_fetch_chunks)
+
+    payload = AskPayload(question="tell me more", document_ids=["doc-1"], k=1, debug=True)
+    request = DummyRequest("Bearer demo")
+    request.state.request_id = "req-offline"
+    principal = Principal(sub="dev|admin", permissions={"read:docs"})
+
+    resp = chat.ask(payload, request, db=DummyDB(), p=principal)
+    assert isinstance(resp["retrieval_debug"], dict)
+    assert isinstance(resp["debug_meta"], dict)
+
+
+def test_debug_keys_present_for_non_admin_request(monkeypatch):
+    class DummyDB:
+        def commit(self):
+            return None
+
+    monkeypatch.setenv("APP_ENV", "dev")
+    monkeypatch.setenv("ALLOW_PROD_DEBUG", "1")
+    monkeypatch.setattr(chat, "effective_auth_mode", lambda: "dev")
+    monkeypatch.setattr(chat, "_detect_trgm_available", lambda *_: False)
+    monkeypatch.setattr(chat, "is_llm_enabled", lambda: False)
+    monkeypatch.setattr(chat, "embed_query", lambda q: [0.0])
+    monkeypatch.setattr(chat, "_ensure_document_scope", lambda db, docs, p: docs)
+    monkeypatch.setattr(chat, "is_admin", lambda *_: False)
+    monkeypatch.setattr(chat, "admin_debug_via_token", lambda *args, **kwargs: False)
+    monkeypatch.setattr(chat, "is_admin_debug", lambda *args, **kwargs: False)
+
+    def fake_fetch_chunks(
+        db,
+        qvec_lit,
+        q_text,
+        k,
+        run_id,
+        document_ids,
+        p,
+        question,
+        trgm_available,
+        admin_debug_hybrid,
+        **_kwargs,
+    ):
+        row = {
+            "id": "chunk-non-admin",
+            "document_id": "doc-1",
+            "filename": "demo.pdf",
+            "page": 1,
+            "chunk_index": 0,
+            "text": "chunk body",
+            "dist": 0.2,
+        }
+        return [row], None
+
+    monkeypatch.setattr(chat, "fetch_chunks", fake_fetch_chunks)
+
+    payload = AskPayload(question="tell me", document_ids=["doc-1"], k=1, debug=True)
+    request = DummyRequest("Bearer demo")
+    request.state.request_id = "req-non-admin"
+    principal = Principal(sub="dev|user", permissions={"read:docs"})
+
+    resp = chat.ask(payload, request, db=DummyDB(), p=principal)
+    assert isinstance(resp["debug_meta"], dict)
+    assert isinstance(resp["retrieval_debug"], dict)
 
 
 @pytest.mark.parametrize(

@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from app.core.authz import Principal, require_permissions, is_admin
 from app.core.run_access import ensure_run_access
+from app.core.text_utils import strip_control_chars
 from app.db.models import Chunk, Document, Run
 from app.db.session import get_db
 from app.schemas.api_contract import ChunkHealthResponse, ChunkResponse
@@ -201,5 +202,5 @@ def get_chunk(
         filename=getattr(doc, "filename", None),
         page=getattr(chunk, "page", None),
         chunk_index=int(getattr(chunk, "chunk_index", 0)),
-        text=str(getattr(chunk, "text", "")),
+        text=strip_control_chars(getattr(chunk, "text", "")),
     )
