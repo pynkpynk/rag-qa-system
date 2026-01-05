@@ -17,9 +17,16 @@ pytestmark = pytest.mark.usefixtures("force_dev_auth")
 
 client = TestClient(app)
 
-CASES = json.loads(
-    (Path(__file__).resolve().parent / "e2e_eval_cases.json").read_text()
-)
+def _load_cases() -> list[dict[str, object]]:
+    cases_path = Path(__file__).resolve().parent / "e2e_eval_cases.json"
+    if not cases_path.exists():
+        raise AssertionError(
+            "Missing backend/tests/e2e_eval_cases.json. Ensure it is committed to the repo."
+        )
+    return json.loads(cases_path.read_text())
+
+
+CASES = _load_cases()
 SMOKE_PDF = Path(__file__).resolve().parent / "fixtures" / "ragqa_smoke.pdf"
 
 

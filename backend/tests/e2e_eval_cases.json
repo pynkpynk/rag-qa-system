@@ -1,0 +1,32 @@
+[
+  {
+    "name": "capital_france",
+    "question": "What city does the smoke document name as the capital of France?",
+    "expect": {
+      "answer_substring": "capital of France is Paris",
+      "filename": "ragqa_smoke.pdf",
+      "page": 1,
+      "min_citations": 1
+    }
+  },
+  {
+    "name": "quality_slogan",
+    "question": "According to the smoke PDF, what does it say about quality answers?",
+    "expect": {
+      "answer_substring": "Quality answers require precise sources",
+      "filename": "ragqa_smoke.pdf",
+      "page": 2,
+      "min_citations": 1
+    }
+  },
+  {
+    "name": "support_email",
+    "question": "Which support email is listed in the smoke PDF?",
+    "expect": {
+      "answer_substring": "support@ragqa.local",
+      "filename": "ragqa_smoke.pdf",
+      "page": 3,
+      "min_citations": 1
+    }
+  }
+]
