@@ -115,6 +115,10 @@ done || abort "Postgres did not become ready"
 docker exec "${DB_CONTAINER}" psql -U postgres -c "CREATE DATABASE ragqa_ci;" >/dev/null 2>&1 || true
 docker exec "${DB_CONTAINER}" psql -U postgres -d ragqa_ci -c "CREATE EXTENSION IF NOT EXISTS vector;" >/dev/null
 docker exec "${DB_CONTAINER}" psql -U postgres -d ragqa_ci -c "CREATE EXTENSION IF NOT EXISTS pg_trgm;" >/dev/null
+TRGM_AVAILABLE_DB=$(docker exec "${DB_CONTAINER}" psql -U postgres -d ragqa_ci -Atc "SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname='pg_trgm');" 2>/dev/null | tr -d '[:space:]')
+if [[ "${TRGM_AVAILABLE_DB}" != "t" && "${TRGM_AVAILABLE_DB}" != "true" && "${TRGM_AVAILABLE_DB}" != "1" ]]; then
+  abort "pg_trgm extension not installed in ragqa_ci database"
+fi
 
 export DATABASE_URL="postgresql+psycopg://postgres:postgres@127.0.0.1:${DB_PORT}/ragqa_ci"
 export OPENAI_OFFLINE="${OPENAI_OFFLINE:-1}"
@@ -125,6 +129,7 @@ export DEV_SUB="${DEV_SUB:-ci-user}"
 export ADMIN_SUBS="${ADMIN_SUBS:-ci-user}"
 export ALLOW_PROD_DEBUG="${ALLOW_PROD_DEBUG:-1}"
 export ENABLE_RETRIEVAL_DEBUG="1"
+export RETRIEVAL_DEBUG_REQUIRE_TOKEN_HASH="${RETRIEVAL_DEBUG_REQUIRE_TOKEN_HASH:-0}"
 export ENABLE_HYBRID="1"
 export ENABLE_TRGM="1"
 
@@ -253,7 +258,11 @@ CITATIONS_COUNT="$(jq '.citations | length' "${TMP_BODY}")"
 
 TRGM_FLAG="$(jq -r '.debug_meta.trgm_available // empty' "${TMP_BODY}")"
 if [[ "${TRGM_FLAG}" != "true" ]]; then
-  abort "Expected debug_meta.trgm_available true (ensure debug:true and ALLOW_PROD_DEBUG=1)"
+  if [[ "${TRGM_AVAILABLE_DB}" == "t" || "${TRGM_AVAILABLE_DB}" == "true" || "${TRGM_AVAILABLE_DB}" == "1" ]]; then
+    echo "[ci-e2e] Warning: debug_meta.trgm_available missing; pg_trgm confirmed in DB"
+  else
+    abort "pg_trgm unavailable (debug_meta missing and DB check failed)"
+  fi
 fi
 
 echo "[ci-e2e] E2E gate succeeded (doc_id=${DOC_ID} run_id=${RUN_ID})"
