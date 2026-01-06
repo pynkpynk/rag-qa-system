@@ -106,6 +106,8 @@ jobs:
         run: |
           set -euxo pipefail
           . .venv/bin/activate
+          : "${DATABASE_URL:?DATABASE_URL is required}"
+          export DATABASE_URL="$DATABASE_URL"
           python -V
           pip freeze | head -n 200
           cd backend
@@ -256,6 +258,8 @@ jobs:
         run: |
           set -euxo pipefail
           . .venv/bin/activate
+          : "${DATABASE_URL:?DATABASE_URL is required}"
+          export DATABASE_URL="$DATABASE_URL"
           python -V
           pip freeze | head -n 200
           cd backend
