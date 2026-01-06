@@ -90,6 +90,10 @@ class ChatResponse(BaseModel):
     debug_meta: dict[str, Any] | None = None
 
 
+class ChatAskResponse(ChatResponse):
+    pass
+
+
 class RunListItem(BaseModel):
     run_id: str
     created_at: str
@@ -155,6 +159,7 @@ class DebugS3HeadResponse(BaseModel):
 
 __all__ = [
     "ChatCitation",
+    "ChatAskResponse",
     "ChatResponse",
     "ChunkHealthResponse",
     "ChunkResponse",

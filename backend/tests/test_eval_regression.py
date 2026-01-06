@@ -125,6 +125,7 @@ def test_eval_cases(case, monkeypatch):
         question,
         trgm_available,
         admin_debug_hybrid,
+        **_kwargs,
     ):
         if not fetch_data:
             return [], None
@@ -197,6 +198,14 @@ def test_eval_cases(case, monkeypatch):
                     f"{case['name']}: used_trgm mismatch"
                 )
         else:
-            assert "retrieval_debug" not in body, (
-                f"{case['name']}: retrieval_debug should be absent"
-            )
+            if payload.debug:
+                assert "retrieval_debug" in body, (
+                    f"{case['name']}: retrieval_debug key should be present"
+                )
+                assert body["retrieval_debug"] == {}, (
+                    f"{case['name']}: expected empty retrieval_debug object"
+                )
+            else:
+                assert "retrieval_debug" not in body, (
+                    f"{case['name']}: retrieval_debug should be absent"
+                )

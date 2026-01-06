@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: pgvector/pgvector:pg16
+        image: pgvector/pgvector:pg17
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
@@ -31,7 +31,10 @@ jobs:
       OPENAI_OFFLINE: "1"
       OPENAI_API_KEY: dummy
       CORS_ORIGIN: http://localhost:5173
-      DATABASE_URL: postgresql+psycopg://postgres:postgres@localhost:5432/postgres
+      PYTHONUNBUFFERED: "1"
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
 
     steps:
       - name: Checkout
@@ -42,33 +45,78 @@ jobs:
         with:
           python-version: '3.13'
 
+      - name: Configure database env
+        run: |
+          set -euxo pipefail
+          if getent hosts postgres >/dev/null 2>&1; then
+            DB_HOST=postgres
+          else
+            DB_HOST=127.0.0.1
+          fi
+          {
+            echo "DB_HOST=${DB_HOST}"
+            echo "DATABASE_URL=postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${DB_HOST}:5432/${POSTGRES_DB}"
+          } >> "$GITHUB_ENV"
+
       - name: Create venv and install deps
         run: |
+          set -euxo pipefail
           python -m venv .venv
           . .venv/bin/activate
           python -m pip install --upgrade pip
           python -m pip install -r backend/requirements.txt
           if [ -f backend/requirements-dev.txt ]; then python -m pip install -r backend/requirements-dev.txt; fi
 
+      - name: Install PostgreSQL client
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client
+
       - name: Wait for Postgres
         run: |
+          set -euxo pipefail
           for i in {1..30}; do
-            if nc -z localhost 5432; then
+            if pg_isready -h "$DB_HOST" -p 5432 -U "$POSTGRES_USER"; then
+              echo "Postgres is ready"
               exit 0
             fi
+            echo "Waiting for Postgres (${i})"
             sleep 2
           done
           echo "Postgres did not become ready" >&2
           exit 1
 
+      - name: Init database extensions
+        env:
+          PGPASSWORD: ${{ env.POSTGRES_PASSWORD }}
+        run: |
+          set -euxo pipefail
+          psql -h "$DB_HOST" -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "CREATE EXTENSION IF NOT EXISTS pg_trgm;"
+          psql -h "$DB_HOST" -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "CREATE EXTENSION IF NOT EXISTS vector;"
+
       - name: Run Alembic migrations
         run: |
+          set -euxo pipefail
           . .venv/bin/activate
           cd backend
           alembic upgrade head
 
+      - name: Backend diagnostics
+        run: |
+          set -euxo pipefail
+          . .venv/bin/activate
+          : "${DATABASE_URL:?DATABASE_URL is required}"
+          export DATABASE_URL="$DATABASE_URL"
+          python -V
+          pip freeze | head -n 200
+          cd backend
+          alembic current
+          alembic heads
+
       - name: Script syntax checks
         run: |
+          set -euxo pipefail
           . .venv/bin/activate
           bash -n backend/scripts/smoke.sh
           bash -n backend/scripts/dev_up.sh
@@ -81,30 +129,65 @@ jobs:
           MAX_REQUEST_BYTES: '1024'
           RATE_LIMIT_ENABLED: '0'
           ADMIN_SUBS: smoke-ci-dummy-sub
+          ENABLE_SMOKE_ENDPOINT: '1'
+          SMOKE_FORCE_RESTART: '1'
         run: |
+          set -euxo pipefail
           . .venv/bin/activate
           cd backend
-          bash scripts/smoke.sh
+          LOG_DIR="${GITHUB_WORKSPACE}/ci-logs"
+          mkdir -p "$LOG_DIR"
+          bash scripts/smoke.sh 2>&1 | tee "$LOG_DIR/smoke.log"
 
       - name: Run pytest
         env:
           APP_ENV: dev
           AUTH_MODE: dev
-          DATABASE_URL: ${{ env.DATABASE_URL }}
           OPENAI_API_KEY: ${{ env.OPENAI_API_KEY }}
           CORS_ORIGIN: ${{ env.CORS_ORIGIN }}
         run: |
+          set -euxo pipefail
           . .venv/bin/activate
           cd backend
-          python -m pytest -q
+          LOG_DIR="${GITHUB_WORKSPACE}/ci-logs"
+          mkdir -p "$LOG_DIR"
+          python -m pytest -vv -rA --maxfail=1 tests 2>&1 | tee "$LOG_DIR/pytest.log"
+
+      - name: Upload backend logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-smoke-logs
+          path: |
+            ci-logs/smoke.log
+            ci-logs/pytest.log
+            backend/.devserver.log
 
   e2e:
     needs: smoke
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     env:
       OPENAI_OFFLINE: "1"
       OPENAI_API_KEY: sk-ci-dummy
       CORS_ORIGIN: http://localhost:5173
+      PYTHONUNBUFFERED: "1"
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -114,8 +197,22 @@ jobs:
         with:
           python-version: '3.13'
 
+      - name: Configure database env
+        run: |
+          set -euxo pipefail
+          if getent hosts postgres >/dev/null 2>&1; then
+            DB_HOST=postgres
+          else
+            DB_HOST=127.0.0.1
+          fi
+          {
+            echo "DB_HOST=${DB_HOST}"
+            echo "DATABASE_URL=postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${DB_HOST}:5432/${POSTGRES_DB}"
+          } >> "$GITHUB_ENV"
+
       - name: Create venv and install deps
         run: |
+          set -euxo pipefail
           python -m venv .venv
           . .venv/bin/activate
           python -m pip install --upgrade pip
@@ -123,7 +220,53 @@ jobs:
           if [ -f backend/requirements-dev.txt ]; then python -m pip install -r backend/requirements-dev.txt; fi
 
       - name: Install tools
-        run: sudo apt-get update && sudo apt-get install -y jq
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y jq postgresql-client
+
+      - name: Wait for Postgres
+        run: |
+          set -euxo pipefail
+          for i in {1..30}; do
+            if pg_isready -h "$DB_HOST" -p 5432 -U "$POSTGRES_USER"; then
+              echo "Postgres is ready"
+              exit 0
+            fi
+            echo "Waiting for Postgres (${i})"
+            sleep 2
+          done
+          echo "Postgres did not become ready" >&2
+          exit 1
+
+      - name: Init database extensions
+        env:
+          PGPASSWORD: ${{ env.POSTGRES_PASSWORD }}
+        run: |
+          set -euxo pipefail
+          psql -h "$DB_HOST" -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "CREATE EXTENSION IF NOT EXISTS pg_trgm;"
+          psql -h "$DB_HOST" -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "CREATE EXTENSION IF NOT EXISTS vector;"
+
+      - name: Run Alembic migrations
+        run: |
+          set -euxo pipefail
+          . .venv/bin/activate
+          cd backend
+          alembic upgrade head
+
+      - name: Backend diagnostics (e2e)
+        run: |
+          set -euxo pipefail
+          . .venv/bin/activate
+          : "${DATABASE_URL:?DATABASE_URL is required}"
+          export DATABASE_URL="$DATABASE_URL"
+          python -V
+          pip freeze | head -n 200
+          cd backend
+          if ! alembic current; then
+            echo "alembic current failed (likely no DATABASE_URL configured)" >&2
+          fi
+          alembic heads
 
       - name: Run CI E2E gate
         env:
@@ -131,6 +274,17 @@ jobs:
           DEV_SUB: ci-user
           ADMIN_SUBS: ci-user
         run: |
+          set -euxo pipefail
           . .venv/bin/activate
           cd backend
-          bash scripts/ci_e2e_gate.sh
+          LOG_DIR="${GITHUB_WORKSPACE}/ci-logs"
+          mkdir -p "$LOG_DIR"
+          bash scripts/ci_e2e_gate.sh 2>&1 | tee "$LOG_DIR/ci_e2e_gate.log"
+
+      - name: Upload e2e logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-e2e-logs
+          path: |
+            ci-logs/ci_e2e_gate.log
