@@ -53,6 +53,8 @@ def hybrid_search_chunks_rrf(
     document_ids: Sequence[str] | None,
     query_text: str,
     query_embedding: Sequence[float],
+    q_trgm: str | None = None,
+    q_trgm_text: str | None = None,
     top_k: int = 20,
     fts_k: int = 50,
     vec_k: int = 50,
@@ -78,8 +80,8 @@ def hybrid_search_chunks_rrf(
 
     if top_k <= 0:
         raise ValueError("top_k must be > 0")
-    if vec_k <= 0:
-        raise ValueError("vec_k must be > 0")
+    if vec_k < 0:
+        raise ValueError("vec_k must be >= 0")
     if rrf_k <= 0:
         raise ValueError("rrf_k must be > 0")
 
@@ -87,12 +89,174 @@ def hybrid_search_chunks_rrf(
     use_doc_filter = bool(doc_ids)
 
     q_emb = _to_pgvector_literal(query_embedding)
+    if q_trgm is None and q_trgm_text is not None:
+        q_trgm = q_trgm_text
+    q_trgm = query_text if q_trgm is None else q_trgm
     trgm_patterns = [pattern for pattern in (trgm_like_patterns or []) if pattern]
     use_trgm = bool(use_trgm and trgm_k > 0)
     use_fts = bool(use_fts and fts_k > 0)
+    use_like_fallback = bool(
+        trgm_patterns and (not use_trgm) and fts_k <= 0 and vec_k <= 0
+    )
 
-    sql = text(
+    if use_like_fallback:
+        at_patterns = [p for p in trgm_patterns if "@" in p]
+        base_patterns = [p for p in trgm_patterns if p not in at_patterns]
+        at_pattern = at_patterns[0] if at_patterns else "%@%"
+        extra_clause = (
+            "\n  AND c.text ILIKE ANY(:trgm_like_patterns)" if base_patterns else ""
+        )
+        like_sql = text(
+            f"""
+SELECT
+  c.id,
+  c.document_id,
+  d.filename,
+  c.page,
+  c.chunk_index,
+  c.text
+FROM chunks c
+JOIN documents d ON d.id = c.document_id
+WHERE
+  d.status = 'indexed'
+  AND (
+    :owner_sub IS NULL
+    OR d.owner_sub = :owner_sub
+    OR (:owner_sub_alt IS NOT NULL AND d.owner_sub = :owner_sub_alt)
+  )
+  AND (
+    :use_doc_filter = false
+    OR CAST(c.document_id AS text) = ANY(:doc_ids)
+  )
+  AND c.text ILIKE :at_pattern{extra_clause}
+ORDER BY c.page NULLS LAST, c.chunk_index ASC, c.id ASC
+LIMIT :top_k
+            """
+        ).bindparams(
+            bindparam("owner_sub", type_=String()),
+            bindparam("owner_sub_alt", type_=String()),
+            bindparam("use_doc_filter", type_=Boolean()),
+            bindparam("doc_ids", type_=ARRAY(String())),
+            bindparam("at_pattern", type_=String()),
+            bindparam("top_k", type_=Integer()),
+        )
+        if base_patterns:
+            like_sql = like_sql.bindparams(
+                bindparam("trgm_like_patterns", type_=ARRAY(String())),
+            )
+        params = {
+            "owner_sub": owner_sub,
+            "owner_sub_alt": owner_sub_alt,
+            "use_doc_filter": use_doc_filter,
+            "doc_ids": doc_ids or [],
+            "at_pattern": at_pattern,
+            "top_k": top_k,
+        }
+        if base_patterns:
+            params["trgm_like_patterns"] = base_patterns
+        rows = db.execute(like_sql, params).mappings()
+        hits: list[HybridHit] = []
+        for rank, r in enumerate(rows, start=1):
+            hits.append(
+                HybridHit(
+                    chunk_id=r["id"],
+                    document_id=r["document_id"],
+                    filename=r.get("filename"),
+                    page=r["page"],
+                    chunk_index=r["chunk_index"],
+                    text=r["text"],
+                    score=max(0.0, 1.0 - (rank - 1) * 0.001),
+                    rank_fts=None,
+                    rank_vec=None,
+                    vec_distance=None,
+                    rank_trgm=rank,
+                    trgm_sim=None,
+                )
+            )
+        meta = HybridMeta(
+            fts_count=0,
+            vec_count=0,
+            trgm_count=len(hits),
+            vec_min_distance=None,
+            vec_max_distance=None,
+            vec_avg_distance=None,
+            trgm_min_sim=None,
+            trgm_max_sim=None,
+            trgm_avg_sim=None,
+        )
+        return hits, meta
+
+    trgm_threshold_line = (
+        "\n    , set_config('pg_trgm.similarity_threshold', :trgm_limit, true) AS _trgm_threshold_set"
+        if use_trgm
+        else ""
+    )
+    trgm_cte = (
         """
+, trgm AS (
+  SELECT
+    c.id AS chunk_id,
+    ROW_NUMBER() OVER (ORDER BY similarity(c.text, :q_trgm) DESC) AS r_trgm,
+    similarity(c.text, :q_trgm) AS sim
+  FROM chunks c
+  JOIN documents d ON d.id = c.document_id
+  CROSS JOIN params p
+  WHERE
+    p.use_trgm = true
+    AND (
+      :owner_sub IS NULL
+      OR d.owner_sub = :owner_sub
+      OR (:owner_sub_alt IS NOT NULL AND d.owner_sub = :owner_sub_alt)
+    )
+    AND d.status = 'indexed'
+    AND (
+      p.use_doc_filter = false
+      OR CAST(c.document_id AS text) = ANY(:doc_ids)
+    )
+    AND (
+      cardinality(:trgm_like_patterns) = 0
+      OR c.text ILIKE ANY(:trgm_like_patterns)
+    )
+    AND c.text % :q_trgm
+  ORDER BY similarity(c.text, :q_trgm) DESC
+  LIMIT :trgm_k
+)
+"""
+        if use_trgm
+        else ""
+    )
+    trgm_union = (
+        """
+    UNION ALL
+    SELECT chunk_id, r_trgm AS rank FROM trgm
+"""
+        if use_trgm
+        else ""
+    )
+    trgm_join = (
+        "  LEFT JOIN trgm ON trgm.chunk_id = c.id\n" if use_trgm else ""
+    )
+    trgm_columns = (
+        "    trgm.r_trgm,\n    trgm.sim AS trgm_sim"
+        if use_trgm
+        else "    NULL::integer AS r_trgm,\n    NULL::double precision AS trgm_sim"
+    )
+    trgm_meta_select = (
+        """
+    (SELECT COUNT(*) FROM trgm) AS trgm_count,
+    (SELECT MIN(sim) FROM trgm) AS trgm_min_sim,
+    (SELECT MAX(sim) FROM trgm) AS trgm_max_sim,
+    (SELECT AVG(sim) FROM trgm) AS trgm_avg_sim,
+"""
+        if use_trgm
+        else """
+    0 AS trgm_count,
+    NULL::double precision AS trgm_min_sim,
+    NULL::double precision AS trgm_max_sim,
+    NULL::double precision AS trgm_avg_sim,
+"""
+    )
+    sql_template = f"""
 WITH
 params AS (
   SELECT
@@ -101,8 +265,7 @@ params AS (
     CAST(:rrf_k AS int) AS rrf_k,
     CAST(:use_doc_filter AS boolean) AS use_doc_filter,
     CAST(:use_fts AS boolean) AS use_fts,
-    CAST(:use_trgm AS boolean) AS use_trgm,
-    set_config('pg_trgm.similarity_threshold', :trgm_limit, true) AS _trgm_threshold_set
+    CAST(:use_trgm AS boolean) AS use_trgm{trgm_threshold_line}
 ),
 fts AS (
   SELECT
@@ -149,45 +312,15 @@ vec AS (
     AND c.embedding IS NOT NULL
   ORDER BY (c.embedding <=> p.qvec) ASC
   LIMIT :vec_k
-),
-trgm AS (
-  SELECT
-    c.id AS chunk_id,
-    ROW_NUMBER() OVER (ORDER BY similarity(c.text, :q) DESC) AS r_trgm,
-    similarity(c.text, :q) AS sim
-  FROM chunks c
-  JOIN documents d ON d.id = c.document_id
-  CROSS JOIN params p
-  WHERE
-    p.use_trgm = true
-    AND (
-      :owner_sub IS NULL
-      OR d.owner_sub = :owner_sub
-      OR (:owner_sub_alt IS NOT NULL AND d.owner_sub = :owner_sub_alt)
-    )
-    AND d.status = 'indexed'
-    AND (
-      p.use_doc_filter = false
-      OR CAST(c.document_id AS text) = ANY(:doc_ids)
-    )
-    AND (
-      cardinality(:trgm_like_patterns) = 0
-      OR c.text ILIKE ANY(:trgm_like_patterns)
-    )
-    AND c.text % :q
-  ORDER BY similarity(c.text, :q) DESC
-  LIMIT :trgm_k
-),
-rrf AS (
+){trgm_cte}
+, rrf AS (
   SELECT
     src.chunk_id,
     SUM(1.0 / (p.rrf_k + src.rank)) AS score
   FROM (
     SELECT chunk_id, r_fts AS rank FROM fts
     UNION ALL
-    SELECT chunk_id, r_vec AS rank FROM vec
-    UNION ALL
-    SELECT chunk_id, r_trgm AS rank FROM trgm
+    SELECT chunk_id, r_vec AS rank FROM vec{trgm_union}
   ) src
   CROSS JOIN params p
   GROUP BY src.chunk_id
@@ -204,28 +337,22 @@ picked AS (
     vec.dist AS vec_distance,
     fts.r_fts,
     vec.r_vec,
-    trgm.r_trgm,
-    trgm.sim AS trgm_sim
+{trgm_columns}
   FROM rrf r
   JOIN chunks c ON c.id = r.chunk_id
   JOIN documents d ON d.id = c.document_id
   LEFT JOIN vec ON vec.chunk_id = c.id
   LEFT JOIN fts ON fts.chunk_id = c.id
-  LEFT JOIN trgm ON trgm.chunk_id = c.id
-  ORDER BY r.score DESC, c.id ASC
+{trgm_join}  ORDER BY r.score DESC, c.id ASC
   LIMIT :top_k
 ),
 meta AS (
   SELECT
     (SELECT COUNT(*) FROM fts) AS fts_count,
     (SELECT COUNT(*) FROM vec) AS vec_count,
-    (SELECT COUNT(*) FROM trgm) AS trgm_count,
-    (SELECT MIN(dist) FROM vec) AS vec_min_distance,
+{trgm_meta_select}    (SELECT MIN(dist) FROM vec) AS vec_min_distance,
     (SELECT MAX(dist) FROM vec) AS vec_max_distance,
-    (SELECT AVG(dist) FROM vec) AS vec_avg_distance,
-    (SELECT MIN(sim) FROM trgm) AS trgm_min_sim,
-    (SELECT MAX(sim) FROM trgm) AS trgm_max_sim,
-    (SELECT AVG(sim) FROM trgm) AS trgm_avg_sim
+    (SELECT AVG(dist) FROM vec) AS vec_avg_distance
 )
 SELECT
   p.id,
@@ -253,7 +380,9 @@ FROM meta m
 LEFT JOIN picked p ON true
 ORDER BY p.score DESC NULLS LAST, p.id ASC NULLS LAST;
 """
-    ).bindparams(
+    sql = text(sql_template)
+    wants_q_trgm = ":q_trgm" in sql_template or "%(q_trgm)" in sql_template
+    bind_params = [
         bindparam("q", type_=String()),
         bindparam("owner_sub", type_=String()),
         bindparam("owner_sub_alt", type_=String()),
@@ -262,39 +391,48 @@ ORDER BY p.score DESC NULLS LAST, p.id ASC NULLS LAST;
         bindparam("use_doc_filter", type_=Boolean()),
         bindparam("use_fts", type_=Boolean()),
         bindparam("use_trgm", type_=Boolean()),
-        bindparam("trgm_limit", type_=String()),
-        bindparam("trgm_like_patterns", type_=ARRAY(String())),
         bindparam("doc_ids", type_=ARRAY(String())),
         bindparam("top_k", type_=Integer()),
         bindparam("fts_k", type_=Integer()),
         bindparam("vec_k", type_=Integer()),
-        bindparam("trgm_k", type_=Integer()),
-    )
+    ]
+    if wants_q_trgm:
+        bind_params.append(bindparam("q_trgm", type_=String()))
+    if use_trgm:
+        bind_params.extend(
+            [
+                bindparam("trgm_limit", type_=String()),
+                bindparam("trgm_like_patterns", type_=ARRAY(String())),
+                bindparam("trgm_k", type_=Integer()),
+            ]
+        )
+    sql = sql.bindparams(*bind_params)
 
-    rows = (
-        db.execute(
-            sql,
+    exec_params = {
+        "owner_sub": owner_sub,
+        "owner_sub_alt": owner_sub_alt,
+        "q": query_text,
+        "q_emb": q_emb,
+        "rrf_k": rrf_k,
+        "use_doc_filter": use_doc_filter,
+        "use_fts": use_fts,
+        "use_trgm": use_trgm,
+        "doc_ids": doc_ids or [],
+        "top_k": top_k,
+        "fts_k": fts_k,
+        "vec_k": vec_k,
+    }
+    if wants_q_trgm:
+        exec_params["q_trgm"] = q_trgm
+    if use_trgm:
+        exec_params.update(
             {
-                "owner_sub": owner_sub,
-                "owner_sub_alt": owner_sub_alt,
-                "q": query_text,
-                "q_emb": q_emb,
-                "rrf_k": rrf_k,
-                "use_doc_filter": use_doc_filter,
-                "use_fts": use_fts,
-                "use_trgm": use_trgm,
                 "trgm_limit": f"{float(trgm_limit):.6f}",
                 "trgm_like_patterns": trgm_patterns,
-                "doc_ids": doc_ids or [],
-                "top_k": top_k,
-                "fts_k": fts_k,
-                "vec_k": vec_k,
-                "trgm_k": trgm_k if use_trgm else 0,
-            },
+                "trgm_k": trgm_k,
+            }
         )
-        .mappings()
-        .all()
-    )
+    rows = db.execute(sql, exec_params).mappings().all()
 
     hits: list[HybridHit] = []
     for r in rows:
