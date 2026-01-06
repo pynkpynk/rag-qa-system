@@ -48,6 +48,10 @@ def _unauth_detail(message: str) -> Dict[str, str]:
     return {"code": "NOT_AUTHENTICATED", "message": message}
 
 
+def _auth_bypass_forbidden_detail(message: str) -> Dict[str, str]:
+    return {"code": "AUTH_BYPASS_FORBIDDEN", "message": message}
+
+
 def _parse_csv(v: str) -> list[str]:
     return [x.strip() for x in v.split(",") if x.strip()]
 
@@ -285,8 +289,11 @@ def _maybe_guard_prod_mode() -> None:
         return
     mode = _effective_mode()
     if _is_production() and mode in {"dev", "disabled"}:
-        raise RuntimeError(
-            "Auth bypass (AUTH_MODE=dev or AUTH_DISABLED=1) is not allowed in production."
+        raise HTTPException(
+            status_code=403,
+            detail=_auth_bypass_forbidden_detail(
+                "Auth bypass (AUTH_MODE=dev or AUTH_DISABLED=1) is not allowed in production."
+            ),
         )
 
 
