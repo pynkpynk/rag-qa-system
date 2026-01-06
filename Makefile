@@ -42,6 +42,10 @@ health:
 docs:
 	@curl -sS http://$(BACKEND_HOST):$(BACKEND_PORT)/api/docs | python -m json.tool || true
 
+.PHONY: smoke-prod
+smoke-prod:
+	@./scripts/smoke_prod.sh
+
 .PHONY: preflight
 preflight:
 	@./scripts/preflight.sh
