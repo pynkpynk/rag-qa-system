@@ -27,6 +27,15 @@
 - Run `make prod-smoke` (or `bash scripts/prod_smoke.sh`). The script uploads the PDF, validates tenant isolation for docs/runs/chunks, runs an Ask call, and prints PASS/FAIL.
 - Example: `API_BASE=https://rag.example.com/api TOKEN_A=... TOKEN_B=... PDF=./sample.pdf make prod-smoke`
 
+## Production smoke (health/search)
+- For a quicker API check (no upload), set `API_BASE` (without trailing slash) and `TOKEN`, then run:
+  ```bash
+  API_BASE=https://rag-qa-system-wv95.onrender.com \
+  TOKEN=demo-token \
+  make smoke-prod
+  ```
+- This runs `GET /api/health`, `GET /api/chunks/health`, and `POST /api/search` (with debug flag) and fails fast on any non-2xx response.
+
 ## Local dev workflow (deterministic)
 1. Copy `backend/.env.example` to `backend/.env.local`, fill in required keys, and quote any values containing `|` (e.g., `DEV_SUB="auth0|local-user"`). In dev mode, only `DEV_ADMIN_SUBS` grants admin rights; leave it empty to stay non-admin by default.
 2. Verify the environment with `python backend/scripts/dev_env_status.py` (all required keys should show `SET`).
