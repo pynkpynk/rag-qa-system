@@ -15,6 +15,7 @@ echo "[smoke] API_BASE=${API_BASE} token_prefix=${token_prefix}"
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 tmpdir="$(mktemp -d)"
+LAST_RESPONSE_BODY=""
 cleanup() {
   rm -rf "${tmpdir}"
 }
@@ -36,6 +37,7 @@ run_request() {
   )
   local curl_rc=$?
   set -e
+  LAST_RESPONSE_BODY="${body_file}"
   if [[ ${curl_rc} -ne 0 ]]; then
     echo "[smoke] curl error rc=${curl_rc} (${method} ${url})" >&2
     if [[ -s "${body_file}" ]]; then
@@ -68,6 +70,46 @@ run_request GET "${API_BASE%/}/api/health"
 echo "[smoke] 2/3 GET /api/chunks/health"
 run_request GET "${API_BASE%/}/api/chunks/health" \
   -H "Authorization: Bearer ${TOKEN}"
+chunks_health_body="${LAST_RESPONSE_BODY:-}"
+if [[ -z "${chunks_health_body}" || ! -f "${chunks_health_body}" ]]; then
+  echo "[smoke] missing /api/chunks/health body capture" >&2
+  exit 1
+fi
+echo "[smoke] validating DB state from /api/chunks/health"
+CHUNKS_HEALTH_BODY="${chunks_health_body}" python - <<'PY'
+import json
+import os
+import sys
+
+body_path = os.environ.get("CHUNKS_HEALTH_BODY")
+if not body_path or not os.path.exists(body_path):
+    print("[smoke] FAIL: chunks health body missing", file=sys.stderr)
+    sys.exit(1)
+
+with open(body_path, "r", encoding="utf-8") as f:
+    payload = json.load(f)
+
+db = payload.get("db") or {}
+rev = db.get("alembic_revision")
+if not rev:
+    print("[smoke] FAIL: db.alembic_revision missing or empty", file=sys.stderr)
+    sys.exit(1)
+
+dialect = (db.get("dialect") or "").lower()
+if dialect == "postgresql":
+    if db.get("chunks_fts_column") is not True:
+        print("[smoke] FAIL: chunks_fts_column not reported as present", file=sys.stderr)
+        sys.exit(1)
+    if db.get("pg_trgm_installed") is not True:
+        print("[smoke] FAIL: pg_trgm extension not reported", file=sys.stderr)
+        sys.exit(1)
+    if db.get("fts_gin_index") is not True:
+        print("[smoke] warning: fts_gin_index not reported as present", file=sys.stderr)
+    if db.get("text_trgm_index") is not True:
+        print("[smoke] warning: text_trgm_index not reported as present", file=sys.stderr)
+else:
+    print(f"[smoke] db dialect={dialect or 'unknown'} (no pg-specific enforcement)")
+PY
 
 echo "[smoke] 3/3 POST /api/search"
 run_request POST "${API_BASE%/}/api/search" \
