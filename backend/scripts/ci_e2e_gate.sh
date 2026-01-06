@@ -123,6 +123,7 @@ export CORS_ORIGIN="${CORS_ORIGIN:-http://localhost:5173}"
 export AUTH_MODE="dev"
 export DEV_SUB="${DEV_SUB:-ci-user}"
 export ADMIN_SUBS="${ADMIN_SUBS:-ci-user}"
+export ALLOW_PROD_DEBUG="${ALLOW_PROD_DEBUG:-1}"
 export ENABLE_RETRIEVAL_DEBUG="1"
 export ENABLE_HYBRID="1"
 export ENABLE_TRGM="1"
@@ -251,6 +252,8 @@ CITATIONS_COUNT="$(jq '.citations | length' "${TMP_BODY}")"
 [[ "${CITATIONS_COUNT}" -gt 0 ]] || abort "Expected citations"
 
 TRGM_FLAG="$(jq -r '.debug_meta.trgm_available // empty' "${TMP_BODY}")"
-[[ "${TRGM_FLAG}" == "true" ]] || abort "Expected debug_meta.trgm_available true"
+if [[ "${TRGM_FLAG}" != "true" ]]; then
+  abort "Expected debug_meta.trgm_available true (ensure debug:true and ALLOW_PROD_DEBUG=1)"
+fi
 
 echo "[ci-e2e] E2E gate succeeded (doc_id=${DOC_ID} run_id=${RUN_ID})"
