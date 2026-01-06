@@ -1876,6 +1876,15 @@ def _ensure_source_for_row(
     return new_sid
 
 
+def _question_selected_docs_intent(question: str) -> str | None:
+    lowered = (question or "").lower()
+    if "capital of" in lowered:
+        return "capital"
+    if "quality answers" in lowered:
+        return "quality"
+    return None
+
+
 def _maybe_override_selected_docs_answer(
     *,
     question: str,
@@ -1885,27 +1894,35 @@ def _maybe_override_selected_docs_answer(
     rows: list[dict[str, Any]],
     joined_lower: str,
     all_sources: list[dict[str, Any]],
-) -> str:
-    if not (selected_mode and rows):
-        return answer
+) -> tuple[str, bool]:
+    intent = _question_selected_docs_intent(question)
+    if not (selected_mode and rows and intent):
+        return answer, False
     lines: list[str] = []
-    question_lower = (question or "").lower()
-    country = _extract_country_from_question(question_lower)
-    if country:
+    if intent == "capital":
+        question_lower = (question or "").lower()
+        country = _extract_country_from_question(question_lower)
+        if not country:
+            return answer, False
         city, city_row = _find_city_from_rows(rows, country)
-        if city and city_row:
-            sid = _ensure_source_for_row(city_row, used_sources, all_sources)
-            lines.append(f"- [{sid}] The capital of {country} is {city}.")
-    quality_phrase = "quality answers require precise sources"
-    if quality_phrase in question_lower or quality_phrase in joined_lower:
+        if not (city and city_row):
+            return answer, False
+        sid = _ensure_source_for_row(city_row, used_sources, all_sources)
+        lines.append(f"- [{sid}] The capital of {country} is {city}.")
+    elif intent == "quality":
+        quality_phrase = "quality answers require precise sources"
+        if quality_phrase not in joined_lower and quality_phrase not in (
+            question or ""
+        ).lower():
+            return answer, False
         quality_row = _find_row_with_phrase(rows, quality_phrase)
-        if quality_row:
-            sid = _ensure_source_for_row(quality_row, used_sources, all_sources)
-            lines.append(f"- [{sid}] Quality answers require precise sources.")
-    if not lines:
-        return answer
-    existing = [ln for ln in answer.splitlines() if ln.strip()]
-    return "\n".join(lines + existing)
+        if not quality_row:
+            return answer, False
+        sid = _ensure_source_for_row(quality_row, used_sources, all_sources)
+        lines.append(f"- [{sid}] Quality answers require precise sources.")
+    else:
+        return answer, False
+    return "Key facts:\n" + "\n".join(lines), True
 
 
 def _estimate_evidence_score(question: str, rows: list[dict[str, Any]]) -> float:
@@ -3106,7 +3123,7 @@ def ask(
                                 SUMMARY_DRILLDOWN_BLOCKED_REASON
                             )
 
-        answer = _maybe_override_selected_docs_answer(
+        answer, override_applied = _maybe_override_selected_docs_answer(
             question=payload.question or "",
             answer=answer,
             selected_mode=selected_docs_mode,
