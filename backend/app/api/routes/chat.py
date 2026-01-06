@@ -3123,7 +3123,7 @@ def ask(
                                 SUMMARY_DRILLDOWN_BLOCKED_REASON
                             )
 
-        answer, override_applied = _maybe_override_selected_docs_answer(
+        answer, _ = _maybe_override_selected_docs_answer(
             question=payload.question or "",
             answer=answer,
             selected_mode=selected_docs_mode,
