@@ -1,9 +1,15 @@
 import hashlib
+import logging
 import os
+import re
 from typing import List, Tuple
 
-from pypdf import PdfReader
 from openai import OpenAI
+from pypdf import PdfReader
+
+from app.services.ocr import get_ocr_backend
+
+logger = logging.getLogger(__name__)
 
 EMBED_DIM = int(os.getenv("EMBED_DIM", "1536") or "1536")
 
@@ -28,7 +34,7 @@ def _offline_embedding(text: str) -> List[float]:
     return vec[:EMBED_DIM]
 
 
-def extract_pdf_pages(path: str) -> List[Tuple[int, str]]:
+def _extract_pdf_pages_pypdf(path: str) -> List[Tuple[int, str]]:
     reader = PdfReader(path)
     out = []
     for i, page in enumerate(reader.pages):
@@ -36,6 +42,65 @@ def extract_pdf_pages(path: str) -> List[Tuple[int, str]]:
         if text:
             out.append((i + 1, text))
     return out
+
+
+_TABLE_LINE_RE = re.compile(r"\S\s{2,}\S")
+
+
+def normalize_table_like_text(text: str) -> str:
+    lines = text.splitlines()
+    normalized: list[str] = []
+    for line in lines:
+        if _TABLE_LINE_RE.search(line):
+            normalized.append(re.sub(r"\s{2,}", "\t", line.rstrip()))
+        else:
+            normalized.append(line)
+    return "\n".join(normalized)
+
+
+def extract_pdf_pages_with_ocr_fallback(
+    path: str,
+    *,
+    request_id: str | None = None,
+    min_total_chars: int = 80,
+) -> List[Tuple[int, str]]:
+    pages = _extract_pdf_pages_pypdf(path)
+    pages = [(num, normalize_table_like_text(text)) for num, text in pages]
+    total_chars = sum(len(text) for _, text in pages)
+    if total_chars >= min_total_chars or not os.path.exists(path):
+        return pages
+
+    try:
+        backend = get_ocr_backend()
+    except RuntimeError as exc:  # noqa: BLE001
+        logger.info(
+            "ocr_backend_unavailable",
+            extra={"request_id": request_id, "error": str(exc)},
+        )
+        return pages
+
+    try:
+        ocr_pages = backend.extract(path, request_id=request_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "ocr_backend_failed",
+            extra={"request_id": request_id, "error": str(exc)},
+        )
+        return pages
+
+    if not ocr_pages:
+        logger.info(
+            "ocr_no_text_found",
+            extra={"request_id": request_id},
+        )
+        return pages
+
+    ocr_pages = [(num, normalize_table_like_text(text)) for num, text in ocr_pages]
+    return ocr_pages
+
+
+def extract_pdf_pages(path: str) -> List[Tuple[int, str]]:
+    return extract_pdf_pages_with_ocr_fallback(path)
 
 
 def simple_chunk(text: str, max_chars: int = 1200, overlap: int = 150) -> List[str]:
