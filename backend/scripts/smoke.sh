@@ -117,7 +117,7 @@ body_size_check() {
     "$target_endpoint" || true)
   if [ "$smoke_endpoint_enabled" -eq 1 ] && [ "$code" = "404" ]; then
     echo "Smoke endpoint is disabled on the running server (404)." >&2
-    echo "Start dev_up with ENABLE_SMOKE_ENDPOINT=1 (and APP_ENV=dev) or let smoke.sh manage the server." >&2
+    echo "Hint: rerun with SMOKE_FORCE_RESTART=1 ENABLE_SMOKE_ENDPOINT=1 APP_ENV=dev (smoke.sh will restart dev_up for you)." >&2
     exit 1
   fi
   if [ "$code" != "413" ]; then

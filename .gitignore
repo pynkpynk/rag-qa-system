@@ -115,6 +115,7 @@ pnpm-debug.log*
 *.pdf
 !datasets/**/*.pdf
 !frontend/public/**/*.pdf
+!backend/tests/fixtures/**/*.pdf
 
 # =========================
 # Optional: DB dumps / local compose volumes
@@ -131,3 +132,6 @@ __pycache__/
 
 # Next.js build output
 .next/
+
+# build artifacts
+frontend.zip
