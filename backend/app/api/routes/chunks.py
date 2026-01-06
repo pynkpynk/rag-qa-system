@@ -162,6 +162,93 @@ def _ensure_chunk_accessible_for_run(
         _not_found()
 
 
+def _safe_bool_query(db: Session, sql: str) -> bool | None:
+    try:
+        result = db.execute(sql_text(sql)).scalar()
+    except Exception:
+        return None
+    if result is None:
+        return None
+    return bool(result)
+
+
+def _build_db_status(db: Session) -> dict:
+    status = {
+        "dialect": None,
+        "alembic_revision": None,
+        "chunks_fts_column": None,
+        "fts_gin_index": None,
+        "pg_trgm_installed": None,
+        "text_trgm_index": None,
+    }
+    try:
+        bind = db.get_bind()
+    except Exception:
+        bind = None
+    if bind is None:
+        return status
+
+    dialect = getattr(getattr(bind, "dialect", None), "name", None)
+    if dialect:
+        status["dialect"] = dialect
+
+    try:
+        version = db.execute(
+            sql_text("SELECT version_num FROM alembic_version LIMIT 1")
+        ).scalar()
+        status["alembic_revision"] = version
+    except Exception:
+        status["alembic_revision"] = None
+
+    if dialect != "postgresql":
+        return status
+
+    status["chunks_fts_column"] = _safe_bool_query(
+        db,
+        """
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_name = 'chunks'
+          AND column_name = 'fts'
+          AND table_schema = current_schema()
+        LIMIT 1
+        """,
+    )
+    status["fts_gin_index"] = _safe_bool_query(
+        db,
+        """
+        SELECT 1
+        FROM pg_indexes
+        WHERE tablename = 'chunks'
+          AND schemaname = current_schema()
+          AND indexdef ILIKE '%USING gin%'
+          AND indexdef ILIKE '%fts%'
+        LIMIT 1
+        """,
+    )
+    status["text_trgm_index"] = _safe_bool_query(
+        db,
+        """
+        SELECT 1
+        FROM pg_indexes
+        WHERE tablename = 'chunks'
+          AND schemaname = current_schema()
+          AND indexdef ILIKE '%trgm_ops%'
+        LIMIT 1
+        """,
+    )
+    status["pg_trgm_installed"] = _safe_bool_query(
+        db,
+        """
+        SELECT 1
+        FROM pg_extension
+        WHERE extname = 'pg_trgm'
+        LIMIT 1
+        """,
+    )
+    return status
+
+
 # ------------------------------------------------------------
 # Route
 # ------------------------------------------------------------
@@ -169,9 +256,13 @@ def _ensure_chunk_accessible_for_run(
 
 @router.get("/chunks/health", response_model=ChunkHealthResponse)
 def chunks_health(
+    db: Session = Depends(get_db),
     p: Principal = Depends(require_permissions("read:docs")),
 ) -> ChunkHealthResponse:
-    return ChunkHealthResponse(ok=True, principal_sub=getattr(p, "sub", None))
+    db_status = _build_db_status(db)
+    return ChunkHealthResponse(
+        ok=True, principal_sub=getattr(p, "sub", None), db=db_status
+    )
 
 
 @router.get("/chunks/{chunk_id}", response_model=ChunkResponse)

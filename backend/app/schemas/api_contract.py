@@ -66,9 +66,19 @@ class ChunkResponse(BaseModel):
     text: str
 
 
+class ChunkDBStatus(BaseModel):
+    dialect: str | None = None
+    alembic_revision: str | None = None
+    chunks_fts_column: bool | None = None
+    fts_gin_index: bool | None = None
+    pg_trgm_installed: bool | None = None
+    text_trgm_index: bool | None = None
+
+
 class ChunkHealthResponse(BaseModel):
     ok: bool
     principal_sub: str | None = None
+    db: ChunkDBStatus | None = None
 
 
 class ChatCitation(BaseModel):
