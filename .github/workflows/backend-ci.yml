@@ -32,6 +32,7 @@ jobs:
       OPENAI_API_KEY: dummy
       CORS_ORIGIN: http://localhost:5173
       DATABASE_URL: postgresql+psycopg://postgres:postgres@localhost:5432/postgres
+      PYTHONUNBUFFERED: "1"
 
     steps:
       - name: Checkout
@@ -44,18 +45,28 @@ jobs:
 
       - name: Create venv and install deps
         run: |
+          set -euxo pipefail
           python -m venv .venv
           . .venv/bin/activate
           python -m pip install --upgrade pip
           python -m pip install -r backend/requirements.txt
           if [ -f backend/requirements-dev.txt ]; then python -m pip install -r backend/requirements-dev.txt; fi
 
+      - name: Install PostgreSQL client
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client
+
       - name: Wait for Postgres
         run: |
+          set -euxo pipefail
           for i in {1..30}; do
-            if nc -z localhost 5432; then
+            if pg_isready -h localhost -p 5432 -U postgres; then
+              echo "Postgres is ready"
               exit 0
             fi
+            echo "Waiting for Postgres (${i})"
             sleep 2
           done
           echo "Postgres did not become ready" >&2
@@ -63,12 +74,24 @@ jobs:
 
       - name: Run Alembic migrations
         run: |
+          set -euxo pipefail
           . .venv/bin/activate
           cd backend
           alembic upgrade head
 
+      - name: Backend diagnostics
+        run: |
+          set -euxo pipefail
+          . .venv/bin/activate
+          python -V
+          pip freeze | head -n 200
+          cd backend
+          alembic current
+          alembic heads
+
       - name: Script syntax checks
         run: |
+          set -euxo pipefail
           . .venv/bin/activate
           bash -n backend/scripts/smoke.sh
           bash -n backend/scripts/dev_up.sh
@@ -81,10 +104,15 @@ jobs:
           MAX_REQUEST_BYTES: '1024'
           RATE_LIMIT_ENABLED: '0'
           ADMIN_SUBS: smoke-ci-dummy-sub
+          ENABLE_SMOKE_ENDPOINT: '1'
+          SMOKE_FORCE_RESTART: '1'
         run: |
+          set -euxo pipefail
           . .venv/bin/activate
           cd backend
-          bash scripts/smoke.sh
+          LOG_DIR="${GITHUB_WORKSPACE}/ci-logs"
+          mkdir -p "$LOG_DIR"
+          bash scripts/smoke.sh 2>&1 | tee "$LOG_DIR/smoke.log"
 
       - name: Run pytest
         env:
@@ -94,9 +122,22 @@ jobs:
           OPENAI_API_KEY: ${{ env.OPENAI_API_KEY }}
           CORS_ORIGIN: ${{ env.CORS_ORIGIN }}
         run: |
+          set -euxo pipefail
           . .venv/bin/activate
           cd backend
-          python -m pytest -q
+          LOG_DIR="${GITHUB_WORKSPACE}/ci-logs"
+          mkdir -p "$LOG_DIR"
+          python -m pytest -vv -rA --maxfail=1 tests 2>&1 | tee "$LOG_DIR/pytest.log"
+
+      - name: Upload backend logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-smoke-logs
+          path: |
+            ci-logs/smoke.log
+            ci-logs/pytest.log
+            backend/.devserver.log
 
   e2e:
     needs: smoke
@@ -105,6 +146,7 @@ jobs:
       OPENAI_OFFLINE: "1"
       OPENAI_API_KEY: sk-ci-dummy
       CORS_ORIGIN: http://localhost:5173
+      PYTHONUNBUFFERED: "1"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -116,6 +158,7 @@ jobs:
 
       - name: Create venv and install deps
         run: |
+          set -euxo pipefail
           python -m venv .venv
           . .venv/bin/activate
           python -m pip install --upgrade pip
@@ -123,7 +166,22 @@ jobs:
           if [ -f backend/requirements-dev.txt ]; then python -m pip install -r backend/requirements-dev.txt; fi
 
       - name: Install tools
-        run: sudo apt-get update && sudo apt-get install -y jq
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+      - name: Backend diagnostics (e2e)
+        run: |
+          set -euxo pipefail
+          . .venv/bin/activate
+          python -V
+          pip freeze | head -n 200
+          cd backend
+          if ! alembic current; then
+            echo "alembic current failed (likely no DATABASE_URL configured)" >&2
+          fi
+          alembic heads
 
       - name: Run CI E2E gate
         env:
@@ -131,6 +189,17 @@ jobs:
           DEV_SUB: ci-user
           ADMIN_SUBS: ci-user
         run: |
+          set -euxo pipefail
           . .venv/bin/activate
           cd backend
-          bash scripts/ci_e2e_gate.sh
+          LOG_DIR="${GITHUB_WORKSPACE}/ci-logs"
+          mkdir -p "$LOG_DIR"
+          bash scripts/ci_e2e_gate.sh 2>&1 | tee "$LOG_DIR/ci_e2e_gate.log"
+
+      - name: Upload e2e logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-e2e-logs
+          path: |
+            ci-logs/ci_e2e_gate.log
