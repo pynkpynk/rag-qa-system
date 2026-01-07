@@ -213,7 +213,7 @@ echo "[smoke] 3/4 POST /api/search"
 run_request POST "${API_BASE%/}/api/search" \
   -H "Authorization: Bearer ${TOKEN}" \
   -H "Content-Type: application/json" \
-  --data '{"q":"example","mode":"library","limit":5,"debug":true}'
+  --data '{"q":"Paris","mode":"library","limit":5,"debug":true}'
 search_body="${LAST_RESPONSE_BODY:-}"
 if [[ -z "${search_body}" || ! -f "${search_body}" ]]; then
   echo "[smoke] missing /api/search body capture" >&2
@@ -249,6 +249,20 @@ banned = {"db_host", "db_name", "db_port", "principal_sub", "owner_sub_used", "o
 leaks = [k for k in banned if k in debug]
 if leaks:
     print(f"[smoke] FAIL: debug payload leaks sensitive keys {leaks}", file=sys.stderr)
+    sys.exit(1)
+hits = payload.get("hits") or []
+if not hits:
+    print("[smoke] FAIL: expected hits in library search response", file=sys.stderr)
+    sys.exit(1)
+fts_count = debug.get("fts_count")
+if not isinstance(fts_count, int) or fts_count < 1:
+    print(f"[smoke] FAIL: debug.fts_count {fts_count!r} < 1", file=sys.stderr)
+    sys.exit(1)
+if not any(hit.get("fts_rank") is not None for hit in hits):
+    print("[smoke] FAIL: no hits contain fts_rank metadata", file=sys.stderr)
+    sys.exit(1)
+if not any("paris" in (hit.get("text") or "").lower() for hit in hits):
+    print("[smoke] FAIL: no hit text contains 'Paris'", file=sys.stderr)
     sys.exit(1)
 PY
 
@@ -378,7 +392,7 @@ else
   run_request POST "${API_BASE%/}/api/search" \
     -H "Authorization: Bearer ${TOKEN}" \
     -H "Content-Type: application/json" \
-    --data '{"q":"example","mode":"selected_docs","document_ids":["'"${selected_doc_id}"'"],"debug":true}'
+    --data '{"q":"Pariss","mode":"selected_docs","document_ids":["'"${selected_doc_id}"'"],"debug":true}'
   selected_search_body="${LAST_RESPONSE_BODY:-}"
   if [[ -z "${selected_search_body}" || ! -f "${selected_search_body}" ]]; then
     echo "[smoke] missing selected_docs search body" >&2
@@ -419,12 +433,24 @@ leaks = [k for k in banned if k in debug]
 if leaks:
     print(f"[smoke] FAIL: debug payload leaks sensitive keys {leaks}", file=sys.stderr)
     sys.exit(1)
+trgm_count = debug.get("trgm_count")
+if not isinstance(trgm_count, int) or trgm_count < 1:
+    print(f"[smoke] FAIL: debug.trgm_count {trgm_count!r} < 1", file=sys.stderr)
+    sys.exit(1)
+trgm_min_sim = debug.get("trgm_min_sim")
+has_trgm_sim = trgm_min_sim is not None or any(hit.get("trgm_sim") is not None for hit in hits)
+if not has_trgm_sim:
+    print("[smoke] FAIL: expected trgm similarity metadata but none found", file=sys.stderr)
+    sys.exit(1)
+if not any("paris" in (hit.get("text") or "").lower() for hit in hits):
+    print("[smoke] FAIL: no hit text contains 'Paris' for typo query", file=sys.stderr)
+    sys.exit(1)
 PY
 fi
 run_request POST "${API_BASE%/}/api/search" \
   -H "Authorization: Bearer ${TOKEN}" \
   -H "Content-Type: application/json" \
-  --data '{"q":"example","mode":"selected_docs","document_ids":["'"${selected_doc_id}"'"],"debug":true}'
+  --data '{"q":"Pariss","mode":"selected_docs","document_ids":["'"${selected_doc_id}"'"],"debug":true}'
 selected_search_body="${LAST_RESPONSE_BODY:-}"
 if [[ -z "${selected_search_body}" || ! -f "${selected_search_body}" ]]; then
   echo "[smoke] missing selected_docs search body" >&2
@@ -455,16 +481,28 @@ used_filter = debug.get("used_use_doc_filter")
 if used_filter is not True:
     print(f"[smoke] FAIL: debug.used_use_doc_filter {used_filter!r} != True", file=sys.stderr)
     sys.exit(1)
-banned = {"db_host", "db_name", "db_port", "principal_sub", "owner_sub_used", "owner_sub_alt"}
-leaks = [k for k in banned if k in debug]
-if leaks:
-    print(f"[smoke] FAIL: debug payload leaks sensitive keys {leaks}", file=sys.stderr)
-    sys.exit(1)
 hits = payload.get("hits") or []
 for hit in hits:
     if hit.get("document_id") != doc_id:
         print(f"[smoke] FAIL: hit document_id {hit.get('document_id')!r} != expected {doc_id!r}", file=sys.stderr)
         sys.exit(1)
+banned = {"db_host", "db_name", "db_port", "principal_sub", "owner_sub_used", "owner_sub_alt"}
+leaks = [k for k in banned if k in debug]
+if leaks:
+    print(f"[smoke] FAIL: debug payload leaks sensitive keys {leaks}", file=sys.stderr)
+    sys.exit(1)
+trgm_count = debug.get("trgm_count")
+if not isinstance(trgm_count, int) or trgm_count < 1:
+    print(f"[smoke] FAIL: debug.trgm_count {trgm_count!r} < 1", file=sys.stderr)
+    sys.exit(1)
+trgm_min_sim = debug.get("trgm_min_sim")
+has_trgm_sim = trgm_min_sim is not None or any(hit.get("trgm_sim") is not None for hit in hits)
+if not has_trgm_sim:
+    print("[smoke] FAIL: expected trgm similarity metadata but none found", file=sys.stderr)
+    sys.exit(1)
+if not any("paris" in (hit.get("text") or "").lower() for hit in hits):
+    print("[smoke] FAIL: no hit text contains 'Paris' for typo query", file=sys.stderr)
+    sys.exit(1)
 PY
 
 echo "[smoke] OK"
