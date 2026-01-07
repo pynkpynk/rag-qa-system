@@ -108,10 +108,10 @@ run_request_expect_status() {
   fi
 }
 
-echo "[smoke] 1/3 GET /api/health"
+echo "[smoke] 1/4 GET /api/health"
 run_request GET "${API_BASE%/}/api/health"
 
-echo "[smoke] 2/3 GET /api/chunks/health"
+echo "[smoke] 2/4 GET /api/chunks/health"
 run_request GET "${API_BASE%/}/api/chunks/health" \
   -H "Authorization: Bearer ${TOKEN}"
 chunks_health_body="${LAST_RESPONSE_BODY:-}"
@@ -169,7 +169,7 @@ else:
     print(f"[smoke] db dialect={dialect or 'unknown'} (no pg-specific enforcement)")
 PY
 
-echo "[smoke] 3/3 POST /api/search"
+echo "[smoke] 3/4 POST /api/search"
 run_request POST "${API_BASE%/}/api/search" \
   -H "Authorization: Bearer ${TOKEN}" \
   -H "Content-Type: application/json" \
@@ -234,6 +234,90 @@ expected = "document_ids is required when mode=selected_docs"
 if expected not in message:
     print(f"[smoke] FAIL: expected error message containing {expected!r}, got {message!r}", file=sys.stderr)
     sys.exit(1)
+PY
+
+echo "[smoke] validating selected_docs success path"
+run_request GET "${API_BASE%/}/api/docs" \
+  -H "Authorization: Bearer ${TOKEN}"
+docs_body="${LAST_RESPONSE_BODY:-}"
+if [[ -z "${docs_body}" || ! -f "${docs_body}" ]]; then
+  echo "[smoke] missing docs body capture" >&2
+  exit 1
+fi
+DOCS_BODY="${docs_body}" python - <<'PY'
+import json
+import os
+import sys
+
+body_path = os.environ.get("DOCS_BODY")
+if not body_path or not os.path.exists(body_path):
+    print("[smoke] FAIL: docs body missing", file=sys.stderr)
+    sys.exit(1)
+with open(body_path, "r", encoding="utf-8") as f:
+    docs = json.load(f)
+if not isinstance(docs, list) or not docs:
+    print("[smoke] FAIL: /api/docs returned no documents; need at least one to test selected_docs mode", file=sys.stderr)
+    sys.exit(1)
+doc_id = docs[0].get("document_id")
+if not doc_id:
+    print("[smoke] FAIL: first document missing document_id", file=sys.stderr)
+    sys.exit(1)
+print(doc_id)
+PY
+selected_doc_id="$(DOCS_BODY="${docs_body}" python - <<'PY'
+import json
+import os
+body_path = os.environ.get("DOCS_BODY")
+if not body_path or not os.path.exists(body_path):
+    raise SystemExit("DOCS_BODY missing or does not point to a file")
+with open(body_path, "r", encoding="utf-8") as f:
+    docs = json.load(f)
+print(docs[0]["document_id"])
+PY
+)"
+if [[ -z "${selected_doc_id}" ]]; then
+  echo "[smoke] FAIL: could not extract document_id from /api/docs" >&2
+  exit 1
+fi
+run_request POST "${API_BASE%/}/api/search" \
+  -H "Authorization: Bearer ${TOKEN}" \
+  -H "Content-Type: application/json" \
+  --data '{"q":"example","mode":"selected_docs","document_ids":["'"${selected_doc_id}"'"],"debug":true}'
+selected_search_body="${LAST_RESPONSE_BODY:-}"
+if [[ -z "${selected_search_body}" || ! -f "${selected_search_body}" ]]; then
+  echo "[smoke] missing selected_docs search body" >&2
+  exit 1
+fi
+SELECTED_SEARCH_BODY="${selected_search_body}" SELECTED_DOC_ID="${selected_doc_id}" python - <<'PY'
+import json
+import os
+import sys
+
+body_path = os.environ.get("SELECTED_SEARCH_BODY")
+doc_id = os.environ.get("SELECTED_DOC_ID")
+if not body_path or not os.path.exists(body_path):
+    print("[smoke] FAIL: selected_docs search body missing", file=sys.stderr)
+    sys.exit(1)
+with open(body_path, "r", encoding="utf-8") as f:
+    payload = json.load(f)
+debug = payload.get("debug") or {}
+mode = debug.get("used_mode")
+reason = debug.get("doc_filter_reason")
+if mode != "selected_docs":
+    print(f"[smoke] FAIL: debug.used_mode {mode!r} != 'selected_docs'", file=sys.stderr)
+    sys.exit(1)
+if reason != "mode=selected_docs":
+    print(f"[smoke] FAIL: debug.doc_filter_reason {reason!r} != 'mode=selected_docs'", file=sys.stderr)
+    sys.exit(1)
+used_filter = debug.get("used_use_doc_filter")
+if used_filter is not True:
+    print(f"[smoke] FAIL: debug.used_use_doc_filter {used_filter!r} != True", file=sys.stderr)
+    sys.exit(1)
+hits = payload.get("hits") or []
+for hit in hits:
+    if hit.get("document_id") != doc_id:
+        print(f"[smoke] FAIL: hit document_id {hit.get('document_id')!r} != expected {doc_id!r}", file=sys.stderr)
+        sys.exit(1)
 PY
 
 echo "[smoke] OK"
