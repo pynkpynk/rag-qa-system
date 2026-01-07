@@ -3,6 +3,10 @@ from __future__ import annotations
 import logging
 from uuid import UUID
 
+from pathlib import Path
+
+from alembic.config import Config
+from alembic.script import ScriptDirectory
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import text as sql_text
 from sqlalchemy.orm import Session
@@ -172,10 +176,23 @@ def _safe_bool_query(db: Session, sql: str) -> bool | None:
     return bool(result)
 
 
+def _get_alembic_head() -> str | None:
+    try:
+        backend_dir = Path(__file__).resolve().parents[3]
+        cfg = Config(str(backend_dir / "alembic.ini"))
+        cfg.set_main_option("script_location", str(backend_dir / "alembic"))
+        script = ScriptDirectory.from_config(cfg)
+        return script.get_current_head()
+    except Exception:
+        return None
+
+
 def _build_db_status(db: Session) -> dict:
     status = {
         "dialect": None,
         "alembic_revision": None,
+        "alembic_head": None,
+        "is_alembic_head": None,
         "chunks_fts_column": None,
         "fts_gin_index": None,
         "pg_trgm_installed": None,
@@ -199,6 +216,13 @@ def _build_db_status(db: Session) -> dict:
         status["alembic_revision"] = version
     except Exception:
         status["alembic_revision"] = None
+
+    head = _get_alembic_head()
+    status["alembic_head"] = head
+    if status["alembic_revision"] and head:
+        status["is_alembic_head"] = status["alembic_revision"] == head
+    else:
+        status["is_alembic_head"] = None
 
     if dialect != "postgresql":
         return status

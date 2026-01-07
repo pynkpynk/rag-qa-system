@@ -57,6 +57,8 @@ def test_chunks_health_includes_db_block(sqlite_db):
     for key in [
         "dialect",
         "alembic_revision",
+        "alembic_head",
+        "is_alembic_head",
         "chunks_fts_column",
         "fts_gin_index",
         "pg_trgm_installed",
@@ -65,3 +67,7 @@ def test_chunks_health_includes_db_block(sqlite_db):
         assert key in db_status
     for leak_key in ("host", "port", "url"):
         assert leak_key not in db_status
+    leak_strings = ["localhost", "127.0.0.1", "://", "DATABASE_URL", "db_host", "db_port"]
+    body = resp.text
+    for needle in leak_strings:
+        assert needle not in body

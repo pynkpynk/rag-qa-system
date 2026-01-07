@@ -69,6 +69,8 @@ class ChunkResponse(BaseModel):
 class ChunkDBStatus(BaseModel):
     dialect: str | None = None
     alembic_revision: str | None = None
+    alembic_head: str | None = None
+    is_alembic_head: bool | None = None
     chunks_fts_column: bool | None = None
     fts_gin_index: bool | None = None
     pg_trgm_installed: bool | None = None

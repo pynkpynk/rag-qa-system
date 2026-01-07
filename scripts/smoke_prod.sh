@@ -76,7 +76,7 @@ if [[ -z "${chunks_health_body}" || ! -f "${chunks_health_body}" ]]; then
   exit 1
 fi
 echo "[smoke] validating DB state from /api/chunks/health"
-CHUNKS_HEALTH_BODY="${chunks_health_body}" python - <<'PY'
+CHUNKS_HEALTH_BODY="${chunks_health_body}" SMOKE_ALLOW_ALEMBIC_BEHIND="${SMOKE_ALLOW_ALEMBIC_BEHIND:-0}" python - <<'PY'
 import json
 import os
 import sys
@@ -94,6 +94,20 @@ rev = db.get("alembic_revision")
 if not rev:
     print("[smoke] FAIL: db.alembic_revision missing or empty", file=sys.stderr)
     sys.exit(1)
+head = db.get("alembic_head")
+if not head:
+    print("[smoke] FAIL: db.alembic_head missing or empty", file=sys.stderr)
+    sys.exit(1)
+is_head = db.get("is_alembic_head")
+allow_env = (os.environ.get("SMOKE_ALLOW_ALEMBIC_BEHIND", "0") or "").lower()
+allow = allow_env in {"1", "true", "yes", "on"}
+if is_head is not True:
+    msg = f"[smoke] DB revision {rev} != code head {head}"
+    if allow:
+        print(msg + " (allowed by SMOKE_ALLOW_ALEMBIC_BEHIND)", file=sys.stderr)
+    else:
+        print(msg + " (set SMOKE_ALLOW_ALEMBIC_BEHIND=1 to warn only)", file=sys.stderr)
+        sys.exit(1)
 
 dialect = (db.get("dialect") or "").lower()
 if dialect == "postgresql":
