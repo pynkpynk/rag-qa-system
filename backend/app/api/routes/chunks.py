@@ -284,9 +284,7 @@ def chunks_health(
     p: Principal = Depends(require_permissions("read:docs")),
 ) -> ChunkHealthResponse:
     db_status = _build_db_status(db)
-    return ChunkHealthResponse(
-        ok=True, principal_sub=getattr(p, "sub", None), db=db_status
-    )
+    return ChunkHealthResponse(ok=True, db=db_status)
 
 
 @router.get("/chunks/{chunk_id}", response_model=ChunkResponse)
