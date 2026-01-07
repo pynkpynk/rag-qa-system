@@ -2206,6 +2206,50 @@ def public_citations(citations: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return out
 
 
+def build_source_evidence(
+    rows: list[dict[str, Any]], sources: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    row_map: dict[str, dict[str, Any]] = {}
+    for idx, row in enumerate(rows or [], start=1):
+        sid = f"S{idx}"
+        text = guard_source_text(row.get("text") or "")
+        lines = text.splitlines() if text else []
+        row_map[sid] = {
+            "document_id": row.get("document_id"),
+            "filename": row.get("filename"),
+            "page": row.get("page"),
+            "chunk_id": row.get("id"),
+            "text": text,
+            "line_start": 1 if lines else 0,
+            "line_end": len(lines) if lines else 0,
+        }
+
+    evidence: list[dict[str, Any]] = []
+    for src in sources or []:
+        sid = src.get("source_id")
+        base = row_map.get(sid, {})
+        text = base.get("text") or ""
+        if text:
+            line_start = base.get("line_start")
+            line_end = base.get("line_end")
+        else:
+            line_start = base.get("line_start") or 0
+            line_end = base.get("line_end") or 0
+        evidence.append(
+            {
+                "source_id": sid,
+                "document_id": base.get("document_id") or src.get("document_id"),
+                "filename": base.get("filename") or src.get("filename"),
+                "page": base.get("page") or src.get("page"),
+                "chunk_id": base.get("chunk_id") or src.get("chunk_id"),
+                "line_start": int(line_start or 0),
+                "line_end": int(line_end or 0),
+                "text": text,
+            }
+        )
+    return evidence
+
+
 def _limit_sources_for_citations(
     sources: list[dict[str, Any]], limit: int
 ) -> list[dict[str, Any]]:
@@ -2946,6 +2990,7 @@ def ask(
                 resp = {
                     "answer": "I don't know based on the provided sources.",
                     "citations": citations_out,
+                    "sources": build_source_evidence(rows, fallback_sources),
                     "run_id": effective_run_id,
                     "request_id": req_id,
                 }
@@ -3001,6 +3046,7 @@ def ask(
                 resp = {
                     "answer": SUMMARY_NO_SOURCES_MESSAGE,
                     "citations": [],
+                    "sources": [],
                     "run_id": effective_run_id,
                     "request_id": req_id,
                 }
@@ -3008,6 +3054,7 @@ def ask(
                 resp = {
                     "answer": "I don't know based on the provided sources.",
                     "citations": [],
+                    "sources": [],
                     "run_id": effective_run_id,
                     "request_id": req_id,
                 }
@@ -3149,6 +3196,7 @@ def ask(
         resp = {
             "answer": answer,
             "citations": citations_out,
+            "sources": build_source_evidence(rows, used_sources),
             "run_id": effective_run_id,
             "request_id": req_id,
         }
