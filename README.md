@@ -37,6 +37,22 @@
 - This runs `GET /api/health`, `GET /api/chunks/health`, and `POST /api/search` (with debug flag) and fails fast on any non-2xx response.
 - `/api/chunks/health` now reports the live DB revision vs. code head; the smoke script fails if they differ unless you set `SMOKE_ALLOW_ALEMBIC_BEHIND=1` to downgrade the mismatch to a warning (use cautiously).
 
+## Retrieval regression gate
+- Deterministic eval cases for `/api/search` live in `backend/tests/fixtures/search_eval_cases.json`.
+- Run `make eval-regression` to execute only the regression test (`backend/tests/test_search_regression_eval.py`). This uploads the smoke PDF and ensures search continues returning the expected snippets; CI/preflight also runs it via `pytest backend/tests`.
+- The eval regression needs a working Postgres `DATABASE_URL`. If port `5432` is already in use, either point to your existing local Postgres or map the docker container to a different host port:
+  - Use existing local Postgres (default port):
+    ```bash
+    export DATABASE_URL="postgresql+psycopg://user:pass@127.0.0.1:5432/ragqa_test"
+    make eval-regression
+    ```
+  - Map docker to host port 5433 and pass that URL:
+    ```bash
+    docker run -p 5433:5432 ... postgres
+    export DATABASE_URL="postgresql+psycopg://user:pass@127.0.0.1:5433/ragqa_test"
+    make eval-regression
+    ```
+
 ## Production DB migration helper
 - To upgrade the production DB schema when you have a PSQL URL:
   ```bash

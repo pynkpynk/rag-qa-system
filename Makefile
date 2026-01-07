@@ -46,6 +46,10 @@ docs:
 smoke-prod:
 	@./scripts/smoke_prod.sh
 
+.PHONY: eval-regression
+eval-regression:
+	PYTHONPATH=backend ./.venv/bin/python -m pytest backend/tests/test_search_regression_eval.py
+
 .PHONY: migrate-prod
 migrate-prod:
 	@./scripts/migrate_prod_db.sh
