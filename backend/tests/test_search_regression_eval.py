@@ -7,10 +7,16 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
-from backend.tests.test_eval_smoke_cases import (  # noqa: I252
-    _dev_headers as _smoke_headers,
-)
-from backend.tests.test_eval_smoke_cases import smoke_document  # noqa: F401
+try:  # pragma: no cover - import shim for backend/ root runs
+    from tests.test_eval_smoke_cases import (  # type: ignore  # noqa: I252
+        _dev_headers as _smoke_headers,
+    )
+    from tests.test_eval_smoke_cases import smoke_document  # type: ignore # noqa: F401
+except ModuleNotFoundError:  # pragma: no cover
+    from backend.tests.test_eval_smoke_cases import (  # noqa: I252
+        _dev_headers as _smoke_headers,
+    )
+    from backend.tests.test_eval_smoke_cases import smoke_document  # noqa: F401
 
 pytestmark = pytest.mark.usefixtures("force_dev_auth")
 
