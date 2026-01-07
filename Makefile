@@ -46,6 +46,10 @@ docs:
 smoke-prod:
 	@./scripts/smoke_prod.sh
 
+.PHONY: migrate-prod
+migrate-prod:
+	@./scripts/migrate_prod_db.sh
+
 .PHONY: preflight
 preflight:
 	@./scripts/preflight.sh

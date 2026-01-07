@@ -35,6 +35,14 @@
   make smoke-prod
   ```
 - This runs `GET /api/health`, `GET /api/chunks/health`, and `POST /api/search` (with debug flag) and fails fast on any non-2xx response.
+- `/api/chunks/health` now reports the live DB revision vs. code head; the smoke script fails if they differ unless you set `SMOKE_ALLOW_ALEMBIC_BEHIND=1` to downgrade the mismatch to a warning (use cautiously).
+
+## Production DB migration helper
+- To upgrade the production DB schema when you have a PSQL URL:
+  ```bash
+  PSQL_URL="postgresql+psycopg://user:pass@host:5432/db" make migrate-prod
+  ```
+- The script runs Alembic using `backend/alembic.ini`, prints the current revision, executes `upgrade head`, and prints the revision afterward (without echoing full credentials). Ensure `PSQL_URL` points to the target DB and contains necessary credentials.
 
 ## Local dev workflow (deterministic)
 1. Copy `backend/.env.example` to `backend/.env.local`, fill in required keys, and quote any values containing `|` (e.g., `DEV_SUB="auth0|local-user"`). In dev mode, only `DEV_ADMIN_SUBS` grants admin rights; leave it empty to stay non-admin by default.
