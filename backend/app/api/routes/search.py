@@ -39,16 +39,8 @@ class SearchHit(BaseModel):
 
 
 class SearchDebug(BaseModel):
-    principal_sub: str
-    owner_sub_used: str
-    owner_sub_alt: Optional[str] = None
     used_mode: str
     doc_filter_reason: Optional[str] = None
-
-    db_name: Optional[str] = None
-    db_host: Optional[str] = None
-    db_port: Optional[int] = None
-
     fts_count: int
     vec_count: int
     trgm_count: int
@@ -308,14 +300,8 @@ def search(
         return SearchResponse(
             hits=[],
             debug=SearchDebug(
-                principal_sub=getattr(p, "sub", "") or "",
-                owner_sub_used=owner_sub_used,
-                owner_sub_alt=owner_sub_alt,
                 used_mode=req.mode.value,
                 doc_filter_reason=doc_filter_reason,
-                db_name=db_info.get("db_name"),
-                db_host=db_info.get("db_host"),
-                db_port=db_info.get("db_port"),
                 fts_count=fts_count,
                 vec_count=vec_count,
                 trgm_count=trgm_count,
@@ -352,14 +338,8 @@ def search(
         return SearchResponse(
             hits=[],
             debug=SearchDebug(
-                principal_sub=getattr(p, "sub", "") or "",
-                owner_sub_used=owner_sub_used,
-                owner_sub_alt=owner_sub_alt,
                 used_mode=req.mode.value,
                 doc_filter_reason=doc_filter_reason,
-                db_name=db_info.get("db_name"),
-                db_host=db_info.get("db_host"),
-                db_port=db_info.get("db_port"),
                 fts_count=fts_count,
                 vec_count=vec_count,
                 trgm_count=trgm_count,
@@ -404,14 +384,8 @@ def search(
     return SearchResponse(
         hits=hits,
         debug=SearchDebug(
-            principal_sub=getattr(p, "sub", "") or "",
-            owner_sub_used=owner_sub_used,
-            owner_sub_alt=owner_sub_alt,
             used_mode=req.mode.value,
             doc_filter_reason=doc_filter_reason,
-            db_name=db_info.get("db_name"),
-            db_host=db_info.get("db_host"),
-            db_port=db_info.get("db_port"),
             fts_count=fts_count,
             vec_count=vec_count,
             trgm_count=trgm_count,

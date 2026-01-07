@@ -205,6 +205,11 @@ if not reason:
 if reason != "mode=library":
     print(f"[smoke] FAIL: debug.doc_filter_reason {reason!r} != 'mode=library'", file=sys.stderr)
     sys.exit(1)
+banned = {"db_host", "db_name", "db_port", "principal_sub", "owner_sub_used", "owner_sub_alt"}
+leaks = [k for k in banned if k in debug]
+if leaks:
+    print(f"[smoke] FAIL: debug payload leaks sensitive keys {leaks}", file=sys.stderr)
+    sys.exit(1)
 PY
 
 echo "[smoke] validating selected_docs 422 behavior"
@@ -312,6 +317,11 @@ if reason != "mode=selected_docs":
 used_filter = debug.get("used_use_doc_filter")
 if used_filter is not True:
     print(f"[smoke] FAIL: debug.used_use_doc_filter {used_filter!r} != True", file=sys.stderr)
+    sys.exit(1)
+banned = {"db_host", "db_name", "db_port", "principal_sub", "owner_sub_used", "owner_sub_alt"}
+leaks = [k for k in banned if k in debug]
+if leaks:
+    print(f"[smoke] FAIL: debug payload leaks sensitive keys {leaks}", file=sys.stderr)
     sys.exit(1)
 hits = payload.get("hits") or []
 for hit in hits:
