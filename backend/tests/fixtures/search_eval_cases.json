@@ -1,0 +1,39 @@
+[
+  {
+    "name": "search_capital_france",
+    "query": "What city does the smoke document name as the capital of France?",
+    "mode": "selected_docs",
+    "limit": 5,
+    "expected": {
+      "contains": [
+        "capital of france",
+        "paris"
+      ],
+      "page": 1
+    }
+  },
+  {
+    "name": "search_quality_slogan",
+    "query": "According to the smoke PDF, what does it say about quality answers?",
+    "mode": "selected_docs",
+    "limit": 5,
+    "expected": {
+      "contains": [
+        "quality answers require precise sources"
+      ],
+      "page": 2
+    }
+  },
+  {
+    "name": "search_support_email",
+    "query": "Which support email is listed in the smoke PDF?",
+    "mode": "selected_docs",
+    "limit": 5,
+    "expected": {
+      "contains": [
+        "support@ragqa.local"
+      ],
+      "page": 3
+    }
+  }
+]
