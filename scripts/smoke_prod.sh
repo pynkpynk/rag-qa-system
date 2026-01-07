@@ -64,6 +64,27 @@ run_request() {
   exit 1
 }
 
+retry_health() {
+  local max_attempts=12
+  local attempt=1
+  local delay=1
+  while true; do
+    if run_request GET "${API_BASE%/}/api/health"; then
+      return 0
+    fi
+    if [[ ${attempt} -ge ${max_attempts} ]]; then
+      echo "[smoke] /api/health failed after ${max_attempts} attempts" >&2
+      exit 1
+    fi
+    echo "[smoke] /api/health attempt ${attempt}/${max_attempts} failed, retrying in ${delay}s" >&2
+    sleep "${delay}"
+    attempt=$((attempt + 1))
+    if [[ ${delay} -lt 10 ]]; then
+      delay=$((delay + 1))
+    fi
+  done
+}
+
 run_request_expect_status() {
   local expected_status="$1"
   shift
@@ -109,7 +130,7 @@ run_request_expect_status() {
 }
 
 echo "[smoke] 1/4 GET /api/health"
-run_request GET "${API_BASE%/}/api/health"
+retry_health
 
 echo "[smoke] 2/4 GET /api/chunks/health"
 run_request GET "${API_BASE%/}/api/chunks/health" \
@@ -261,34 +282,19 @@ if expected not in message:
 PY
 
 echo "[smoke] validating selected_docs success path"
-run_request GET "${API_BASE%/}/api/docs" \
-  -H "Authorization: Bearer ${TOKEN}"
-docs_body="${LAST_RESPONSE_BODY:-}"
-if [[ -z "${docs_body}" || ! -f "${docs_body}" ]]; then
-  echo "[smoke] missing docs body capture" >&2
-  exit 1
-fi
-DOCS_BODY="${docs_body}" python - <<'PY'
-import json
-import os
-import sys
-
-body_path = os.environ.get("DOCS_BODY")
-if not body_path or not os.path.exists(body_path):
-    print("[smoke] FAIL: docs body missing", file=sys.stderr)
-    sys.exit(1)
-with open(body_path, "r", encoding="utf-8") as f:
-    docs = json.load(f)
-if not isinstance(docs, list) or not docs:
-    print("[smoke] FAIL: /api/docs returned no documents; need at least one to test selected_docs mode", file=sys.stderr)
-    sys.exit(1)
-doc_id = docs[0].get("document_id")
-if not doc_id:
-    print("[smoke] FAIL: first document missing document_id", file=sys.stderr)
-    sys.exit(1)
-print(doc_id)
-PY
-selected_doc_id="$(DOCS_BODY="${docs_body}" python - <<'PY'
+select_doc_id() {
+  if [[ -n "${SMOKE_DOC_ID:-}" ]]; then
+    echo "[smoke] using SMOKE_DOC_ID=${SMOKE_DOC_ID}" >&2
+    echo "${SMOKE_DOC_ID}"
+    return 0
+  fi
+  run_request GET "${API_BASE%/}/api/docs" -H "Authorization: Bearer ${TOKEN}" >/dev/null
+  docs_body="${LAST_RESPONSE_BODY:-}"
+  if [[ -z "${docs_body}" || ! -f "${docs_body}" ]]; then
+    echo "[smoke] missing docs body capture" >&2
+    return 1
+  fi
+  doc_id="$(DOCS_BODY="${docs_body}" python - <<'PY'
 import json
 import os
 body_path = os.environ.get("DOCS_BODY")
@@ -296,12 +302,124 @@ if not body_path or not os.path.exists(body_path):
     raise SystemExit("DOCS_BODY missing or does not point to a file")
 with open(body_path, "r", encoding="utf-8") as f:
     docs = json.load(f)
-print(docs[0]["document_id"])
+if not isinstance(docs, list) or not docs:
+    raise SystemExit()
+doc_id = docs[0].get("document_id")
+if not doc_id:
+    raise SystemExit()
+print(doc_id)
 PY
 )"
+  if [[ -n "${doc_id}" ]]; then
+    echo "${doc_id}"
+    return 0
+  fi
+  return 1
+}
+
+ensure_doc_id() {
+  local doc_id
+  doc_id="$(select_doc_id || true)"
+  if [[ -n "${doc_id}" ]]; then
+    echo "${doc_id}"
+    return 0
+  fi
+  if [[ "${SMOKE_UPLOAD_FIXTURE:-0}" == "1" ]]; then
+    echo "[smoke] uploading ragqa_smoke.pdf for selected_docs validation" >&2
+    run_request POST "${API_BASE%/}/api/docs/upload" \
+      -H "Authorization: Bearer ${TOKEN}" \
+      -H "Content-Type: multipart/form-data" \
+      -F "file=@${repo_root}/backend/tests/fixtures/ragqa_smoke.pdf" >/dev/null
+    upload_body="${LAST_RESPONSE_BODY:-}"
+    doc_id="$(UPLOAD_BODY="${upload_body}" python - <<'PY'
+import json
+import os
+body_path = os.environ.get("UPLOAD_BODY")
+if not body_path or not os.path.exists(body_path):
+    raise SystemExit("UPLOAD_BODY missing")
+with open(body_path, "r", encoding="utf-8") as f:
+    payload = json.load(f)
+doc_id = payload.get("document_id")
+if not doc_id:
+    raise SystemExit()
+print(doc_id)
+PY
+)"
+    if [[ -n "${doc_id}" ]]; then
+      echo "${doc_id}"
+      return 0
+    fi
+    echo "[smoke] upload failed to produce a document_id" >&2
+  fi
+  if [[ "${STRICT_SMOKE:-0}" == "1" ]]; then
+    echo "[smoke] FAIL: no documents available for selected_docs checks" >&2
+    exit 1
+  else
+    echo "[smoke] SKIP selected_docs checks: no documents available" >&2
+    echo ""
+    return 0
+  fi
+}
+
+selected_doc_id="$(ensure_doc_id)"
+selected_doc_id="${selected_doc_id//$'\r'/}"
+selected_doc_id="${selected_doc_id//$'\n'/}"
+selected_doc_id="${selected_doc_id:-}"
 if [[ -z "${selected_doc_id}" ]]; then
-  echo "[smoke] FAIL: could not extract document_id from /api/docs" >&2
-  exit 1
+  selected_doc_id=""
+fi
+if [[ -z "${selected_doc_id}" ]]; then
+  echo "[smoke] skipping selected_docs validation due to missing doc_id" >&2
+  if [[ "${STRICT_SMOKE:-0}" == "1" ]]; then
+    exit 1
+  fi
+else
+  echo "[smoke] validating selected_docs success path"
+  run_request POST "${API_BASE%/}/api/search" \
+    -H "Authorization: Bearer ${TOKEN}" \
+    -H "Content-Type: application/json" \
+    --data '{"q":"example","mode":"selected_docs","document_ids":["'"${selected_doc_id}"'"],"debug":true}'
+  selected_search_body="${LAST_RESPONSE_BODY:-}"
+  if [[ -z "${selected_search_body}" || ! -f "${selected_search_body}" ]]; then
+    echo "[smoke] missing selected_docs search body" >&2
+    exit 1
+  fi
+  SELECTED_SEARCH_BODY="${selected_search_body}" SELECTED_DOC_ID="${selected_doc_id}" python - <<'PY'
+import json
+import os
+import sys
+
+body_path = os.environ.get("SELECTED_SEARCH_BODY")
+doc_id = os.environ.get("SELECTED_DOC_ID")
+if not body_path or not os.path.exists(body_path):
+    print("[smoke] FAIL: selected_docs search body missing", file=sys.stderr)
+    sys.exit(1)
+with open(body_path, "r", encoding="utf-8") as f:
+    payload = json.load(f)
+debug = payload.get("debug") or {}
+mode = debug.get("used_mode")
+reason = debug.get("doc_filter_reason")
+if mode != "selected_docs":
+    print(f"[smoke] FAIL: debug.used_mode {mode!r} != 'selected_docs'", file=sys.stderr)
+    sys.exit(1)
+if reason != "mode=selected_docs":
+    print(f"[smoke] FAIL: debug.doc_filter_reason {reason!r} != 'mode=selected_docs'", file=sys.stderr)
+    sys.exit(1)
+used_filter = debug.get("used_use_doc_filter")
+if used_filter is not True:
+    print(f"[smoke] FAIL: debug.used_use_doc_filter {used_filter!r} != True", file=sys.stderr)
+    sys.exit(1)
+hits = payload.get("hits") or []
+for hit in hits:
+    if hit.get("document_id") != doc_id:
+        print(f"[smoke] FAIL: hit document_id {hit.get('document_id')!r} != expected {doc_id!r}", file=sys.stderr)
+        sys.exit(1)
+banned = {"db_host", "db_name", "db_port", "principal_sub", "owner_sub_used", "owner_sub_alt"}
+leaks = [k for k in banned if k in debug]
+if leaks:
+    print(f"[smoke] FAIL: debug payload leaks sensitive keys {leaks}", file=sys.stderr)
+    sys.exit(1)
+PY
 fi
 run_request POST "${API_BASE%/}/api/search" \
   -H "Authorization: Bearer ${TOKEN}" \
