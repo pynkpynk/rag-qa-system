@@ -64,6 +64,50 @@ run_request() {
   exit 1
 }
 
+run_request_expect_status() {
+  local expected_status="$1"
+  shift
+  local method="$1"
+  local url="$2"
+  shift 2
+  local body_file
+  body_file="$(mktemp "${tmpdir}/body.XXXXXX")"
+  local status
+  set +e
+  status=$(
+    curl -sS -o "${body_file}" -w "%{http_code}" \
+      "$@" \
+      -X "${method}" \
+      "${url}"
+  )
+  local curl_rc=$?
+  set -e
+  LAST_RESPONSE_BODY="${body_file}"
+  if [[ ${curl_rc} -ne 0 ]]; then
+    echo "[smoke] curl error rc=${curl_rc} (${method} ${url})" >&2
+    if [[ -s "${body_file}" ]]; then
+      cat "${body_file}" >&2
+    else
+      echo "(no body captured)" >&2
+    fi
+    exit 1
+  fi
+  if [[ "${status}" != "${expected_status}" ]]; then
+    echo "[smoke] ${method} ${url} expected status ${expected_status} but got ${status}" >&2
+    if [[ -s "${body_file}" ]]; then
+      cat "${body_file}" >&2
+    else
+      echo "(no body captured)" >&2
+    fi
+    exit 1
+  fi
+  if command -v jq >/dev/null 2>&1; then
+    jq . "${body_file}" || cat "${body_file}"
+  else
+    cat "${body_file}"
+  fi
+}
+
 echo "[smoke] 1/3 GET /api/health"
 run_request GET "${API_BASE%/}/api/health"
 
@@ -130,5 +174,66 @@ run_request POST "${API_BASE%/}/api/search" \
   -H "Authorization: Bearer ${TOKEN}" \
   -H "Content-Type: application/json" \
   --data '{"q":"example","mode":"library","limit":5,"debug":true}'
+search_body="${LAST_RESPONSE_BODY:-}"
+if [[ -z "${search_body}" || ! -f "${search_body}" ]]; then
+  echo "[smoke] missing /api/search body capture" >&2
+  exit 1
+fi
+SEARCH_BODY="${search_body}" python - <<'PY'
+import json
+import os
+import sys
+
+body_path = os.environ.get("SEARCH_BODY")
+if not body_path or not os.path.exists(body_path):
+    print("[smoke] FAIL: search body missing", file=sys.stderr)
+    sys.exit(1)
+with open(body_path, "r", encoding="utf-8") as f:
+    payload = json.load(f)
+debug = payload.get("debug") or {}
+mode = debug.get("used_mode")
+reason = debug.get("doc_filter_reason")
+if not mode:
+    print("[smoke] FAIL: debug.used_mode missing", file=sys.stderr)
+    sys.exit(1)
+if mode != "library":
+    print(f"[smoke] FAIL: debug.used_mode {mode!r} != 'library'", file=sys.stderr)
+    sys.exit(1)
+if not reason:
+    print("[smoke] FAIL: debug.doc_filter_reason missing", file=sys.stderr)
+    sys.exit(1)
+if reason != "mode=library":
+    print(f"[smoke] FAIL: debug.doc_filter_reason {reason!r} != 'mode=library'", file=sys.stderr)
+    sys.exit(1)
+PY
+
+echo "[smoke] validating selected_docs 422 behavior"
+run_request_expect_status 422 POST "${API_BASE%/}/api/search" \
+  -H "Authorization: Bearer ${TOKEN}" \
+  -H "Content-Type: application/json" \
+  --data '{"q":"example","mode":"selected_docs","debug":true}'
+invalid_body="${LAST_RESPONSE_BODY:-}"
+if [[ -z "${invalid_body}" || ! -f "${invalid_body}" ]]; then
+  echo "[smoke] missing selected_docs error body" >&2
+  exit 1
+fi
+INVALID_BODY="${invalid_body}" python - <<'PY'
+import json
+import os
+import sys
+
+body_path = os.environ.get("INVALID_BODY")
+if not body_path or not os.path.exists(body_path):
+    print("[smoke] FAIL: selected_docs error body missing", file=sys.stderr)
+    sys.exit(1)
+with open(body_path, "r", encoding="utf-8") as f:
+    payload = json.load(f)
+error = payload.get("error") or {}
+message = error.get("message") or ""
+expected = "document_ids is required when mode=selected_docs"
+if expected not in message:
+    print(f"[smoke] FAIL: expected error message containing {expected!r}, got {message!r}", file=sys.stderr)
+    sys.exit(1)
+PY
 
 echo "[smoke] OK"
