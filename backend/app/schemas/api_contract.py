@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from typing import Any, Literal, Optional
+from enum import Enum
+from typing import Any, Literal, Optional, List
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class HealthResponse(BaseModel):
@@ -104,6 +105,38 @@ class ChatResponse(BaseModel):
 
 class ChatAskResponse(ChatResponse):
     pass
+
+
+class SearchMode(str, Enum):
+    selected_docs = "selected_docs"
+    library = "library"
+
+
+class SearchRequest(BaseModel):
+    q: str = Field(..., min_length=1, description="Search query text")
+    mode: SearchMode = Field(
+        SearchMode.library,
+        description="Defaults to library when omitted; selected_docs requires document_ids.",
+    )
+    document_ids: Optional[List[str]] = None
+    limit: int = Field(20, ge=1, le=100)
+    k_fts: int = Field(50, ge=1, le=500)
+    k_vec: int = Field(50, ge=1, le=500)
+    k_trgm: int = Field(50, ge=1, le=500)
+    rrf_k: int = Field(60, ge=1, le=500)
+    min_score: float = Field(0.02, ge=0.0)
+    max_vec_distance: Optional[float] = Field(None, ge=0.0)
+    return_empty_on_low_confidence: bool = True
+    trgm_limit: float = Field(0.12, ge=0.0, le=1.0)
+    trgm_enabled: bool = True
+    debug: bool = False
+
+    @field_validator("mode", mode="before")
+    @classmethod
+    def _normalize_mode(cls, v):
+        if isinstance(v, str) and v.strip() == "all_docs":
+            return SearchMode.library
+        return v
 
 
 class RunListItem(BaseModel):
