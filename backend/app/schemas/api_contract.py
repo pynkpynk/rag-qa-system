@@ -80,7 +80,6 @@ class ChunkDBStatus(BaseModel):
 
 class ChunkHealthResponse(BaseModel):
     ok: bool
-    principal_sub: str | None = None
     db: ChunkDBStatus | None = None
 
 

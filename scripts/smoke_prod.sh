@@ -167,6 +167,25 @@ if dialect == "postgresql":
         print("[smoke] warning: text_trgm_index not reported as present", file=sys.stderr)
 else:
     print(f"[smoke] db dialect={dialect or 'unknown'} (no pg-specific enforcement)")
+def scan(obj, in_db_block=False):
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            lowered = key.lower()
+            if lowered == "principal_sub":
+                print("[smoke] FAIL: chunks health response leaked principal_sub", file=sys.stderr)
+                sys.exit(1)
+            if lowered.startswith("owner_sub"):
+                print(f"[smoke] FAIL: chunks health response leaked {key}", file=sys.stderr)
+                sys.exit(1)
+            if lowered.startswith("db_") and not in_db_block:
+                print(f"[smoke] FAIL: chunks health response leaked {key}", file=sys.stderr)
+                sys.exit(1)
+            scan(value, in_db_block or lowered == "db")
+    elif isinstance(obj, list):
+        for item in obj:
+            scan(item, in_db_block)
+
+scan(payload, False)
 PY
 
 echo "[smoke] 3/4 POST /api/search"
