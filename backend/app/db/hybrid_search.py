@@ -62,6 +62,7 @@ def hybrid_search_chunks_rrf(
     trgm_k: int = 0,
     trgm_limit: float = 0.0,
     trgm_like_patterns: Sequence[str] | None = None,
+    force_trgm_pattern_filter: bool = False,
     use_fts: bool = True,
     use_trgm: bool = False,
     allow_all_without_owner: bool = False,
@@ -93,6 +94,7 @@ def hybrid_search_chunks_rrf(
         q_trgm = q_trgm_text
     q_trgm = query_text if q_trgm is None else q_trgm
     trgm_patterns = [pattern for pattern in (trgm_like_patterns or []) if pattern]
+    force_trgm_pattern_filter = bool(force_trgm_pattern_filter)
     use_trgm = bool(use_trgm and trgm_k > 0)
     use_fts = bool(use_fts and fts_k > 0)
     use_like_fallback = bool(
@@ -196,8 +198,8 @@ LIMIT :top_k
 , trgm AS (
   SELECT
     c.id AS chunk_id,
-    ROW_NUMBER() OVER (ORDER BY similarity(c.text, :q_trgm) DESC) AS r_trgm,
-    similarity(c.text, :q_trgm) AS sim
+    ROW_NUMBER() OVER (ORDER BY word_similarity(:q_trgm, c.text) DESC) AS r_trgm,
+    word_similarity(:q_trgm, c.text) AS sim
   FROM chunks c
   JOIN documents d ON d.id = c.document_id
   CROSS JOIN params p
@@ -214,11 +216,12 @@ LIMIT :top_k
       OR CAST(c.document_id AS text) = ANY(:doc_ids)
     )
     AND (
-      cardinality(:trgm_like_patterns) = 0
+      p.force_trgm_pattern_filter = false
+      OR cardinality(:trgm_like_patterns) = 0
       OR c.text ILIKE ANY(:trgm_like_patterns)
     )
-    AND c.text % :q_trgm
-  ORDER BY similarity(c.text, :q_trgm) DESC
+    AND word_similarity(:q_trgm, c.text) >= CAST(:trgm_limit AS double precision)
+  ORDER BY word_similarity(:q_trgm, c.text) DESC
   LIMIT :trgm_k
 )
 """
@@ -265,7 +268,8 @@ params AS (
     CAST(:rrf_k AS int) AS rrf_k,
     CAST(:use_doc_filter AS boolean) AS use_doc_filter,
     CAST(:use_fts AS boolean) AS use_fts,
-    CAST(:use_trgm AS boolean) AS use_trgm{trgm_threshold_line}
+    CAST(:use_trgm AS boolean) AS use_trgm,
+    CAST(:force_trgm_pattern_filter AS boolean) AS force_trgm_pattern_filter{trgm_threshold_line}
 ),
 fts AS (
   SELECT
@@ -391,6 +395,7 @@ ORDER BY p.score DESC NULLS LAST, p.id ASC NULLS LAST;
         bindparam("use_doc_filter", type_=Boolean()),
         bindparam("use_fts", type_=Boolean()),
         bindparam("use_trgm", type_=Boolean()),
+        bindparam("force_trgm_pattern_filter", type_=Boolean()),
         bindparam("doc_ids", type_=ARRAY(String())),
         bindparam("top_k", type_=Integer()),
         bindparam("fts_k", type_=Integer()),
@@ -417,6 +422,7 @@ ORDER BY p.score DESC NULLS LAST, p.id ASC NULLS LAST;
         "use_doc_filter": use_doc_filter,
         "use_fts": use_fts,
         "use_trgm": use_trgm,
+        "force_trgm_pattern_filter": force_trgm_pattern_filter,
         "doc_ids": doc_ids or [],
         "top_k": top_k,
         "fts_k": fts_k,

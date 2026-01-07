@@ -1,4 +1,5 @@
 {"name":"capital_france","query":"What is the capital of France?","mode":"library","expected_filenames":["eval_alpha.pdf"],"k":5}
+{"name":"typo_paris","query":"Pariss","mode":"library","expected_filenames":["eval_alpha.pdf"],"k":5,"debug":true,"expect_trgm_count_min":1,"require_trgm_sim_hit":true}
 {"name":"quality_answers","query":"quality answers require","mode":"library","expected_filenames":["eval_alpha.pdf"],"k":5}
 {"name":"support_email","query":"support email","mode":"library","expected_filenames":["eval_alpha.pdf"],"k":5}
 {"name":"library_coverage","query":"library mode covers all indexed documents","mode":"library","expected_filenames":["eval_alpha.pdf"],"expected_substrings":["library mode covers"],"k":5}

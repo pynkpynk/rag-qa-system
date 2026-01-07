@@ -1403,6 +1403,7 @@ def fetch_chunks(
         for pattern in required_patterns:
             if pattern not in trgm_patterns:
                 trgm_patterns.append(pattern)
+    force_trgm_pattern_filter = bool(use_trgm_final and email_query)
     strategy = "hybrid_rrf_all_docs_admin" if is_admin(p) else "hybrid_rrf_all_docs_user"
     if run_id:
         strategy = (
@@ -1427,6 +1428,7 @@ def fetch_chunks(
             trgm_k=trgm_k,
             trgm_limit=0.0,
             trgm_like_patterns=trgm_patterns,
+            force_trgm_pattern_filter=force_trgm_pattern_filter,
             use_fts=use_fts_final,
             use_trgm=use_trgm_final,
             allow_all_without_owner=allow_all_without_owner,

@@ -95,7 +95,7 @@ def test_retrieval_regression(case: dict, seeded_docs: dict[str, str]):
         "q": case["query"],
         "mode": case.get("mode", "library"),
         "limit": case.get("k", 5),
-        "debug": False,
+        "debug": bool(case.get("debug")),
     }
 
     if payload["mode"] == "selected_docs":
@@ -151,3 +151,15 @@ def test_retrieval_regression(case: dict, seeded_docs: dict[str, str]):
         assert (
             not bad_hits
         ), f"{case['name']}: hits outside allowed doc_ids: {bad_hits}"
+
+    if case.get("expect_trgm_count_min") is not None:
+        debug = body.get("debug") or {}
+        trgm_count = debug.get("trgm_count")
+        assert trgm_count is not None, f"{case['name']}: missing trgm_count in debug"
+        assert (
+            trgm_count >= case["expect_trgm_count_min"]
+        ), f"{case['name']}: expected trgm_count >= {case['expect_trgm_count_min']}, got {trgm_count}"
+
+    if case.get("require_trgm_sim_hit"):
+        has_trgm = any(hit.get("trgm_sim") is not None for hit in hits)
+        assert has_trgm, f"{case['name']}: expected at least one hit with trgm_sim"
