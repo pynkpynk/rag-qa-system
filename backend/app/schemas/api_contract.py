@@ -93,6 +93,17 @@ class ChatCitation(BaseModel):
     drilldown_blocked_reason: str | None = None
 
 
+class SourceEvidence(BaseModel):
+    source_id: str
+    document_id: str | None = None
+    filename: str | None = None
+    page: int | None = None
+    chunk_id: str | None = None
+    line_start: int = 0
+    line_end: int = 0
+    text: str
+
+
 class ChatResponse(BaseModel):
     answer: str
     citations: list[ChatCitation]
@@ -100,6 +111,7 @@ class ChatResponse(BaseModel):
     request_id: str
     retrieval_debug: dict[str, Any] | None = None
     debug_meta: dict[str, Any] | None = None
+    sources: list[SourceEvidence] | None = None
 
 
 class ChatAskResponse(ChatResponse):
