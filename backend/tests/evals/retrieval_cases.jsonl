@@ -1,0 +1,10 @@
+{"name":"capital_france","query":"What is the capital of France?","mode":"library","expected_filenames":["eval_alpha.pdf"],"k":5}
+{"name":"quality_answers","query":"quality answers require","mode":"library","expected_filenames":["eval_alpha.pdf"],"k":5}
+{"name":"support_email","query":"support email","mode":"library","expected_filenames":["eval_alpha.pdf"],"k":5}
+{"name":"library_coverage","query":"library mode covers all indexed documents","mode":"library","expected_filenames":["eval_alpha.pdf"],"expected_substrings":["library mode covers"],"k":5}
+{"name":"neural_search","query":"neural search embeddings","mode":"library","expected_filenames":["eval_beta.pdf"],"k":5}
+{"name":"precision_recall","query":"precision and recall metrics","mode":"library","expected_filenames":["eval_beta.pdf"],"k":5}
+{"name":"hybrid_merge","query":"hybrid retrieval merges scores","mode":"library","expected_filenames":["eval_beta.pdf"],"k":5}
+{"name":"selected_capital","query":"capital of france","mode":"selected_docs","allowed_filenames":["eval_alpha.pdf"],"expected_filenames":["eval_alpha.pdf"],"k":5}
+{"name":"selected_neural","query":"trigram fallback","mode":"selected_docs","allowed_filenames":["eval_beta.pdf"],"expected_filenames":["eval_beta.pdf"],"k":5}
+{"name":"selected_support","query":"support contact","mode":"selected_docs","allowed_filenames":["eval_alpha.pdf","eval_beta.pdf"],"expected_filenames":["eval_alpha.pdf"],"k":5}
