@@ -33,8 +33,8 @@ class SearchRequest(BaseModel):
     q: str = Field(..., min_length=1, description="Search query text")
 
     mode: SearchMode = Field(
-        SearchMode.selected_docs,
-        description="selected_docs requires document_ids; library searches all user's docs",
+        SearchMode.library,
+        description="Defaults to library when omitted; selected_docs requires document_ids.",
     )
     document_ids: Optional[List[str]] = Field(
         None,

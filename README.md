@@ -11,6 +11,7 @@
 - Swagger UI: `/api/swagger`
 - OpenAPI JSON: `/api/openapi.json`
 - ReDoc: `/api/redoc`
+- `POST /api/search` treats missing `mode` as `library`; set `mode="selected_docs"` and pass `document_ids` to scope to specific documents.
 
 ## Admin debug token allowlist
 - To allow an opaque admin token to enable `retrieval_debug`, compute its SHA256 digest (e.g., `echo -n "$ADMIN_TOKEN" | shasum -a 256 | cut -d' ' -f1`) and set `ADMIN_DEBUG_TOKEN_SHA256_LIST=<digest>` (comma-separated for multiple tokens).
