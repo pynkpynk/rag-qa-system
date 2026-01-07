@@ -3,11 +3,10 @@ from __future__ import annotations
 import logging
 import os
 import re
-from enum import Enum
 from typing import Any, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
@@ -16,6 +15,7 @@ from app.core.text_utils import strip_control_chars
 from app.db.hybrid_search import hybrid_search_chunks_rrf
 from app.db.session import get_db
 from app.db.models import Document
+from app.schemas.api_contract import SearchMode, SearchRequest
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -24,60 +24,6 @@ logger = logging.getLogger(__name__)
 # ----------------------------
 # Request/Response models
 # ----------------------------
-class SearchMode(str, Enum):
-    selected_docs = "selected_docs"
-    library = "library"
-
-
-class SearchRequest(BaseModel):
-    q: str = Field(..., min_length=1, description="Search query text")
-
-    mode: SearchMode = Field(
-        SearchMode.library,
-        description="Defaults to library when omitted; selected_docs requires document_ids.",
-    )
-    document_ids: Optional[List[str]] = Field(
-        None,
-        description="Filter to these doc IDs (required for selected_docs mode)",
-    )
-
-    limit: int = Field(20, ge=1, le=100, description="Final number of chunks to return")
-    k_fts: int = Field(50, ge=1, le=500, description="Candidate count from FTS")
-    k_vec: int = Field(
-        50, ge=1, le=500, description="Candidate count from vector search"
-    )
-    k_trgm: int = Field(
-        50, ge=1, le=500, description="Candidate count from trigram search"
-    )
-    rrf_k: int = Field(60, ge=1, le=500, description="RRF constant")
-
-    min_score: float = Field(
-        0.02, ge=0.0, description="Drop hits below this RRF score."
-    )
-    max_vec_distance: Optional[float] = Field(
-        None, ge=0.0, description="Optional vec distance cutoff."
-    )
-    return_empty_on_low_confidence: bool = Field(
-        True, description="If filtering removes all hits, return hits=[]"
-    )
-
-    # NOTE: this is a *threshold* for pg_trgm similarity operator (%).
-    # For CJK queries, code will auto-lower this value to avoid "always zero" behavior on long chunks.
-    trgm_limit: float = Field(
-        0.12, ge=0.0, le=1.0, description="Trigram similarity threshold (pg_trgm)."
-    )
-    trgm_enabled: bool = Field(True, description="Enable trigram fallback (pg_trgm).")
-
-    debug: bool = Field(False, description="Include debug stats in response.")
-
-    @field_validator("mode", mode="before")
-    @classmethod
-    def _normalize_mode(cls, v):
-        if isinstance(v, str) and v.strip() == "all_docs":
-            return SearchMode.library
-        return v
-
-
 class SearchHit(BaseModel):
     chunk_id: str
     document_id: str
@@ -96,6 +42,8 @@ class SearchDebug(BaseModel):
     principal_sub: str
     owner_sub_used: str
     owner_sub_alt: Optional[str] = None
+    used_mode: str
+    doc_filter_reason: Optional[str] = None
 
     db_name: Optional[str] = None
     db_host: Optional[str] = None
@@ -253,6 +201,9 @@ def search(
         doc_ids_list = _ensure_document_scope(db, doc_ids_list, p)
 
     use_doc_filter = bool(doc_ids_list)
+    doc_filter_reason = f"mode={req.mode.value}"
+    if req.mode == SearchMode.selected_docs and not doc_ids_list:
+        doc_filter_reason = "document_ids empty"
 
     owner_sub_used, owner_sub_alt = _owner_sub_pair(getattr(p, "sub", "") or "")
     if not owner_sub_used:
@@ -360,6 +311,8 @@ def search(
                 principal_sub=getattr(p, "sub", "") or "",
                 owner_sub_used=owner_sub_used,
                 owner_sub_alt=owner_sub_alt,
+                used_mode=req.mode.value,
+                doc_filter_reason=doc_filter_reason,
                 db_name=db_info.get("db_name"),
                 db_host=db_info.get("db_host"),
                 db_port=db_info.get("db_port"),
@@ -402,6 +355,8 @@ def search(
                 principal_sub=getattr(p, "sub", "") or "",
                 owner_sub_used=owner_sub_used,
                 owner_sub_alt=owner_sub_alt,
+                used_mode=req.mode.value,
+                doc_filter_reason=doc_filter_reason,
                 db_name=db_info.get("db_name"),
                 db_host=db_info.get("db_host"),
                 db_port=db_info.get("db_port"),
@@ -452,6 +407,8 @@ def search(
             principal_sub=getattr(p, "sub", "") or "",
             owner_sub_used=owner_sub_used,
             owner_sub_alt=owner_sub_alt,
+            used_mode=req.mode.value,
+            doc_filter_reason=doc_filter_reason,
             db_name=db_info.get("db_name"),
             db_host=db_info.get("db_host"),
             db_port=db_info.get("db_port"),
