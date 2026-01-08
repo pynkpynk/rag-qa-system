@@ -153,6 +153,16 @@ jobs:
           mkdir -p "$LOG_DIR"
           python -m pytest -vv -rA --maxfail=1 tests 2>&1 | tee "$LOG_DIR/pytest.log"
 
+      - name: Eval regression gate
+        env:
+          APP_ENV: test
+          AUTH_MODE: dev
+          OPENAI_OFFLINE: "1"
+        run: |
+          set -euxo pipefail
+          . .venv/bin/activate
+          make eval-regression
+
       - name: Upload backend logs
         if: failure()
         uses: actions/upload-artifact@v4
