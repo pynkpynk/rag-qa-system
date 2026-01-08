@@ -13,6 +13,12 @@ export APP_ENV="dev"
 export AUTH_MODE="dev"
 export DEV_SUB="test-user"
 export CORS_ORIGIN="http://localhost:5173"
+if [[ -z "${DATABASE_URL:-}" ]]; then
+  export DATABASE_URL="postgresql+psycopg://postgres:postgres@127.0.0.1:5432/ragqa_test"
+else
+  export DATABASE_URL
+fi
+echo "[preflight] DATABASE_URL=${DATABASE_URL}"
 
 compile_targets=()
 for target in "backend/app" "backend/tests"; do
