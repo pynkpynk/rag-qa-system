@@ -1,11 +1,58 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
+import re
 from typing import Sequence
 
 from sqlalchemy import Boolean, Integer, String, bindparam, text
+from sqlalchemy.exc import ProgrammingError
 from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.orm import Session
+
+try:  # psycopg3 is part of backend deps; fall back gracefully if unavailable in tests
+    from psycopg.errors import UndefinedFunction
+except Exception:  # pragma: no cover - psycopg present in normal test/dev envs
+    UndefinedFunction = None  # type: ignore[assignment]
+
+logger = logging.getLogger(__name__)
+_SIMPLE_STOPWORDS = {
+    "what",
+    "is",
+    "the",
+    "of",
+    "a",
+    "an",
+    "to",
+    "in",
+    "on",
+    "for",
+    "and",
+    "or",
+    "as",
+    "with",
+    "at",
+    "by",
+}
+
+
+def _normalize_simple_fts_query(q: str) -> str:
+    raw = (q or "").lower()
+    tokens = [t for t in re.split(r"[^0-9a-z]+", raw) if t]
+    filtered = [t for t in tokens if t not in _SIMPLE_STOPWORDS]
+    normalized = " ".join(filtered)
+    return normalized or q
+
+
+def reset_retrieval_caches_for_testing() -> None:
+    """Tests: reset cached retrieval capability flags."""
+    try:
+        from app.api.routes import chat
+
+        chat._TRGM_AVAILABLE_FLAG = None
+        chat._TRGM_UNAVAILABLE_LOGGED = False
+    except Exception:
+        pass
 
 
 @dataclass(frozen=True)
@@ -198,8 +245,10 @@ LIMIT :top_k
 , trgm AS (
   SELECT
     c.id AS chunk_id,
-    ROW_NUMBER() OVER (ORDER BY word_similarity(:q_trgm, c.text) DESC) AS r_trgm,
-    word_similarity(:q_trgm, c.text) AS sim
+    ROW_NUMBER() OVER (
+        ORDER BY word_similarity(CAST(:q_trgm AS text), c.text) DESC
+    ) AS r_trgm,
+    word_similarity(CAST(:q_trgm AS text), c.text) AS sim
   FROM chunks c
   JOIN documents d ON d.id = c.document_id
   CROSS JOIN params p
@@ -220,8 +269,8 @@ LIMIT :top_k
       OR cardinality(:trgm_like_patterns) = 0
       OR c.text ILIKE ANY(:trgm_like_patterns)
     )
-    AND word_similarity(:q_trgm, c.text) >= CAST(:trgm_limit AS double precision)
-  ORDER BY word_similarity(:q_trgm, c.text) DESC
+    AND word_similarity(CAST(:q_trgm AS text), c.text) >= CAST(:trgm_limit AS double precision)
+  ORDER BY word_similarity(CAST(:q_trgm AS text), c.text) DESC
   LIMIT :trgm_k
 )
 """
@@ -263,7 +312,7 @@ LIMIT :top_k
 WITH
 params AS (
   SELECT
-    websearch_to_tsquery('simple', :q) AS tsq,
+    websearch_to_tsquery('simple', :q_fts) AS tsq,
     CAST(:q_emb AS vector) AS qvec,
     CAST(:rrf_k AS int) AS rrf_k,
     CAST(:use_doc_filter AS boolean) AS use_doc_filter,
@@ -387,7 +436,7 @@ ORDER BY p.score DESC NULLS LAST, p.id ASC NULLS LAST;
     sql = text(sql_template)
     wants_q_trgm = ":q_trgm" in sql_template or "%(q_trgm)" in sql_template
     bind_params = [
-        bindparam("q", type_=String()),
+        bindparam("q_fts", type_=String()),
         bindparam("owner_sub", type_=String()),
         bindparam("owner_sub_alt", type_=String()),
         bindparam("q_emb", type_=String()),
@@ -416,7 +465,7 @@ ORDER BY p.score DESC NULLS LAST, p.id ASC NULLS LAST;
     exec_params = {
         "owner_sub": owner_sub,
         "owner_sub_alt": owner_sub_alt,
-        "q": query_text,
+        "q_fts": _normalize_simple_fts_query(query_text),
         "q_emb": q_emb,
         "rrf_k": rrf_k,
         "use_doc_filter": use_doc_filter,
@@ -438,7 +487,36 @@ ORDER BY p.score DESC NULLS LAST, p.id ASC NULLS LAST;
                 "trgm_k": trgm_k,
             }
         )
-    rows = db.execute(sql, exec_params).mappings().all()
+    try:
+        rows = db.execute(sql, exec_params).mappings().all()
+    except Exception as exc:
+        if use_trgm and _is_trgm_missing_error(exc):
+            logger.warning(
+                "pg_trgm functions unavailable; rerunning hybrid search without trigram: %s",
+                exc,
+            )
+            return hybrid_search_chunks_rrf(
+                db,
+                owner_sub=owner_sub,
+                owner_sub_alt=owner_sub_alt,
+                document_ids=document_ids,
+                query_text=query_text,
+                query_embedding=query_embedding,
+                q_trgm=q_trgm,
+                q_trgm_text=q_trgm_text,
+                top_k=top_k,
+                fts_k=fts_k,
+                vec_k=vec_k,
+                rrf_k=rrf_k,
+                trgm_k=0,
+                trgm_limit=trgm_limit,
+                trgm_like_patterns=trgm_like_patterns,
+                force_trgm_pattern_filter=force_trgm_pattern_filter,
+                use_fts=use_fts,
+                use_trgm=False,
+                allow_all_without_owner=allow_all_without_owner,
+            )
+        raise
 
     hits: list[HybridHit] = []
     for r in rows:
@@ -507,3 +585,16 @@ ORDER BY p.score DESC NULLS LAST, p.id ASC NULLS LAST;
     )
 
     return hits, meta
+
+
+def _is_trgm_missing_error(exc: Exception) -> bool:
+    if UndefinedFunction and isinstance(exc, UndefinedFunction):
+        return True
+    if isinstance(exc, ProgrammingError):
+        orig = getattr(exc, "orig", None)
+        if UndefinedFunction and isinstance(orig, UndefinedFunction):
+            return True
+        message = str(orig or exc).lower()
+    else:
+        message = str(exc).lower()
+    return "word_similarity" in message or "pg_trgm" in message

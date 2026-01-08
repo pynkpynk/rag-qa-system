@@ -227,6 +227,7 @@ TRGM_K = max(1, int(os.getenv("TRGM_K", "30") or "30"))
 APP_ENV = (os.getenv("APP_ENV", "dev") or "dev").strip().lower()
 _ALLOW_PROD_DEBUG = os.getenv("ALLOW_PROD_DEBUG", "0") == "1"
 _TRGM_AVAILABLE_FLAG: bool | None = None
+_TRGM_UNAVAILABLE_LOGGED = False
 
 
 def _parse_admin_debug_token_hashes(raw: str | None) -> set[str]:
@@ -473,17 +474,31 @@ def is_admin_debug(
 
 
 def _detect_trgm_available(db: Session) -> bool:
-    global _TRGM_AVAILABLE_FLAG
-    if _TRGM_AVAILABLE_FLAG is not None:
-        return _TRGM_AVAILABLE_FLAG
+    global _TRGM_AVAILABLE_FLAG, _TRGM_UNAVAILABLE_LOGGED
+    if _TRGM_AVAILABLE_FLAG:
+        return True
     try:
         row = db.execute(
             sql_text("SELECT true FROM pg_extension WHERE extname = 'pg_trgm'")
         ).first()
-        _TRGM_AVAILABLE_FLAG = bool(row)
-    except Exception:
-        _TRGM_AVAILABLE_FLAG = False
-    return _TRGM_AVAILABLE_FLAG
+        if row:
+            _TRGM_AVAILABLE_FLAG = True
+            return True
+        if not _TRGM_UNAVAILABLE_LOGGED:
+            logger.warning(
+                "pg_trgm extension not available; disabling trigram search in chat/search"
+            )
+            _TRGM_UNAVAILABLE_LOGGED = True
+    except Exception as exc:
+        if not _TRGM_UNAVAILABLE_LOGGED:
+            logger.warning(
+                "pg_trgm availability check failed; disabling trigram search: %s",
+                exc,
+            )
+            _TRGM_UNAVAILABLE_LOGGED = True
+    return False
+
+
 
 
 def _ensure_document_scope(
