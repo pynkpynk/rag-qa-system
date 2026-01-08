@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Set
+from typing import Iterable, Optional, Set
 
 from fastapi import Depends, Header
 
@@ -9,7 +9,6 @@ from .errors import http_error
 
 
 # ---- Domain model for auth context ----
-
 
 @dataclass(frozen=True)
 class CurrentUser:
@@ -19,7 +18,6 @@ class CurrentUser:
 
 
 # ---- AuthN: build CurrentUser from credential (e.g. JWT) ----
-
 
 def get_current_user(authorization: str | None = Header(default=None)) -> CurrentUser:
     """
@@ -58,18 +56,11 @@ def get_current_user(authorization: str | None = Header(default=None)) -> Curren
 def _mock_verify_jwt(token: str) -> dict:
     # Demo only. Replace with real verification.
     if token == "bad":
-        raise http_error(
-            status_code=401, code="auth.bad_token", message="Invalid token."
-        )
-    return {
-        "sub": "demo-user",
-        "email": "demo@example.com",
-        "scopes": ["documents:read", "documents:write"],
-    }
+        raise http_error(status_code=401, code="auth.bad_token", message="Invalid token.")
+    return {"sub": "demo-user", "email": "demo@example.com", "scopes": ["documents:read", "documents:write"]}
 
 
 # ---- AuthZ: scope-based guard ----
-
 
 def require_scope(*required: str):
     """
@@ -94,15 +85,12 @@ def require_scope(*required: str):
 
 # ---- Resource authorization: 403 vs 404 design ----
 
-
 def deny_as_not_found() -> Exception:
     """
     Use 404 to hide existence when the user should not learn
     whether the resource exists.
     """
-    return http_error(
-        status_code=404, code="resource.not_found", message="Resource not found."
-    )
+    return http_error(status_code=404, code="resource.not_found", message="Resource not found.")
 
 
 def deny_as_forbidden() -> Exception:

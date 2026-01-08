@@ -1,0 +1,27 @@
+name: AI PR Review
+
+on:
+  pull_request:
+    types:
+      - opened
+      - reopened
+      - ready_for_review
+      - synchronize
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  ai-review:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run Qodo PR Agent
+        uses: qodo-ai/pr-agent@v2.31.0
+        with:
+          config: .github/pr_agent.toml
+          mode: review
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.PR_AGENT_GITHUB_TOKEN }}

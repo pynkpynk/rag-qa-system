@@ -46,6 +46,10 @@ docs:
 smoke-prod:
 	@./scripts/smoke_prod.sh
 
+.PHONY: smoke-injection-prod
+smoke-injection-prod:
+	@./scripts/smoke_injection_prod.sh
+
 .PHONY: eval-regression
 eval-regression:
 	PYTHONPATH=backend ./.venv/bin/python -m pytest backend/tests/test_search_regression_eval.py

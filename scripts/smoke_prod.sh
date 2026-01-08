@@ -308,22 +308,13 @@ select_doc_id() {
     echo "[smoke] missing docs body capture" >&2
     return 1
   fi
-  doc_id="$(DOCS_BODY="${docs_body}" python - <<'PY'
-import json
-import os
-body_path = os.environ.get("DOCS_BODY")
-if not body_path or not os.path.exists(body_path):
-    raise SystemExit("DOCS_BODY missing or does not point to a file")
-with open(body_path, "r", encoding="utf-8") as f:
-    docs = json.load(f)
-if not isinstance(docs, list) or not docs:
-    raise SystemExit()
-doc_id = docs[0].get("document_id")
-if not doc_id:
-    raise SystemExit()
-print(doc_id)
-PY
-)"
+  doc_id="$(python -c 'import json,sys; data=json.load(sys.stdin)
+for doc in data:
+    if (doc.get("filename") or "").lower()=="ragqa_smoke.pdf":
+        val=doc.get("document_id") or ""
+        if val:
+            print(val)
+        break' <"${docs_body}")"
   if [[ -n "${doc_id}" ]]; then
     echo "${doc_id}"
     return 0
@@ -345,34 +336,18 @@ ensure_doc_id() {
       -H "Content-Type: multipart/form-data" \
       -F "file=@${repo_root}/backend/tests/fixtures/ragqa_smoke.pdf" >/dev/null
     upload_body="${LAST_RESPONSE_BODY:-}"
-    doc_id="$(UPLOAD_BODY="${upload_body}" python - <<'PY'
-import json
-import os
-body_path = os.environ.get("UPLOAD_BODY")
-if not body_path or not os.path.exists(body_path):
-    raise SystemExit("UPLOAD_BODY missing")
-with open(body_path, "r", encoding="utf-8") as f:
-    payload = json.load(f)
-doc_id = payload.get("document_id")
-if not doc_id:
-    raise SystemExit()
-print(doc_id)
-PY
-)"
+    doc_id="$(python -c 'import json,sys; payload=json.load(sys.stdin); val=payload.get("document_id")
+if not val:
+    raise SystemExit("missing doc_id")
+print(val)' <"${upload_body}")"
     if [[ -n "${doc_id}" ]]; then
       echo "${doc_id}"
       return 0
     fi
     echo "[smoke] upload failed to produce a document_id" >&2
   fi
-  if [[ "${STRICT_SMOKE:-0}" == "1" ]]; then
-    echo "[smoke] FAIL: no documents available for selected_docs checks" >&2
-    exit 1
-  else
-    echo "[smoke] SKIP selected_docs checks: no documents available" >&2
-    echo ""
-    return 0
-  fi
+  echo "[smoke] FAIL: ragqa_smoke.pdf not found. Upload/index it or set SMOKE_UPLOAD_FIXTURE=1." >&2
+  exit 1
 }
 
 selected_doc_id="$(ensure_doc_id)"

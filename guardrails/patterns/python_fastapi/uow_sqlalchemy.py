@@ -26,7 +26,6 @@ class UnitOfWork:
     - Commits on success
     - Rolls back on error
     """
-
     session_factory: SessionFactory[TSession]
     session: Optional[TSession] = None
 
