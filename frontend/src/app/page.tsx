@@ -1,28 +1,7 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { authFetch } from "../lib/apiClient";
-import { clearToken, getToken, setToken } from "../lib/authToken";
-import {
-  attachDocsToRun,
-  createRun,
-  deleteRun,
-  getRun,
-  listRuns,
-  type RunDetail,
-  type RunListItem,
-} from "../lib/runClient";
-import { getChunk, type ChunkDetail } from "../lib/chunkClient";
-import { deleteDoc } from "../lib/docClient";
-import { searchChunks, type SearchHit } from "../lib/searchClient";
-
-type HealthResponse = {
-  status: string;
-  app: string;
-  app_env: string;
-  auth_mode: string;
-  git_sha: string;
-};
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { apiFetch } from "../lib/apiClient";
 
 type DocumentListItem = {
   document_id: string;
@@ -31,1166 +10,587 @@ type DocumentListItem = {
   error?: string | null;
 };
 
-type DocumentUploadResponse = {
-  document_id: string;
-  filename: string;
-  status: string;
-  dedup: boolean;
-};
-
 type ChatCitation = {
   source_id?: string | null;
-  page?: number | null;
-  filename?: string | null;
-  document_id?: string | null;
-  chunk_id?: string | null;
-  chunk_id_missing_reason?: string | null;
-};
-
-type ChatAskResponse = {
-  answer: string;
-  request_id: string;
-  citations: ChatCitation[];
-  sources?: SourceEvidence[] | null;
-};
-
-type SourceEvidence = {
-  source_id: string;
-  document_id?: string | null;
   filename?: string | null;
   page?: number | null;
-  chunk_id?: string | null;
-  line_start?: number | null;
-  line_end?: number | null;
-  text?: string | null;
+  document_id?: string | null;
 };
 
-type SourcesPanelProps = {
-  sources: SourceEvidence[] | null | undefined;
-  openMap: Record<string, boolean>;
-  onToggle: (sourceId: string, next?: boolean) => void;
-  registerRef: (sourceId: string, el: HTMLDivElement | null) => void;
+type ChatResponse = {
+  answer?: string;
+  citations?: ChatCitation[];
+  request_id?: string;
 };
 
-const suspiciousPatterns = [
-  /pwned_/i,
-  /ignore all instructions/i,
-  /system override/i,
-];
+type HealthPayload = Record<string, unknown>;
 
-function detectInjection(text?: string | null): boolean {
-  if (!text) {
-    return false;
-  }
-  return suspiciousPatterns.some((re) => re.test(text));
-}
+type TabKey = "ask" | "documents" | "health";
 
-function SourcesPanel({
-  sources,
-  openMap,
-  onToggle,
-  registerRef,
-}: SourcesPanelProps) {
-  if (!sources || sources.length === 0) {
-    return (
-      <div style={{ marginTop: "1rem" }}>
-        <h3>Sources</h3>
-        <p>No sources returned.</p>
-      </div>
-    );
-  }
-  return (
-    <div style={{ marginTop: "1rem" }}>
-      <h3>Sources</h3>
-      <div style={{ display: "flex", flexDirection: "column", gap: "0.75rem" }}>
-        {sources.map((source) => {
-          const sid = source.source_id || "(unknown)";
-          const isOpen = !!openMap[sid];
-          const flagged = detectInjection(source.text);
-          const lineRange =
-            source.line_start || source.line_end
-              ? `lines ${source.line_start ?? "?"}–${source.line_end ?? "?"}`
-              : "lines n/a";
-          const metaParts = [
-            source.filename ? `file ${source.filename}` : null,
-            source.page !== null && source.page !== undefined
-              ? `page ${source.page}`
-              : null,
-            lineRange,
-          ].filter(Boolean);
-          return (
-            <div
-              key={sid}
-              ref={(el) => registerRef(sid, el)}
-              style={{
-                border: "1px solid #334155",
-                borderRadius: "4px",
-                padding: "0.5rem",
-                background: "#0f172a",
-              }}
-              tabIndex={-1}
-            >
-              <div
-                style={{
-                  display: "flex",
-                  justifyContent: "space-between",
-                  gap: "0.5rem",
-                  flexWrap: "wrap",
-                  alignItems: "center",
-                }}
-              >
-                <div>
-                  <strong>{sid}</strong>{" "}
-                  <span style={{ color: "#94a3b8" }}>
-                    {metaParts.join(", ")}
-                  </span>
-                </div>
-                <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap" }}>
-                  {flagged && (
-                    <span
-                      style={{
-                        background: "#f87171",
-                        color: "#0f172a",
-                        borderRadius: "9999px",
-                        padding: "0.15rem 0.6rem",
-                        fontSize: "0.85rem",
-                      }}
-                    >
-                      Potential injection
-                    </span>
-                  )}
-                  <button
-                    type="button"
-                    onClick={() => onToggle(sid, !isOpen)}
-                  >
-                    {isOpen ? "Hide text" : "Show text"}
-                  </button>
-                </div>
-              </div>
-              {isOpen && (
-                <pre
-                  style={{
-                    marginTop: "0.5rem",
-                    whiteSpace: "pre-wrap",
-                    background: "#1e293b",
-                    padding: "0.5rem",
-                    borderRadius: "4px",
-                  }}
-                >
-                  {source.text || "(no text)"}
-                </pre>
-              )}
-            </div>
-          );
-        })}
-      </div>
-    </div>
-  );
-}
+const DEFAULT_API_BASE =
+  process.env.NEXT_PUBLIC_API_BASE || "http://127.0.0.1:8000/api";
+const STORAGE_BASE = "ragqa.ui.apiBase";
+const STORAGE_TOKEN = "ragqa.ui.token";
+const STORAGE_DEV_SUB = "ragqa.ui.devSub";
 
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "/api";
-
-export default function HomePage() {
-  const [health, setHealth] = useState<HealthResponse | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [tokenValue, setTokenValue] = useState("");
-  const [hasToken, setHasToken] = useState(false);
-  const [docsData, setDocsData] = useState<string | null>(null);
-  const [docsError, setDocsError] = useState<string | null>(null);
-  const [docsLoading, setDocsLoading] = useState(false);
-  const [docsList, setDocsList] = useState<DocumentListItem[]>([]);
-  const [selectedDocs, setSelectedDocs] = useState<string[]>([]);
-  const [uploadFile, setUploadFile] = useState<File | null>(null);
-  const [uploadResp, setUploadResp] = useState<DocumentUploadResponse | null>(null);
-  const [uploadError, setUploadError] = useState<string | null>(null);
-  const [askQuestion, setAskQuestion] = useState("");
-  const [askMode, setAskMode] = useState("library");
-  const [askResult, setAskResult] = useState<ChatAskResponse | null>(null);
-  const [askError, setAskError] = useState<string | null>(null);
-  const [askLoading, setAskLoading] = useState(false);
-  const [runs, setRuns] = useState<RunListItem[]>([]);
-  const [runsError, setRunsError] = useState<string | null>(null);
-  const [runsLoading, setRunsLoading] = useState(false);
-  const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
-  const [runDetail, setRunDetail] = useState<RunDetail | null>(null);
-  const [runDetailError, setRunDetailError] = useState<string | null>(null);
-  const [runDetailLoading, setRunDetailLoading] = useState(false);
-  const [runActionMessage, setRunActionMessage] = useState<string | null>(null);
-  const [runActionError, setRunActionError] = useState<string | null>(null);
-  const [useRunScope, setUseRunScope] = useState(false);
-  const [chunkDetails, setChunkDetails] = useState<Record<string, ChunkDetail>>({});
-  const [chunkErrors, setChunkErrors] = useState<Record<string, string | null>>({});
-  const [chunkLoadingState, setChunkLoadingState] = useState<Record<string, boolean>>(
-    {},
-  );
-  const [deletingDocId, setDeletingDocId] = useState<string | null>(null);
-  const [docsActionError, setDocsActionError] = useState<string | null>(null);
-  const [deletingRunId, setDeletingRunId] = useState<string | null>(null);
-  const [autoAttachToRun, setAutoAttachToRun] = useState(false);
-  const [searchQuery, setSearchQuery] = useState("");
-  const [searchLimit, setSearchLimit] = useState(8);
-  const [searchMode, setSearchMode] =
-    useState<"selected_docs" | "library">("selected_docs");
-  const [searchResults, setSearchResults] = useState<SearchHit[]>([]);
-  const [searchLoading, setSearchLoading] = useState(false);
-  const [searchError, setSearchError] = useState<string | null>(null);
-  const [lastAskExport, setLastAskExport] = useState<{
-    request: Record<string, unknown>;
-    response: ChatAskResponse;
-  } | null>(null);
-  const [openSourceMap, setOpenSourceMap] = useState<Record<string, boolean>>({});
-  const sourceRefs = useRef<Record<string, HTMLDivElement | null>>({});
+function useRememberedConfig() {
+  const [baseUrl, setBaseUrl] = useState(DEFAULT_API_BASE);
+  const [token, setToken] = useState("");
+  const [devSub, setDevSub] = useState("dev|user");
+  const [remember, setRemember] = useState(false);
 
   useEffect(() => {
-    let mounted = true;
-    fetch(`${API_BASE}/health`)
-      .then(async (res) => {
-        if (!res.ok) {
-          throw new Error(`HTTP ${res.status}`);
-        }
-        return (await res.json()) as HealthResponse;
-      })
-      .then((data) => {
-        if (mounted) {
-          setHealth(data);
-          setError(null);
-        }
-      })
-      .catch((err: Error) => {
-        if (mounted) {
-          setError(err.message || "Failed to fetch health");
-          setHealth(null);
-        }
-      });
-    const stored = getToken();
-    if (stored) {
-      setTokenValue(stored);
-      setHasToken(true);
-    }
-    return () => {
-      mounted = false;
-    };
-  }, []);
-
-  const fetchDocsList = useCallback(async () => {
-    const token = getToken();
-    if (!token) {
-      setDocsError("Set a demo token first.");
-      setDocsList([]);
-      setDocsData(null);
+    if (typeof window === "undefined") {
       return;
     }
-    setDocsError(null);
-    setDocsLoading(true);
-    try {
-      const resp = await authFetch("/docs");
-      const body = await resp.text();
+    const savedBase = window.localStorage.getItem(STORAGE_BASE);
+    const savedToken = window.localStorage.getItem(STORAGE_TOKEN);
+    const savedDev = window.localStorage.getItem(STORAGE_DEV_SUB);
+    if (savedBase || savedToken || savedDev) {
+      setBaseUrl(savedBase || DEFAULT_API_BASE);
+      setToken(savedToken || "");
+      setDevSub(savedDev || "dev|user");
+      setRemember(true);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    if (remember) {
+      window.localStorage.setItem(STORAGE_BASE, baseUrl);
+      window.localStorage.setItem(STORAGE_TOKEN, token);
+      window.localStorage.setItem(STORAGE_DEV_SUB, devSub);
+    } else {
+      window.localStorage.removeItem(STORAGE_BASE);
+      window.localStorage.removeItem(STORAGE_TOKEN);
+      window.localStorage.removeItem(STORAGE_DEV_SUB);
+    }
+  }, [remember, baseUrl, token, devSub]);
+
+  return {
+    baseUrl,
+    token,
+    devSub,
+    remember,
+    setBaseUrl,
+    setToken,
+    setDevSub,
+    setRemember,
+  };
+}
+
+function useApi(baseUrl: string, token: string, devSub: string) {
+  const normalized = baseUrl || DEFAULT_API_BASE;
+  return useMemo(() => {
+    async function request<T>(
+      path: string,
+      init: RequestInit = {},
+    ): Promise<T> {
+      const resp = await apiFetch(
+        normalized,
+        path,
+        token || undefined,
+        devSub || undefined,
+        init,
+      );
+      const text = await resp.text();
+      const payload = text ? JSON.parse(text) : null;
       if (!resp.ok) {
-        throw new Error(`HTTP ${resp.status}: ${body || resp.statusText}`);
+        const errMessage =
+          (payload && payload.error && payload.error.message) ||
+          payload?.message ||
+          resp.statusText;
+        throw new Error(errMessage || "Request failed");
       }
-      const list = JSON.parse(body) as DocumentListItem[];
-      setDocsList(list);
-      setDocsData(JSON.stringify(list, null, 2));
+      return payload as T;
+    }
+    async function requestRaw(
+      path: string,
+      init: RequestInit = {},
+    ): Promise<Response> {
+      return apiFetch(
+        normalized,
+        path,
+        token || undefined,
+        devSub || undefined,
+        init,
+      );
+    }
+    return { request, requestRaw };
+  }, [normalized, token, devSub]);
+}
+
+export default function HomePage() {
+  const {
+    baseUrl,
+    token,
+    devSub,
+    remember,
+    setBaseUrl,
+    setToken,
+    setDevSub,
+    setRemember,
+  } = useRememberedConfig();
+  const api = useApi(baseUrl, token, devSub);
+  const [activeTab, setActiveTab] = useState<TabKey>("ask");
+
+  const [healthData, setHealthData] = useState<HealthPayload | null>(null);
+  const [healthError, setHealthError] = useState<string | null>(null);
+  const [healthLoading, setHealthLoading] = useState(false);
+
+  const [docs, setDocs] = useState<DocumentListItem[]>([]);
+  const [docsLoading, setDocsLoading] = useState(false);
+  const [docsError, setDocsError] = useState<string | null>(null);
+  const [fileToUpload, setFileToUpload] = useState<File | null>(null);
+  const [uploadStatus, setUploadStatus] = useState<string | null>(null);
+
+  const [question, setQuestion] = useState("");
+  const [askMode, setAskMode] = useState("library");
+  const [docIdsInput, setDocIdsInput] = useState("");
+  const [askLoading, setAskLoading] = useState(false);
+  const [askError, setAskError] = useState<string | null>(null);
+  const [askResult, setAskResult] = useState<ChatResponse | null>(null);
+
+  const refreshDocuments = useCallback(async () => {
+    setDocsLoading(true);
+    setDocsError(null);
+    try {
+      const payload = await api.request<DocumentListItem[]>("/docs");
+      setDocs(payload);
     } catch (err) {
-      setDocsList([]);
-      setDocsData(null);
-      setDocsError(err instanceof Error ? err.message : String(err));
+      setDocsError((err as Error).message);
     } finally {
       setDocsLoading(false);
     }
-  }, []);
-
-  const fetchRunsList = useCallback(async () => {
-    const token = getToken();
-    if (!token) {
-      setRunsError("Set a demo token first.");
-      setRuns([]);
-      return;
-    }
-    setRunsError(null);
-    setRunsLoading(true);
-    try {
-      const data = await listRuns();
-      setRuns(data);
-    } catch (err) {
-      setRuns([]);
-      setRunsError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setRunsLoading(false);
-    }
-  }, []);
-
-  const loadRunDetail = useCallback(async (runId: string) => {
-    setRunDetailError(null);
-    setRunDetailLoading(true);
-    try {
-      const data = await getRun(runId);
-      setRunDetail(data);
-    } catch (err) {
-      setRunDetail(null);
-      setRunDetailError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setRunDetailLoading(false);
-    }
-  }, []);
+  }, [api]);
 
   useEffect(() => {
-    if (hasToken) {
-      void fetchDocsList();
-      void fetchRunsList();
-    } else {
-      setDocsList([]);
-      setDocsData(null);
-      setDocsError(null);
-      setRuns([]);
-      setRunsError(null);
-      setSelectedRunId(null);
-      setRunDetail(null);
-      setUseRunScope(false);
-      setAutoAttachToRun(false);
+    if (activeTab === "documents") {
+      void refreshDocuments();
     }
-  }, [hasToken, fetchDocsList, fetchRunsList]);
+  }, [activeTab, refreshDocuments]);
 
-  useEffect(() => {
-    setSelectedDocs((prev) =>
-      prev.filter((id) => docsList.some((doc) => doc.document_id === id)),
-    );
-  }, [docsList]);
-
-  useEffect(() => {
-    if (!selectedRunId) {
-      setRunDetail(null);
-      setRunDetailError(null);
-      setRunDetailLoading(false);
-      setUseRunScope(false);
+  async function handleUpload() {
+    if (!fileToUpload) {
+      setUploadStatus("Select a PDF to upload.");
       return;
     }
-    setUseRunScope((prev) => (prev ? prev : true));
-    void loadRunDetail(selectedRunId);
-  }, [selectedRunId, loadRunDetail]);
-
-  const tokenStatus = useMemo(() => {
-    if (!hasToken) {
-      return "No token set";
-    }
-    const masked =
-      tokenValue.length > 6
-        ? `${tokenValue.slice(0, 3)}…${tokenValue.slice(-3)}`
-        : "•••";
-    return `Token set (${masked})`;
-  }, [hasToken, tokenValue]);
-
-  const saveToken = () => {
-    setToken(tokenValue);
-    const active = tokenValue.trim().length > 0;
-    setHasToken(active);
-    if (active) {
-      void fetchDocsList();
-      void fetchRunsList();
-    }
-  };
-
-  const removeToken = () => {
-    clearToken();
-    setTokenValue("");
-    setHasToken(false);
-    setSelectedDocs([]);
-    setSelectedRunId(null);
-    setRuns([]);
-    setRunDetail(null);
-    setAutoAttachToRun(false);
-  };
-
-  const toggleDocSelection = (documentId: string) => {
-    setSelectedDocs((prev) =>
-      prev.includes(documentId)
-        ? prev.filter((id) => id !== documentId)
-        : [...prev, documentId],
-    );
-  };
-
-  const selectRun = (runId: string) => {
-    if (runId === selectedRunId) {
-      return;
-    }
-    setRunActionError(null);
-    setRunActionMessage(null);
-    setSelectedRunId(runId);
-  };
-
-  const handleDeleteRun = async (runId: string) => {
-    if (!window.confirm("Delete this run? This cannot be undone.")) {
-      return;
-    }
-    setRunActionError(null);
-    setRunActionMessage(null);
-    setDeletingRunId(runId);
-    try {
-      await deleteRun(runId);
-      await fetchRunsList();
-      if (selectedRunId === runId) {
-        setSelectedRunId(null);
-        setRunDetail(null);
-      }
-      setRunActionMessage(`Run ${runId} deleted.`);
-    } catch (err) {
-      setRunActionError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setDeletingRunId(null);
-    }
-  };
-
-  const handleDeleteDoc = async (documentId: string) => {
-    if (!window.confirm("Delete this document? This cannot be undone.")) {
-      return;
-    }
-    setDocsActionError(null);
-    setDeletingDocId(documentId);
-    try {
-      await deleteDoc(documentId);
-      await fetchDocsList();
-      setSelectedDocs((prev) => prev.filter((id) => id !== documentId));
-    } catch (err) {
-      setDocsActionError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setDeletingDocId(null);
-    }
-  };
-
-  const handleFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0] || null;
-    setUploadFile(file);
-  };
-
-  const copyText = async (text: string) => {
-    if (!text) {
-      return;
-    }
-    try {
-      await navigator.clipboard.writeText(text);
-    } catch {
-      // ignore clipboard errors (browser may block)
-    }
-  };
-
-  const downloadJson = (filename: string, data: unknown) => {
-    try {
-      const blob = new Blob([JSON.stringify(data, null, 2)], {
-        type: "application/json",
-      });
-      const url = URL.createObjectURL(blob);
-      const link = document.createElement("a");
-      link.href = url;
-      link.download = filename;
-      document.body.appendChild(link);
-      link.click();
-      document.body.removeChild(link);
-      URL.revokeObjectURL(url);
-    } catch {
-      // ignore download errors
-    }
-  };
-
-  const fetchCitationChunk = async (chunkId: string) => {
-    if (!chunkId) {
-      return;
-    }
-    setChunkErrors((prev) => ({ ...prev, [chunkId]: null }));
-    setChunkLoadingState((prev) => ({ ...prev, [chunkId]: true }));
-    try {
-      const detail = await getChunk(chunkId);
-      setChunkDetails((prev) => ({ ...prev, [chunkId]: detail }));
-    } catch (err) {
-      setChunkDetails((prev) => {
-        const next = { ...prev };
-        delete next[chunkId];
-        return next;
-      });
-      setChunkErrors((prev) => ({
-        ...prev,
-        [chunkId]: err instanceof Error ? err.message : String(err),
-      }));
-    } finally {
-      setChunkLoadingState((prev) => ({ ...prev, [chunkId]: false }));
-    }
-  };
-
-  const uploadDocument = async () => {
-    setUploadError(null);
-    setUploadResp(null);
-    if (!getToken()) {
-      setUploadError("Set a demo token before uploading.");
-      return;
-    }
-    if (!uploadFile) {
-      setUploadError("Select a PDF file first.");
-      return;
-    }
+    setUploadStatus("Uploading...");
     const form = new FormData();
-    form.append("file", uploadFile);
+    form.append("file", fileToUpload);
     try {
-      const resp = await authFetch("/docs/upload", {
+      const resp = await api.requestRaw("/docs/upload", {
         method: "POST",
         body: form,
       });
-      const body = await resp.text();
       if (!resp.ok) {
-        if (resp.status === 401) {
-          throw new Error("Unauthorized. Check your token.");
-        }
-        if (resp.status === 413) {
-          throw new Error("File too large (413). Please choose a smaller PDF.");
-        }
-        if (resp.status === 422) {
-          throw new Error(`Validation error: ${body || resp.statusText}`);
-        }
-        throw new Error(`HTTP ${resp.status}: ${body || resp.statusText}`);
+        const text = await resp.text();
+        throw new Error(text || resp.statusText);
       }
-      const data = JSON.parse(body) as DocumentUploadResponse;
-      setUploadResp(data);
-      setUploadFile(null);
-      await fetchDocsList();
-      if (autoAttachToRun && selectedRunId) {
-        try {
-          const detail = await attachDocsToRun(selectedRunId, [data.document_id]);
-          setRunDetail(detail);
-          setRunActionMessage("Uploaded doc attached to run.");
-        } catch (err) {
-          setRunActionError(
-            err instanceof Error
-              ? `Auto-attach failed: ${err.message}`
-              : "Auto-attach failed",
-          );
-        }
-      }
+      setUploadStatus("Upload complete.");
+      setFileToUpload(null);
+      await refreshDocuments();
     } catch (err) {
-      setUploadError(err instanceof Error ? err.message : String(err));
+      setUploadStatus((err as Error).message);
     }
-  };
+  }
 
-  const runSearch = async () => {
-    setSearchError(null);
-    if (!getToken()) {
-      setSearchError("Set a demo token before searching.");
+  async function handleDelete(docId: string) {
+    if (!window.confirm("Delete this document?")) {
       return;
     }
-    if (!searchQuery.trim()) {
-      setSearchError("Enter a search query first.");
-      return;
-    }
-    if (searchMode === "selected_docs" && selectedDocs.length === 0) {
-      setSearchError("Select at least one document or switch mode to library.");
-      return;
-    }
-    setSearchLoading(true);
     try {
-      const resp = await searchChunks({
-        query: searchQuery,
-        mode: searchMode,
-        documentIds: searchMode === "selected_docs" ? selectedDocs : undefined,
-        limit: searchLimit,
-      });
-      setSearchResults(resp.hits);
+      const resp = await api.requestRaw(`/docs/${docId}`, { method: "DELETE" });
+      if (!resp.ok) {
+        const text = await resp.text();
+        throw new Error(text || resp.statusText);
+      }
+      await refreshDocuments();
     } catch (err) {
-      setSearchResults([]);
-      setSearchError(err instanceof Error ? err.message : String(err));
+      setDocsError((err as Error).message);
+    }
+  }
+
+  async function handleHealthCheck() {
+    setHealthLoading(true);
+    setHealthError(null);
+    try {
+      const payload = await api.request<HealthPayload>("/health");
+      setHealthData(payload);
+    } catch (err) {
+      setHealthError((err as Error).message);
+      setHealthData(null);
     } finally {
-      setSearchLoading(false);
+      setHealthLoading(false);
     }
-  };
+  }
 
-  const handleCreateRun = async () => {
-    setRunActionError(null);
-    setRunActionMessage(null);
-    if (!getToken()) {
-      setRunActionError("Set a demo token before creating runs.");
-      return;
-    }
-    try {
-      const run = await createRun({ mode: askMode }, selectedDocs);
-      setRunActionMessage(`Run ${run.run_id} created.`);
-      await fetchRunsList();
-      setSelectedRunId(run.run_id);
-    } catch (err) {
-      setRunActionError(err instanceof Error ? err.message : String(err));
-    }
-  };
-
-  const handleAttachDocs = async () => {
-    setRunActionError(null);
-    setRunActionMessage(null);
-    if (!selectedRunId) {
-      setRunActionError("Select a run before attaching documents.");
-      return;
-    }
-    if (selectedDocs.length === 0) {
-      setRunActionError("Select at least one document to attach.");
-      return;
-    }
-    try {
-      const detail = await attachDocsToRun(selectedRunId, selectedDocs);
-      setRunDetail(detail);
-      setRunActionMessage("Documents attached to run.");
-      await fetchRunsList();
-    } catch (err) {
-      setRunActionError(err instanceof Error ? err.message : String(err));
-    }
-  };
-
-  const formatCitationLabel = (citation: ChatCitation, idx: number): string => {
-    const base = citation.source_id || `S${idx + 1}`;
-    const pagePart =
-      typeof citation.page === "number" && Number.isFinite(citation.page)
-        ? ` p.${citation.page}`
-        : "";
-    return `[${base}${pagePart}]`;
-  };
-
-  const runAsk = async () => {
+  async function handleAsk() {
+    setAskLoading(true);
     setAskError(null);
     setAskResult(null);
-    if (!getToken()) {
-      setAskError("Set a demo token before asking.");
+    const trimmedQuestion = question.trim();
+    if (!trimmedQuestion) {
+      setAskLoading(false);
+      setAskError("Please enter a question.");
       return;
     }
-    if (!askQuestion.trim()) {
-      setAskError("Enter a question first.");
-      return;
-    }
-    if (useRunScope && !selectedRunId) {
-      setAskError("Select a run or disable run scope.");
-      return;
-    }
-    setAskLoading(true);
     const payload: Record<string, unknown> = {
+      question: trimmedQuestion,
       mode: askMode,
-      question: askQuestion,
     };
-      if (useRunScope && selectedRunId) {
-        payload.run_id = selectedRunId;
-      } else if (selectedDocs.length > 0) {
-        payload.document_ids = selectedDocs;
-      }
+    if (askMode === "selected_docs") {
+      const cleaned = docIdsInput
+        .split(/[\n,]/)
+        .map((id) => id.trim())
+        .filter(Boolean);
+      payload.document_ids = cleaned;
+    }
     try {
-      const resp = await authFetch("/chat/ask", {
+      const resp = await api.requestRaw("/chat/ask", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
       });
-      const body = await resp.text();
+      const bodyText = await resp.text();
       if (!resp.ok) {
+        let detail = resp.statusText || "Request failed";
+        try {
+          const parsed = bodyText ? JSON.parse(bodyText) : null;
+          if (parsed && parsed.error) {
+            const code = parsed.error.code ? `[${parsed.error.code}] ` : "";
+            detail = `${code}${parsed.error.message || detail}`;
+          } else if (parsed?.message) {
+            detail = parsed.message;
+          }
+        } catch {
+          /* ignore */
+        }
         if (resp.status === 401) {
-          throw new Error("Unauthorized. Check your token.");
+          detail = `${detail} — check Bearer token and x-dev-sub.`;
         }
-        if (resp.status === 413) {
-          throw new Error("Request too large (413).");
-        }
-        if (resp.status === 422) {
-          throw new Error(`Validation error: ${body || resp.statusText}`);
-        }
-        throw new Error(`HTTP ${resp.status}: ${body || resp.statusText}`);
+        throw new Error(detail);
       }
-      const data = JSON.parse(body) as ChatAskResponse;
-      setAskResult(data);
-      setLastAskExport({ request: payload, response: data });
-      setOpenSourceMap({});
-      sourceRefs.current = {};
+      const payloadJson: ChatResponse = bodyText ? JSON.parse(bodyText) : {};
+      setAskResult(payloadJson);
     } catch (err) {
-      setAskError(err instanceof Error ? err.message : String(err));
+      const message = (err as Error).message;
+      setAskError(message);
     } finally {
       setAskLoading(false);
     }
-  };
-  const registerSourceRef = useCallback((sourceId: string, el: HTMLDivElement | null) => {
-    if (!sourceId) {
-      return;
-    }
-    if (el) {
-      sourceRefs.current[sourceId] = el;
-    } else {
-      delete sourceRefs.current[sourceId];
-    }
-  }, []);
-
-  const toggleSourceOpen = useCallback((sourceId: string, next?: boolean) => {
-    setOpenSourceMap((prev) => {
-      const current = !!prev[sourceId];
-      const target = next === undefined ? !current : next;
-      return { ...prev, [sourceId]: target };
-    });
-  }, []);
-
-  const handleCitationJump = useCallback((sourceId?: string | null) => {
-    if (!sourceId) {
-      return;
-    }
-    setOpenSourceMap((prev) => ({ ...prev, [sourceId]: true }));
-    const doScroll = () => {
-      const el = sourceRefs.current[sourceId];
-      if (el) {
-        el.scrollIntoView({ behavior: "smooth", block: "start" });
-        el.focus?.();
-      }
-    };
-    if (typeof window !== "undefined" && typeof window.requestAnimationFrame === "function") {
-      window.requestAnimationFrame(doScroll);
-    } else {
-      doScroll();
-    }
-  }, []);
+  }
 
   return (
-    <main>
-      <h1>RAG QA System</h1>
-      <p>
-        API base: <code>{API_BASE}</code>
-      </p>
-      <section>
-        <h2>Demo Token</h2>
-        <p>{tokenStatus}</p>
-        <div style={{ display: "flex", gap: "0.5rem", maxWidth: 460 }}>
-          <input
-            type="password"
-            placeholder="paste token"
-            value={tokenValue}
-            onChange={(e) => setTokenValue(e.target.value)}
-            style={{ flex: 1, padding: "0.5rem" }}
-          />
-          <button onClick={saveToken}>Save</button>
-          <button onClick={removeToken}>Clear</button>
-        </div>
-      </section>
-      <section>
-        <h2>Runs</h2>
-        <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap" }}>
-          <button onClick={() => void fetchRunsList()} disabled={runsLoading}>
-            {runsLoading ? "Loading…" : "Fetch Runs"}
-          </button>
-          <button onClick={() => void handleCreateRun()}>Create Run</button>
-          {selectedRunId && (
-            <label style={{ display: "inline-flex", alignItems: "center", gap: "0.25rem" }}>
-              <input
-                type="checkbox"
-                checked={useRunScope}
-                onChange={(e) => setUseRunScope(e.target.checked)}
-              />
-              Ask using run scope (<code>{selectedRunId}</code>)
-            </label>
-          )}
-          <label style={{ display: "inline-flex", alignItems: "center", gap: "0.25rem" }}>
+    <main
+      style={{
+        minHeight: "100vh",
+        background: "#0f172a",
+        color: "#e2e8f0",
+        fontFamily: "system-ui, sans-serif",
+        padding: "1.5rem",
+      }}
+    >
+      <section
+        style={{
+          border: "1px solid #334155",
+          borderRadius: "6px",
+          padding: "1rem",
+          marginBottom: "1.5rem",
+        }}
+      >
+        <h1 style={{ marginBottom: "0.5rem" }}>RAG QA Console (MVP)</h1>
+        <div
+          style={{
+            display: "flex",
+            flexDirection: "column",
+            gap: "0.75rem",
+          }}
+        >
+          <label style={{ display: "flex", flexDirection: "column", gap: "0.25rem" }}>
+            API Base URL
+            <input
+              value={baseUrl}
+              onChange={(e) => setBaseUrl(e.target.value)}
+              placeholder="https://host/api"
+              style={{ padding: "0.4rem", borderRadius: "4px" }}
+            />
+          </label>
+          <label style={{ display: "flex", flexDirection: "column", gap: "0.25rem" }}>
+            Bearer Token (optional)
+            <input
+              value={token}
+              onChange={(e) => setToken(e.target.value)}
+              placeholder="demo-token"
+              style={{ padding: "0.4rem", borderRadius: "4px" }}
+            />
+          </label>
+          <label style={{ display: "flex", flexDirection: "column", gap: "0.25rem" }}>
+            Dev subject (x-dev-sub)
+            <input
+              value={devSub}
+              onChange={(e) => setDevSub(e.target.value)}
+              placeholder="dev|user"
+              style={{ padding: "0.4rem", borderRadius: "4px" }}
+            />
+          </label>
+          <label style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
             <input
               type="checkbox"
-              checked={autoAttachToRun}
-              onChange={(e) => setAutoAttachToRun(e.target.checked)}
+              checked={remember}
+              onChange={(e) => setRemember(e.target.checked)}
             />
-            Auto-attach uploaded doc to selected run
+            Remember settings locally
           </label>
+          <p style={{ fontSize: "0.85rem", color: "#94a3b8" }}>
+            Local dev auth typically requires Bearer dev-token and x-dev-sub headers.
+          </p>
         </div>
-        {runsError && (
-          <p style={{ color: "#f87171" }}>
-            <strong>Runs error:</strong> {runsError}
-          </p>
-        )}
-        {runActionError && (
-          <p style={{ color: "#f97316" }}>
-            <strong>Run action error:</strong> {runActionError}
-          </p>
-        )}
-        {runActionMessage && (
-          <p style={{ color: "#4ade80" }}>{runActionMessage}</p>
-        )}
-        {runs.length > 0 ? (
-          <ul style={{ marginTop: "1rem" }}>
-            {runs.map((run) => (
-              <li key={run.run_id} style={{ marginBottom: "0.25rem" }}>
-                <button onClick={() => selectRun(run.run_id)}>
-                  {selectedRunId === run.run_id ? "Selected" : "Select"}
-                </button>{" "}
-                <code>{run.run_id}</code> – {run.status} ({run.document_ids.length} docs)
-                <button
-                  style={{ marginLeft: "0.5rem" }}
-                  onClick={() => void handleDeleteRun(run.run_id)}
-                  disabled={deletingRunId === run.run_id}
-                >
-                  {deletingRunId === run.run_id ? "Deleting…" : "Delete"}
-                </button>
-              </li>
-            ))}
-          </ul>
-        ) : (
-          <p style={{ marginTop: "1rem" }}>No runs yet.</p>
-        )}
-        {selectedRunId && (
-          <div style={{ marginTop: "1rem" }}>
-            <p>
-              <strong>Run detail:</strong>{" "}
-              <code>{selectedRunId}</code>
-            </p>
-            {runDetailLoading && <p>Loading run…</p>}
-            {runDetailError && (
-              <p style={{ color: "#f87171" }}>
-                <strong>Run detail error:</strong> {runDetailError}
-              </p>
+      </section>
+
+      <section>
+        <div style={{ display: "flex", gap: "0.5rem", marginBottom: "1rem" }}>
+          {(["ask", "documents", "health"] as TabKey[]).map((tab) => (
+            <button
+              key={tab}
+              onClick={() => setActiveTab(tab)}
+              style={{
+                padding: "0.5rem 1rem",
+                borderRadius: "4px",
+                border: "1px solid #475569",
+                background: activeTab === tab ? "#1d4ed8" : "transparent",
+                color: "#e2e8f0",
+                cursor: "pointer",
+              }}
+            >
+              {tab === "ask"
+                ? "Ask"
+                : tab === "documents"
+                ? "Documents"
+                : "Health"}
+            </button>
+          ))}
+        </div>
+
+        {activeTab === "health" && (
+          <div
+            style={{
+              border: "1px solid #334155",
+              borderRadius: "6px",
+              padding: "1rem",
+            }}
+          >
+            <button
+              onClick={handleHealthCheck}
+              disabled={healthLoading}
+              style={{
+                padding: "0.4rem 0.8rem",
+                borderRadius: "4px",
+                background: "#1d4ed8",
+                color: "#fff",
+                border: "none",
+                cursor: "pointer",
+              }}
+            >
+              {healthLoading ? "Checking..." : "Check health"}
+            </button>
+            {healthError && (
+              <p style={{ marginTop: "0.75rem", color: "#f87171" }}>{healthError}</p>
             )}
-            {runDetail && (
-              <>
-                <ul>
-                  <li>Status: {runDetail.status}</li>
-                  <li>Error: {runDetail.error || "none"}</li>
-                  <li>Documents: {runDetail.document_ids.join(", ") || "none"}</li>
-                </ul>
-                <button
-                  onClick={() => void handleAttachDocs()}
-                  disabled={selectedDocs.length === 0}
-                >
-                  Attach selected docs
-                </button>
-                <pre style={{ marginTop: "0.5rem", overflowX: "auto" }}>
-                  {JSON.stringify(runDetail, null, 2)}
-                </pre>
-              </>
+            {healthData && (
+              <pre
+                style={{
+                  marginTop: "0.75rem",
+                  padding: "0.75rem",
+                  background: "#020617",
+                  borderRadius: "4px",
+                  overflowX: "auto",
+                }}
+              >
+                {JSON.stringify(healthData, null, 2)}
+              </pre>
             )}
           </div>
         )}
-      </section>
-      {health ? (
-        <section>
-          <h2>Backend Health</h2>
-          <ul>
-            <li>Status: {health.status}</li>
-            <li>Environment: {health.app_env}</li>
-            <li>Auth mode: {health.auth_mode}</li>
-            <li>Git SHA: {health.git_sha}</li>
-          </ul>
-        </section>
-      ) : (
-        <p>Loading health…</p>
-      )}
-      {error && (
-        <p>
-          <strong>Error:</strong> {error}
-        </p>
-      )}
-      <section>
-        <h2>Docs</h2>
-        <ul>
-          <li>
-            <a href="/api/swagger" target="_blank" rel="noreferrer">
-              Swagger UI
-            </a>
-          </li>
-          <li>
-            <a href="/api/redoc" target="_blank" rel="noreferrer">
-              ReDoc
-            </a>
-          </li>
-          <li>
-            <a href="/api/openapi.json" target="_blank" rel="noreferrer">
-              OpenAPI JSON
-            </a>
-          </li>
-        </ul>
-        <div style={{ marginTop: "1rem" }}>
-          <button onClick={() => void fetchDocsList()} disabled={docsLoading}>
-            {docsLoading ? "Loading…" : "Fetch Docs"}
-          </button>
-        </div>
-        {docsError && (
-          <p style={{ color: "#f87171" }}>
-            <strong>Docs error:</strong> {docsError}
-          </p>
-        )}
-        {docsActionError && (
-          <p style={{ color: "#f97316" }}>
-            <strong>Doc action error:</strong> {docsActionError}
-          </p>
-        )}
-        {docsList.length > 0 ? (
-          <ul style={{ marginTop: "1rem" }}>
-            {docsList.map((doc) => (
-              <li key={doc.document_id}>
-                <label>
-                  <input
-                    type="checkbox"
-                    checked={selectedDocs.includes(doc.document_id)}
-                    onChange={() => toggleDocSelection(doc.document_id)}
-                  />{" "}
-                  {doc.filename} ({doc.status})
-                </label>
-                <button
-                  style={{ marginLeft: "0.5rem" }}
-                  onClick={() => void handleDeleteDoc(doc.document_id)}
-                  disabled={deletingDocId === doc.document_id}
-                >
-                  {deletingDocId === doc.document_id ? "Deleting…" : "Delete"}
-                </button>
-              </li>
-            ))}
-          </ul>
-        ) : (
-          <p style={{ marginTop: "1rem" }}>No documents yet.</p>
-        )}
-        {docsData && (
-          <pre style={{ marginTop: "1rem", overflowX: "auto" }}>
-            {docsData}
-          </pre>
-        )}
-      </section>
-      <section>
-        <h2>Search</h2>
-        <div style={{ display: "flex", flexWrap: "wrap", gap: "0.5rem" }}>
-          <input
-            type="text"
-            placeholder="Search query"
-            value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
-            style={{ flex: "2 1 200px", padding: "0.5rem" }}
-          />
-          <label style={{ display: "inline-flex", alignItems: "center", gap: "0.25rem" }}>
-            Top K:
-            <input
-              type="number"
-              min={1}
-              max={100}
-              value={searchLimit}
-              onChange={(e) =>
-                setSearchLimit(Math.max(1, Math.min(100, Number(e.target.value) || 1)))
-              }
-              style={{ width: "4rem" }}
-            />
-          </label>
-          <label style={{ display: "inline-flex", alignItems: "center", gap: "0.25rem" }}>
-            Mode:
-            <select
-              value={searchMode}
-              onChange={(e) =>
-                setSearchMode(e.target.value === "library" ? "library" : "selected_docs")
-              }
+
+        {activeTab === "documents" && (
+          <div
+            style={{
+              border: "1px solid #334155",
+              borderRadius: "6px",
+              padding: "1rem",
+              display: "flex",
+              flexDirection: "column",
+              gap: "0.75rem",
+            }}
+          >
+            <div style={{ display: "flex", gap: "0.75rem", flexWrap: "wrap" }}>
+              <button
+                onClick={refreshDocuments}
+                disabled={docsLoading}
+                style={{
+                  padding: "0.4rem 0.8rem",
+                  borderRadius: "4px",
+                  background: "#1d4ed8",
+                  color: "#fff",
+                  border: "none",
+                }}
+              >
+                {docsLoading ? "Loading..." : "Refresh"}
+              </button>
+              <input
+                type="file"
+                accept="application/pdf"
+                onChange={(e) => setFileToUpload(e.target.files?.[0] || null)}
+              />
+              <button
+                onClick={handleUpload}
+                disabled={!fileToUpload}
+                style={{
+                  padding: "0.4rem 0.8rem",
+                  borderRadius: "4px",
+                  background: fileToUpload ? "#0f766e" : "#475569",
+                  color: "#fff",
+                  border: "none",
+                }}
+              >
+                Upload PDF
+              </button>
+            </div>
+            {uploadStatus && <p>{uploadStatus}</p>}
+            {docsError && <p style={{ color: "#f87171" }}>{docsError}</p>}
+            <div
+              style={{
+                display: "flex",
+                flexDirection: "column",
+                gap: "0.5rem",
+              }}
             >
-              <option value="selected_docs">selected_docs</option>
-              <option value="library">library</option>
-            </select>
-          </label>
-          <button onClick={() => void runSearch()} disabled={searchLoading}>
-            {searchLoading ? "Searching…" : "Search"}
-          </button>
-        </div>
-        {searchError && (
-          <p style={{ color: "#f87171" }}>
-            <strong>Search error:</strong> {searchError}
-          </p>
-        )}
-        {searchResults.length > 0 ? (
-          <ul style={{ marginTop: "1rem" }}>
-            {searchResults.map((hit, idx) => {
-              const chunkId = hit.chunk_id;
-              const detail = chunkDetails[chunkId];
-              const chunkLoading = chunkLoadingState[chunkId];
-              const chunkErr = chunkErrors[chunkId];
-              const label = `[Hit ${idx + 1}]`;
-              return (
-                <li key={chunkId} style={{ marginBottom: "0.75rem" }}>
-                  <p>
-                    {label} score {hit.score.toFixed(3)} – doc {hit.document_id}, chunk{" "}
-                    {chunkId}, page {hit.page ?? "?"}
-                  </p>
-                  <p style={{ fontStyle: "italic" }}>{hit.text}</p>
-                  <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap" }}>
-                    <button
-                      onClick={() => void fetchCitationChunk(chunkId)}
-                      disabled={chunkLoading}
-                    >
-                      {chunkLoading
-                        ? "Loading…"
-                        : detail
-                          ? "Refresh excerpt"
-                          : "Show excerpt"}
-                    </button>
-                    <button onClick={() => void copyText(chunkId)}>Copy chunk_id</button>
+              {docs.map((doc) => (
+                <div
+                  key={doc.document_id}
+                  style={{
+                    border: "1px solid #334155",
+                    borderRadius: "4px",
+                    padding: "0.5rem",
+                    display: "flex",
+                    justifyContent: "space-between",
+                    gap: "0.75rem",
+                  }}
+                >
+                  <div>
+                    <strong>{doc.filename}</strong>
+                    <div style={{ fontSize: "0.85rem", color: "#94a3b8" }}>
+                      <div>ID: {doc.document_id}</div>
+                      <div>Status: {doc.status}</div>
+                      {doc.error && <div>Error: {doc.error}</div>}
+                    </div>
                   </div>
-                  {chunkErr && (
-                    <p style={{ color: "#f87171" }}>
-                      <strong>Chunk error:</strong> {chunkErr}
-                    </p>
-                  )}
-                  {detail && (
-                    <pre
-                      style={{
-                        marginTop: "0.5rem",
-                        padding: "0.5rem",
-                        background: "#1e293b",
-                        borderRadius: "4px",
-                      }}
-                    >
-                      {detail.text}
-                    </pre>
-                  )}
-                </li>
-              );
-            })}
-          </ul>
-        ) : (
-          <p style={{ marginTop: "1rem" }}>No search results yet.</p>
+                  <button
+                    onClick={() => handleDelete(doc.document_id)}
+                    style={{
+                      padding: "0.25rem 0.6rem",
+                      background: "#b91c1c",
+                      color: "#fff",
+                      border: "none",
+                      borderRadius: "4px",
+                    }}
+                  >
+                    Delete
+                  </button>
+                </div>
+              ))}
+              {docs.length === 0 && !docsLoading && (
+                <p>No documents found. Upload a PDF to get started.</p>
+              )}
+            </div>
+          </div>
         )}
-      </section>
-      <section>
-        <h2>Upload PDF</h2>
-        <input
-          type="file"
-          accept="application/pdf"
-          onChange={handleFileChange}
-          style={{ marginRight: "0.5rem" }}
-        />
-        <button onClick={() => void uploadDocument()}>Upload PDF</button>
-        {uploadResp && (
-          <p style={{ marginTop: "0.5rem" }}>
-            Uploaded {uploadResp.filename} (status {uploadResp.status},{" "}
-            {uploadResp.dedup ? "deduped" : "new"}) – id{" "}
-            <code>{uploadResp.document_id}</code>
-          </p>
-        )}
-        {uploadError && (
-          <p style={{ color: "#f87171" }}>
-            <strong>Upload error:</strong> {uploadError}
-          </p>
-        )}
-      </section>
-      <section>
-        <h2>Ask</h2>
-        <div style={{ display: "flex", flexDirection: "column", gap: "0.5rem" }}>
-          <textarea
-            rows={4}
-            value={askQuestion}
-            onChange={(e) => setAskQuestion(e.target.value)}
-            placeholder="Ask a question about the selected docs"
-            style={{ padding: "0.5rem" }}
-          />
-          <label>
-            Mode:
-            <select
-              value={askMode}
-              onChange={(e) => setAskMode(e.target.value)}
-              style={{ marginLeft: "0.5rem" }}
-            >
-              <option value="library">library</option>
-              <option value="summary_offline_safe">summary_offline_safe</option>
-            </select>
-          </label>
-          <button onClick={() => void runAsk()} disabled={askLoading}>
-            {askLoading ? "Asking…" : "Ask"}
-          </button>
-        </div>
-        {askError && (
-          <p style={{ color: "#f87171" }}>
-            <strong>Ask error:</strong> {askError}
-          </p>
-        )}
-        {askResult && (
-          <div style={{ marginTop: "1rem" }}>
-            <p>
-              <strong>Request:</strong> {askResult.request_id}
-            </p>
-            <p>
-              <strong>Answer:</strong>
-            </p>
-            <pre style={{ whiteSpace: "pre-wrap" }}>{askResult.answer}</pre>
-            <h3>Citations</h3>
-            {askResult.citations.length === 0 ? (
-              <p>No citations returned.</p>
-            ) : (
-              <ul>
-                {askResult.citations.map((c, idx) => {
-                  const chunkId = c.chunk_id || "";
-                  const detail = chunkId ? chunkDetails[chunkId] : undefined;
-                  const chunkLoading = chunkId
-                    ? chunkLoadingState[chunkId]
-                    : false;
-                  const chunkErr = chunkId ? chunkErrors[chunkId] : null;
-                  const label = formatCitationLabel(c, idx);
-                  return (
-                    <li key={`${chunkId || c.document_id || idx}`}>
-                      <p>
-                        <button
-                          type="button"
-                          onClick={() => handleCitationJump(c.source_id)}
-                          style={{
-                            background: "transparent",
-                            border: "none",
-                            textDecoration: "underline",
-                            color: "#38bdf8",
-                            cursor: "pointer",
-                            padding: 0,
-                            marginRight: "0.5rem",
-                          }}
-                        >
-                          {label}
-                        </button>
-                        doc {c.document_id || "n/a"}, chunk{" "}
-                        {chunkId || "n/a"}, page {c.page ?? "?"}{" "}
-                        {c.filename ? `(${c.filename})` : ""}
-                      </p>
-                      {chunkId && (
-                        <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap" }}>
-                          <button
-                            onClick={() => void fetchCitationChunk(chunkId)}
-                            disabled={chunkLoading}
-                          >
-                            {chunkLoading
-                              ? "Loading…"
-                              : detail
-                                ? "Refresh excerpt"
-                                : "Show excerpt"}
-                          </button>
-                          <button onClick={() => void copyText(chunkId)}>
-                            Copy chunk_id
-                          </button>
-                          <button onClick={() => void copyText(label)}>
-                            Copy label
-                          </button>
-                        </div>
-                      )}
-                      {chunkErr && (
-                        <p style={{ color: "#f87171" }}>
-                          <strong>Chunk error:</strong> {chunkErr}
-                        </p>
-                      )}
-                      {detail && chunkId === detail.chunk_id && (
-                        <pre
-                          style={{
-                            marginTop: "0.5rem",
-                            padding: "0.5rem",
-                            background: "#1e293b",
-                            borderRadius: "4px",
-                          }}
-                        >
-                          {detail.text}
-                        </pre>
-                      )}
-                    </li>
-                  );
-                })}
-              </ul>
+
+        {activeTab === "ask" && (
+          <div
+            style={{
+              border: "1px solid #334155",
+              borderRadius: "6px",
+              padding: "1rem",
+              display: "flex",
+              flexDirection: "column",
+              gap: "0.75rem",
+            }}
+          >
+            <textarea
+              value={question}
+              onChange={(e) => setQuestion(e.target.value)}
+              placeholder="Ask a question..."
+              rows={4}
+              style={{ padding: "0.5rem", borderRadius: "4px" }}
+            />
+            <label>
+              Mode:
+              <select
+                value={askMode}
+                onChange={(e) => setAskMode(e.target.value)}
+                style={{ marginLeft: "0.5rem" }}
+              >
+                <option value="library">library</option>
+                <option value="selected_docs">selected_docs</option>
+              </select>
+            </label>
+            {askMode === "selected_docs" && (
+              <textarea
+                value={docIdsInput}
+                onChange={(e) => setDocIdsInput(e.target.value)}
+                placeholder="Document IDs (comma or newline separated)"
+                rows={3}
+                style={{ padding: "0.5rem", borderRadius: "4px" }}
+              />
             )}
-            {lastAskExport && (
-              <div style={{ marginTop: "1rem", display: "flex", gap: "0.5rem", flexWrap: "wrap" }}>
-                <button
-                  onClick={() =>
-                    void copyText(JSON.stringify(lastAskExport, null, 2))
-                  }
-                >
-                  Copy JSON
-                </button>
-                <button onClick={() => downloadJson("ask-response.json", lastAskExport)}>
-                  Download JSON
-                </button>
+            <button
+              onClick={handleAsk}
+              disabled={askLoading || !question.trim()}
+              style={{
+                padding: "0.5rem 1rem",
+                borderRadius: "4px",
+                border: "none",
+                background: "#1d4ed8",
+                color: "#fff",
+              }}
+            >
+              {askLoading ? "Asking..." : "Ask"}
+            </button>
+            {askError && <p style={{ color: "#f87171" }}>{askError}</p>}
+            {askResult && (
+              <div
+                style={{
+                  border: "1px solid #1e293b",
+                  padding: "0.75rem",
+                  borderRadius: "4px",
+                }}
+              >
+                <h3>Answer</h3>
+                <p style={{ whiteSpace: "pre-wrap" }}>{askResult.answer}</p>
+                {askResult.citations && askResult.citations.length > 0 && (
+                  <div>
+                    <h4>Citations</h4>
+                    <ul>
+                      {askResult.citations.map((cite, idx) => (
+                        <li key={idx}>
+                          {cite.source_id || "S"} — {cite.filename || "file"} (page{" "}
+                          {cite.page ?? "?"})
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
               </div>
             )}
-            <SourcesPanel
-              sources={askResult.sources}
-              openMap={openSourceMap}
-              onToggle={toggleSourceOpen}
-              registerRef={registerSourceRef}
-            />
+            {docs.length === 0 && !docsLoading && (
+              <p style={{ color: "#94a3b8" }}>
+                Upload a document to get citations in Ask responses.
+              </p>
+            )}
           </div>
         )}
       </section>
