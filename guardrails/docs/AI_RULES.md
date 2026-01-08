@@ -12,6 +12,23 @@ This repository is optimized for long-term human maintainability.
 - Reuse existing utilities and patterns. Do NOT create near-duplicates.
 - No "clever" code. Prefer boring, explicit, standard patterns.
 - If something is uncertain, surface the uncertainty (TODO + explanation) rather than guessing.
+- Never check in secrets or tokens. Reference GitHub Secrets placeholders instead.
+
+## Merge requirements
+- Every change should be merge-ready: lint/format/test steps must pass locally before opening a PR.
+- Keep PR descriptions tight (why + how) and call out follow-ups explicitly.
+- Block or mark TODOs if acceptance criteria, rollout, or monitoring steps are unclear.
+
+## Testing requirements
+- Add/adjust automated tests for each bug fix or new feature, including at least one edge case.
+- Document any intentionally untested code paths with rationale in the PR description.
+- Prefer fast, deterministic tests. If something is slow/flaky, isolate and flag it.
+
+## Security posture
+- Treat all inputs as hostile; validate and sanitize at the API boundary.
+- Centralize authn/z checks—no ad-hoc guards buried inside helpers.
+- Avoid logging sensitive fields (passwords, tokens, PII). Scrub before logging.
+- Use dependency pins and document upgrade steps when touching build/runtime deps.
 
 ## Process (required)
 1) Scan the codebase for similar patterns; list what you'll reuse.

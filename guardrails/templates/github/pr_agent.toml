@@ -1,0 +1,28 @@
+[general]
+language = "en"
+require_tests = true
+add_comment_summary = true
+
+[pr_reviewer]
+review_strategy = "auto"
+review_as_comment = true
+max_review_comments = 15
+review_comment_size = "medium"
+enable_review_labels = true
+fail_on_review_error = false
+
+[pr_reviewer.labels]
+approved = "ai-approved"
+changes_requested = "ai-changes-requested"
+reviewed = "ai-reviewed"
+
+[code_suggestions]
+enable_inline_code_suggestions = true
+max_code_suggestions = 10
+
+[files]
+exclude = ["*.lock", "*.md"]
+
+[metadata]
+branding = "Guardrails v0.2.0"
+docs_url = "guardrails/docs/AI_README.md"

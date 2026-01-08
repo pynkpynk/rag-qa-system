@@ -7,7 +7,8 @@ Primary goals: readability and extensibility.
 1) docs/AI_RULES.md
 2) docs/AI_RULES.python_fastapi.md (backend work)
 3) docs/AI_RULES.nextjs.md (frontend work)
-4) patterns/README.md + relevant patterns
+4) patterns/README.md + relevant patterns (each pattern describes when/why to use it)
+5) docs/ARCHITECTURE.md, docs/SECURITY.md, docs/PR_REVIEW_GUIDELINES.md, docs/CI_GUIDE.md
 
 ## Non-negotiables
 - Keep changes small. Minimal files, minimal public API changes.
@@ -20,6 +21,7 @@ Primary goals: readability and extensibility.
 ## How to use patterns
 - Before writing code, find the closest pattern and adapt it.
 - If no pattern exists, propose a new pattern only if it will prevent repeated mistakes.
+- `patterns/README.md` explains what each pattern covers and how to apply it safely.
 
 ## Tooling (quality gates)
 - Format/Lint/Type/Test must pass locally and in CI.
