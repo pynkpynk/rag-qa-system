@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { authFetch } from "../lib/apiClient";
 import { clearToken, getToken, setToken } from "../lib/authToken";
 import {
@@ -51,7 +51,142 @@ type ChatAskResponse = {
   answer: string;
   request_id: string;
   citations: ChatCitation[];
+  sources?: SourceEvidence[] | null;
 };
+
+type SourceEvidence = {
+  source_id: string;
+  document_id?: string | null;
+  filename?: string | null;
+  page?: number | null;
+  chunk_id?: string | null;
+  line_start?: number | null;
+  line_end?: number | null;
+  text?: string | null;
+};
+
+type SourcesPanelProps = {
+  sources: SourceEvidence[] | null | undefined;
+  openMap: Record<string, boolean>;
+  onToggle: (sourceId: string, next?: boolean) => void;
+  registerRef: (sourceId: string, el: HTMLDivElement | null) => void;
+};
+
+const suspiciousPatterns = [
+  /pwned_/i,
+  /ignore all instructions/i,
+  /system override/i,
+];
+
+function detectInjection(text?: string | null): boolean {
+  if (!text) {
+    return false;
+  }
+  return suspiciousPatterns.some((re) => re.test(text));
+}
+
+function SourcesPanel({
+  sources,
+  openMap,
+  onToggle,
+  registerRef,
+}: SourcesPanelProps) {
+  if (!sources || sources.length === 0) {
+    return (
+      <div style={{ marginTop: "1rem" }}>
+        <h3>Sources</h3>
+        <p>No sources returned.</p>
+      </div>
+    );
+  }
+  return (
+    <div style={{ marginTop: "1rem" }}>
+      <h3>Sources</h3>
+      <div style={{ display: "flex", flexDirection: "column", gap: "0.75rem" }}>
+        {sources.map((source) => {
+          const sid = source.source_id || "(unknown)";
+          const isOpen = !!openMap[sid];
+          const flagged = detectInjection(source.text);
+          const lineRange =
+            source.line_start || source.line_end
+              ? `lines ${source.line_start ?? "?"}–${source.line_end ?? "?"}`
+              : "lines n/a";
+          const metaParts = [
+            source.filename ? `file ${source.filename}` : null,
+            source.page !== null && source.page !== undefined
+              ? `page ${source.page}`
+              : null,
+            lineRange,
+          ].filter(Boolean);
+          return (
+            <div
+              key={sid}
+              ref={(el) => registerRef(sid, el)}
+              style={{
+                border: "1px solid #334155",
+                borderRadius: "4px",
+                padding: "0.5rem",
+                background: "#0f172a",
+              }}
+              tabIndex={-1}
+            >
+              <div
+                style={{
+                  display: "flex",
+                  justifyContent: "space-between",
+                  gap: "0.5rem",
+                  flexWrap: "wrap",
+                  alignItems: "center",
+                }}
+              >
+                <div>
+                  <strong>{sid}</strong>{" "}
+                  <span style={{ color: "#94a3b8" }}>
+                    {metaParts.join(", ")}
+                  </span>
+                </div>
+                <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap" }}>
+                  {flagged && (
+                    <span
+                      style={{
+                        background: "#f87171",
+                        color: "#0f172a",
+                        borderRadius: "9999px",
+                        padding: "0.15rem 0.6rem",
+                        fontSize: "0.85rem",
+                      }}
+                    >
+                      Potential injection
+                    </span>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => onToggle(sid, !isOpen)}
+                  >
+                    {isOpen ? "Hide text" : "Show text"}
+                  </button>
+                </div>
+              </div>
+              {isOpen && (
+                <pre
+                  style={{
+                    marginTop: "0.5rem",
+                    whiteSpace: "pre-wrap",
+                    background: "#1e293b",
+                    padding: "0.5rem",
+                    borderRadius: "4px",
+                  }}
+                >
+                  {source.text || "(no text)"}
+                </pre>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "/api";
 
@@ -103,6 +238,8 @@ export default function HomePage() {
     request: Record<string, unknown>;
     response: ChatAskResponse;
   } | null>(null);
+  const [openSourceMap, setOpenSourceMap] = useState<Record<string, boolean>>({});
+  const sourceRefs = useRef<Record<string, HTMLDivElement | null>>({});
 
   useEffect(() => {
     let mounted = true;
@@ -556,12 +693,51 @@ export default function HomePage() {
       const data = JSON.parse(body) as ChatAskResponse;
       setAskResult(data);
       setLastAskExport({ request: payload, response: data });
+      setOpenSourceMap({});
+      sourceRefs.current = {};
     } catch (err) {
       setAskError(err instanceof Error ? err.message : String(err));
     } finally {
       setAskLoading(false);
     }
   };
+  const registerSourceRef = useCallback((sourceId: string, el: HTMLDivElement | null) => {
+    if (!sourceId) {
+      return;
+    }
+    if (el) {
+      sourceRefs.current[sourceId] = el;
+    } else {
+      delete sourceRefs.current[sourceId];
+    }
+  }, []);
+
+  const toggleSourceOpen = useCallback((sourceId: string, next?: boolean) => {
+    setOpenSourceMap((prev) => {
+      const current = !!prev[sourceId];
+      const target = next === undefined ? !current : next;
+      return { ...prev, [sourceId]: target };
+    });
+  }, []);
+
+  const handleCitationJump = useCallback((sourceId?: string | null) => {
+    if (!sourceId) {
+      return;
+    }
+    setOpenSourceMap((prev) => ({ ...prev, [sourceId]: true }));
+    const doScroll = () => {
+      const el = sourceRefs.current[sourceId];
+      if (el) {
+        el.scrollIntoView({ behavior: "smooth", block: "start" });
+        el.focus?.();
+      }
+    };
+    if (typeof window !== "undefined" && typeof window.requestAnimationFrame === "function") {
+      window.requestAnimationFrame(doScroll);
+    } else {
+      doScroll();
+    }
+  }, []);
 
   return (
     <main>
@@ -934,7 +1110,22 @@ export default function HomePage() {
                   return (
                     <li key={`${chunkId || c.document_id || idx}`}>
                       <p>
-                        {label}: doc {c.document_id || "n/a"}, chunk{" "}
+                        <button
+                          type="button"
+                          onClick={() => handleCitationJump(c.source_id)}
+                          style={{
+                            background: "transparent",
+                            border: "none",
+                            textDecoration: "underline",
+                            color: "#38bdf8",
+                            cursor: "pointer",
+                            padding: 0,
+                            marginRight: "0.5rem",
+                          }}
+                        >
+                          {label}
+                        </button>
+                        doc {c.document_id || "n/a"}, chunk{" "}
                         {chunkId || "n/a"}, page {c.page ?? "?"}{" "}
                         {c.filename ? `(${c.filename})` : ""}
                       </p>
@@ -994,6 +1185,12 @@ export default function HomePage() {
                 </button>
               </div>
             )}
+            <SourcesPanel
+              sources={askResult.sources}
+              openMap={openSourceMap}
+              onToggle={toggleSourceOpen}
+              registerRef={registerSourceRef}
+            />
           </div>
         )}
       </section>
