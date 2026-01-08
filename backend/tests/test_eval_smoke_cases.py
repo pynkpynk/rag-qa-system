@@ -11,7 +11,6 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import make_url
 
 from app.main import app
-from app.api.routes import chat as chat_module
 
 pytestmark = pytest.mark.usefixtures("force_dev_auth")
 
@@ -147,7 +146,6 @@ def test_eval_smoke_cases(case, smoke_document):
 
 def test_support_email_selected_docs_without_trgm(monkeypatch, smoke_document):
     monkeypatch.setenv("ENABLE_TRGM", "0")
-    monkeypatch.setattr(chat_module, "_TRGM_AVAILABLE_FLAG", None)
     headers = _dev_headers()
     payload = {
         "mode": "selected_docs",

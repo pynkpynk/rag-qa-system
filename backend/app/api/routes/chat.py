@@ -226,10 +226,6 @@ ENABLE_TRGM = os.getenv("ENABLE_TRGM", "1") == "1"
 TRGM_K = max(1, int(os.getenv("TRGM_K", "30") or "30"))
 APP_ENV = (os.getenv("APP_ENV", "dev") or "dev").strip().lower()
 _ALLOW_PROD_DEBUG = os.getenv("ALLOW_PROD_DEBUG", "0") == "1"
-_TRGM_AVAILABLE_FLAG: bool | None = None
-_TRGM_UNAVAILABLE_LOGGED = False
-
-
 def _parse_admin_debug_token_hashes(raw: str | None) -> set[str]:
     hashes: set[str] = set()
     for part in (raw or "").split(","):
@@ -365,10 +361,6 @@ def should_use_trgm(text: str, *, trgm_available: bool | None = None) -> bool:
     t = (text or "").strip()
     if len(t) < 2:
         return False
-    if trgm_available is None:
-        trgm_available = (
-            True if _TRGM_AVAILABLE_FLAG is None else bool(_TRGM_AVAILABLE_FLAG)
-        )
     return bool(trgm_available) and query_class(t) == "cjk"
 
 
@@ -473,30 +465,16 @@ def is_admin_debug(
     return bool(admin_sub or token_allowed)
 
 
-def _detect_trgm_available(db: Session) -> bool:
-    global _TRGM_AVAILABLE_FLAG, _TRGM_UNAVAILABLE_LOGGED
-    if _TRGM_AVAILABLE_FLAG:
-        return True
-    try:
-        row = db.execute(
-            sql_text("SELECT true FROM pg_extension WHERE extname = 'pg_trgm'")
-        ).first()
-        if row:
-            _TRGM_AVAILABLE_FLAG = True
-            return True
-        if not _TRGM_UNAVAILABLE_LOGGED:
-            logger.warning(
-                "pg_trgm extension not available; disabling trigram search in chat/search"
-            )
-            _TRGM_UNAVAILABLE_LOGGED = True
-    except Exception as exc:
-        if not _TRGM_UNAVAILABLE_LOGGED:
-            logger.warning(
-                "pg_trgm availability check failed; disabling trigram search: %s",
-                exc,
-            )
-            _TRGM_UNAVAILABLE_LOGGED = True
-    return False
+def _detect_trgm_available(request: Request) -> bool:
+    caps = getattr(getattr(request, "app", None), "state", None)
+    if caps is None or not hasattr(caps, "db_capabilities"):
+        return False
+    cap_obj = getattr(caps, "db_capabilities", None)
+    if not cap_obj:
+        return False
+    if not getattr(cap_obj, "checked_ok", False):
+        return False
+    return bool(getattr(cap_obj, "pg_trgm_available", False))
 
 
 
@@ -2707,7 +2685,9 @@ def ask(
         auth_mode_dev and is_admin_debug_user and ADMIN_DEBUG_STRATEGY == "hybrid"
     )
     trgm_enabled_flag = bool(ENABLE_TRGM)
-    trgm_available_flag = _detect_trgm_available(db) if trgm_enabled_flag else False
+    trgm_available_flag = (
+        _detect_trgm_available(request) if trgm_enabled_flag else False
+    )
     llm_enabled = is_llm_enabled()
     offline_mode = not llm_enabled
     summary_mode = (payload.mode or "").strip().lower() == "summary_offline_safe"

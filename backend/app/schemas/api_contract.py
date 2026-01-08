@@ -6,6 +6,15 @@ from typing import Any, Literal, Optional, List
 from pydantic import BaseModel, Field, field_validator
 
 
+class DBHealthCapabilities(BaseModel):
+    extensions_present: list[str] = Field(default_factory=list)
+    pg_trgm_available: bool = False
+    vector_available: bool = False
+    checked_ok: bool = False
+    error: str | None = None
+    missing_required_extensions: list[str] = Field(default_factory=list)
+
+
 class HealthResponse(BaseModel):
     app: str
     version: str
@@ -19,6 +28,7 @@ class HealthResponse(BaseModel):
     llm_enabled: bool
     openai_offline: bool
     openai_key_present: bool
+    db_capabilities: DBHealthCapabilities | None = None
 
 
 class DocumentListItem(BaseModel):

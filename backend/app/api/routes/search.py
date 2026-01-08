@@ -5,7 +5,7 @@ import os
 import re
 from typing import Any, List, Optional, Tuple
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
@@ -176,6 +176,7 @@ def _ensure_document_scope(
 @router.post("/search", response_model=SearchResponse)
 def search(
     req: SearchRequest,
+    request: Request,
     db: Session = Depends(get_db),
     p: Principal = Depends(require_permissions("read:docs")),
 ) -> SearchResponse:
@@ -208,12 +209,16 @@ def search(
         raise HTTPException(status_code=500, detail=f"Embedding error: {e}")
 
     # trgm
-    trgm_enabled = bool(
+    trgm_requested = bool(
         req.trgm_enabled and (os.getenv("SEARCH_TRGM_ENABLED", "1") == "1")
     )
     used_trgm_limit = _auto_trgm_limit(q, req.trgm_limit)
     q_terms = _split_terms(q)
     trgm_like_patterns = [f"%{t}%" for t in q_terms]  # ILIKE ANY patterns
+    caps = getattr(getattr(request.app, "state", None), "db_capabilities", None)
+    caps_ok = bool(caps and getattr(caps, "checked_ok", False))
+    caps_trgm = bool(caps and getattr(caps, "pg_trgm_available", False))
+    trgm_enabled = bool(trgm_requested and caps_ok and caps_trgm)
 
     debug_enabled = req.debug or (os.getenv("SEARCH_DEBUG") == "1")
 

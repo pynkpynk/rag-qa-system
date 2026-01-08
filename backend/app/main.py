@@ -32,6 +32,8 @@ from app.api.routes.chunks import router as chunks_router
 from app.api.routes.debug import router as debug_router
 from app.api.routes.search import router as search_router
 from app.schemas.api_contract import HealthResponse
+from app.db.session import get_engine
+import app.db.capabilities as db_caps_module
 
 
 def smoke_endpoint_enabled() -> bool:
@@ -209,6 +211,9 @@ def create_app() -> FastAPI:
             "llm_enabled": is_llm_enabled(),
             "openai_offline": is_openai_offline(),
             "openai_key_present": openai_key_present(),
+            "db_capabilities": db_caps_module.db_caps_to_dict(
+                getattr(app.state, "db_capabilities", None)
+            ),
         }
 
     # ---- CORS ----
@@ -250,6 +255,30 @@ def create_app() -> FastAPI:
         @app.post("/api/_smoke/echo", include_in_schema=False)
         async def smoke_echo(payload: SmokeEchoPayload):
             return {"ok": True, "echo_length": len(payload.question)}
+
+    required_exts = [
+        ext.strip().lower()
+        for ext in (os.getenv("DB_REQUIRED_EXTENSIONS", "") or "").split(",")
+        if ext.strip()
+    ]
+    strict_caps_raw = (os.getenv("DB_CAPS_STRICT", "0") or "0").strip().lower()
+    strict_caps = strict_caps_raw in {"1", "true", "yes", "on"}
+    try:
+        caps = db_caps_module.detect_db_capabilities(get_engine(), required_exts)
+    except Exception as exc:  # pragma: no cover - defensive
+        caps = db_caps_module.DBCapabilities(
+            extensions_present=[],
+            pg_trgm_available=False,
+            vector_available=False,
+            checked_ok=False,
+            error=str(exc),
+            missing_required_extensions=required_exts,
+        )
+    app.state.db_capabilities = caps
+    db_caps_module.set_current_db_capabilities(caps)
+    if strict_caps and caps.missing_required_extensions:
+        missing = ", ".join(caps.missing_required_extensions)
+        raise RuntimeError(f"Missing required DB extensions: {missing}")
 
     return app
 

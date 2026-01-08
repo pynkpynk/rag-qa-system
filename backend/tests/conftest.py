@@ -25,7 +25,7 @@ from app.core.log_leak_scan import scan_file, format_report
 def _set_default_test_env(monkeypatch):
     monkeypatch.setenv("AUTH_MODE", os.getenv("AUTH_MODE", "dev") or "dev")
     monkeypatch.setenv("APP_ENV", os.getenv("APP_ENV", "dev") or "dev")
-    monkeypatch.setenv("ALLOW_PROD_DEBUG", os.getenv("ALLOW_PROD_DEBUG", "1") or "1")
+    monkeypatch.setenv("ALLOW_PROD_DEBUG", os.getenv("ALLOW_PROD_DEBUG", "0") or "0")
     monkeypatch.setenv(
         "RATE_LIMIT_ENABLED", os.getenv("RATE_LIMIT_ENABLED", "0") or "0"
     )

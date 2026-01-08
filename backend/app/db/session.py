@@ -35,6 +35,10 @@ def _register_vector(dbapi_connection, connection_record) -> None:  # noqa: ARG0
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 
+def get_engine():
+    return engine
+
+
 def get_db() -> Generator:
     db = SessionLocal()
     try:

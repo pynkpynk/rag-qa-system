@@ -14,7 +14,9 @@ router = APIRouter()
 
 def _debug_allowed() -> bool:
     env = (settings.app_env or "dev").strip().lower()
-    return env != "prod"
+    if env != "prod":
+        return True
+    return (os.getenv("ALLOW_PROD_DEBUG", "0") or "0") == "1"
 
 
 def _require_debug_token(x_debug_token: Optional[str]) -> None:

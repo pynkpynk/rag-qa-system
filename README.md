@@ -18,6 +18,10 @@
 - This unlocks `retrieval_debug` only when `debug=true` and the global flag is enabled; it does **not** expand document/data access.
 - When `debug=true` and the feature flag is enabled, error responses (e.g., `run not found`) now include `debug_meta` so you can diagnose why `retrieval_debug` was excluded; `retrieval_debug` itself remains admin-only and sanitized.
 
+## Production guardrails
+- Debug/diagnostic surfaces (retrieval debug, `/api/_debug/*`) are disabled when `APP_ENV=prod` unless you explicitly set `ALLOW_PROD_DEBUG=1`. Keep the default `0` in production and only flip it temporarily with an audit trail.
+- CORS is deny-by-default in prod. Set `cors_origin` (comma-separated origins, e.g. `https://app.example.com,https://staging.example.com`) in your environment to whitelist specific frontends; leaving it blank keeps the API private.
+
 ## Demo tokens (AUTH_MODE=demo)
 - Production deployments using `AUTH_MODE=demo` **must** configure an allowlist: either set `DEMO_TOKEN_SHA256_LIST` (preferred, comma-separated SHA256 digests) or `DEMO_TOKEN_PLAINTEXT` for a single shared token.
 - Generate a digest with `echo -n "my-demo-token" | shasum -a 256 | cut -d' ' -f1`, then set `DEMO_TOKEN_SHA256_LIST=<digest>` on Render. You can still use `DEMO_TOKEN_PLAINTEXT` for staging/dev, but hashes are safer in prod.

@@ -47,10 +47,10 @@ def _normalize_simple_fts_query(q: str) -> str:
 def reset_retrieval_caches_for_testing() -> None:
     """Tests: reset cached retrieval capability flags."""
     try:
-        from app.api.routes import chat
+        from app.db.capabilities import set_current_db_capabilities
+        from app.main import app as main_app
 
-        chat._TRGM_AVAILABLE_FLAG = None
-        chat._TRGM_UNAVAILABLE_LOGGED = False
+        set_current_db_capabilities(getattr(main_app.state, "db_capabilities", None))
     except Exception:
         pass
 
