@@ -32,9 +32,6 @@ export default function AppNav() {
     >
       <div style={{ display: "flex", gap: "1rem", flexWrap: "wrap" }}>
         <Link href="/">Console</Link>
-        <Link href="/docs">Docs</Link>
-        <Link href="/chat">Chat</Link>
-        <Link href="/runs">Runs</Link>
       </div>
       <div
         style={{
