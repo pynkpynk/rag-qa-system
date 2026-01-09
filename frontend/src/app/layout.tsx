@@ -5,7 +5,11 @@ const APP_NAME = process.env.NEXT_PUBLIC_APP_NAME || "Doc Q&A";
 const SITE_URL =
   process.env.NEXT_PUBLIC_SITE_URL &&
   /^https?:\/\//i.test(process.env.NEXT_PUBLIC_SITE_URL)
-    ? process.env.NEXT_PUBLIC_SITE_URL
+    ? process.env.NEXT_PUBLIC_SITE_URL.replace(/\/$/, "")
+    : process.env.VERCEL_PROJECT_PRODUCTION_URL
+    ? `https://${process.env.VERCEL_PROJECT_PRODUCTION_URL}`.replace(/\/$/, "")
+    : process.env.VERCEL_URL
+    ? `https://${process.env.VERCEL_URL}`.replace(/\/$/, "")
     : undefined;
 const DESCRIPTION =
   "Evidence-first answers from your documents with citations and audit-friendly context.";
