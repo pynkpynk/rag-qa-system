@@ -443,26 +443,6 @@ export default function HomePage() {
           <h2 style={{ fontSize: "1.1rem", marginBottom: "0.75rem" }}>
             Workspace
           </h2>
-          <div
-            style={{ display: "flex", flexDirection: "column", gap: "0.75rem" }}
-          >
-            <div>
-              <p style={{ fontSize: "0.9rem", color: "#94a3b8", margin: 0 }}>
-                Connected backend
-              </p>
-              <code style={{ fontSize: "0.9rem" }}>
-                {normalizeApiBase(baseUrl)}
-              </code>
-            </div>
-            <p style={{ fontSize: "0.85rem", color: "#94a3b8", margin: 0 }}>
-              This demo auto-connects to the configured backend. For advanced
-              settings (custom base URL, tokens, dev headers) open{" "}
-              <a href="/dev" style={{ color: "#38bdf8" }}>
-                /dev
-              </a>
-              .
-            </p>
-          </div>
 
           <div
             style={{
