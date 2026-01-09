@@ -7,16 +7,20 @@ function notConfiguredResponse() {
   return new NextResponse(null, { status: 404 });
 }
 
-export const GET = (req: Request) => {
-  if (!isAuthConfigured) {
-    return notConfiguredResponse();
-  }
-  return handler(req);
+type RouteContext = {
+  params?: Record<string, string> | undefined;
 };
 
-export const POST = (req: Request) => {
+export const GET = (req: Request, ctx: RouteContext) => {
   if (!isAuthConfigured) {
     return notConfiguredResponse();
   }
-  return handler(req);
+  return handler(req, ctx);
+};
+
+export const POST = (req: Request, ctx: RouteContext) => {
+  if (!isAuthConfigured) {
+    return notConfiguredResponse();
+  }
+  return handler(req, ctx);
 };
