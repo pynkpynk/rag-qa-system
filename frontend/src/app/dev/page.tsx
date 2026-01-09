@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { apiFetch } from "../../lib/apiClient";
+import { DEFAULT_API_BASE, normalizeApiBase } from "../../lib/workspace";
 
 type DocumentListItem = {
   document_id: string;
@@ -27,8 +28,6 @@ type HealthPayload = Record<string, unknown>;
 
 type TabKey = "ask" | "documents" | "health";
 
-const DEFAULT_API_BASE =
-  process.env.NEXT_PUBLIC_API_BASE || "http://127.0.0.1:8000/api";
 const STORAGE_BASE = "ragqa.ui.apiBase";
 const STORAGE_TOKEN = "ragqa.ui.token";
 const STORAGE_DEV_SUB = "ragqa.ui.devSub";
@@ -82,7 +81,7 @@ function useRememberedConfig() {
 }
 
 function useApi(baseUrl: string, token: string, devSub: string) {
-  const normalized = baseUrl || DEFAULT_API_BASE;
+  const normalized = normalizeApiBase(baseUrl);
   return useMemo(() => {
     async function request<T>(
       path: string,

@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import type { CSSProperties, ReactNode } from "react";
 import { apiFetch } from "../lib/apiClient";
+import { DEFAULT_API_BASE, normalizeApiBase } from "../lib/workspace";
 
 type DocumentListItem = {
   document_id: string;
@@ -47,11 +48,6 @@ type ChatMessage = {
   requestId?: string;
 };
 
-const DEFAULT_API_BASE =
-  process.env.NEXT_PUBLIC_API_BASE || "http://127.0.0.1:8000/api";
-const STORAGE_BASE = "ragqa.ui.apiBase";
-const STORAGE_TOKEN = "ragqa.ui.token";
-const STORAGE_DEV_SUB = "ragqa.ui.devSub";
 const STORAGE_GLOSSARY = "ragqa.ui.glossary";
 
 const SAMPLE_PROMPTS = [
@@ -62,16 +58,9 @@ const SAMPLE_PROMPTS = [
 ];
 
 function normalizeOrigin(base: string): string {
-  let value = (base || DEFAULT_API_BASE).trim();
-  if (!value) value = DEFAULT_API_BASE;
-  while (value.endsWith("/")) {
-    value = value.slice(0, -1);
-  }
-  const lower = value.toLowerCase();
-  if (lower.endsWith("/api")) {
-    value = value.slice(0, -4) || "/";
-  }
-  return value || "/";
+  const normalized = normalizeApiBase(base);
+  const origin = normalized.slice(0, -4);
+  return origin || "/";
 }
 
 function buildDocViewUrl(
@@ -86,50 +75,6 @@ function buildDocViewUrl(
     url += `#page=${page}`;
   }
   return url;
-}
-
-function useRememberedConfig() {
-  const [baseUrl, setBaseUrl] = useState(DEFAULT_API_BASE);
-  const [token, setToken] = useState("");
-  const [devSub, setDevSub] = useState("dev|user");
-  const [remember, setRemember] = useState(false);
-
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-    const savedBase = window.localStorage.getItem(STORAGE_BASE);
-    const savedToken = window.localStorage.getItem(STORAGE_TOKEN);
-    const savedDev = window.localStorage.getItem(STORAGE_DEV_SUB);
-    if (savedBase || savedToken || savedDev) {
-      setBaseUrl(savedBase || DEFAULT_API_BASE);
-      setToken(savedToken || "");
-      setDevSub(savedDev || "dev|user");
-      setRemember(true);
-    }
-  }, []);
-
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-    if (remember) {
-      window.localStorage.setItem(STORAGE_BASE, baseUrl);
-      window.localStorage.setItem(STORAGE_TOKEN, token);
-      window.localStorage.setItem(STORAGE_DEV_SUB, devSub);
-    } else {
-      window.localStorage.removeItem(STORAGE_BASE);
-      window.localStorage.removeItem(STORAGE_TOKEN);
-      window.localStorage.removeItem(STORAGE_DEV_SUB);
-    }
-  }, [remember, baseUrl, token, devSub]);
-
-  return {
-    baseUrl,
-    token,
-    devSub,
-    remember,
-    setBaseUrl,
-    setToken,
-    setDevSub,
-    setRemember,
-  };
 }
 
 function useGlossary() {
@@ -147,7 +92,7 @@ function useGlossary() {
 }
 
 function useApi(baseUrl: string, token: string, devSub: string) {
-  const normalized = baseUrl || DEFAULT_API_BASE;
+  const normalized = normalizeApiBase(baseUrl);
   return useMemo(() => {
     async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
       const resp = await apiFetch(
@@ -190,19 +135,11 @@ function citationKey(c: ChatCitation): string {
 }
 
 export default function HomePage() {
-  const {
-    baseUrl,
-    token,
-    devSub,
-    remember,
-    setBaseUrl,
-    setToken,
-    setDevSub,
-    setRemember,
-  } = useRememberedConfig();
+  const baseUrl = DEFAULT_API_BASE;
+  const token = "";
+  const devSub = "";
   const api = useApi(baseUrl, token, devSub);
   const { glossary, setGlossary } = useGlossary();
-  const [settingsOpen, setSettingsOpen] = useState(false);
 
   const [documents, setDocuments] = useState<DocumentListItem[]>([]);
   const [docsLoading, setDocsLoading] = useState(false);
@@ -218,8 +155,6 @@ export default function HomePage() {
   const [selectedCitationKey, setSelectedCitationKey] = useState<string | null>(
     null,
   );
-
-  const isLocalBase = /localhost|127\.0\.0\.1|::1/.test(baseUrl);
 
   const refreshDocuments = useCallback(async () => {
     setDocsLoading(true);
@@ -505,57 +440,28 @@ export default function HomePage() {
       <h1 style={{ marginBottom: "1rem", fontSize: "1.5rem" }}>Document Q&A</h1>
       <div style={containerStyle}>
         <section style={paneStyle}>
-          <h2 style={{ fontSize: "1.1rem", marginBottom: "0.75rem" }}>Workspace</h2>
-          <div style={{ display: "flex", flexDirection: "column", gap: "0.75rem" }}>
-            <label style={{ display: "flex", flexDirection: "column", gap: "0.25rem" }}>
-              API Base URL
-              <input
-                value={baseUrl}
-                onChange={(e) => setBaseUrl(e.target.value)}
-                placeholder="https://host/api"
-                style={{ padding: "0.4rem", borderRadius: "6px" }}
-              />
-            </label>
-            <label style={{ display: "flex", flexDirection: "column", gap: "0.25rem" }}>
-              Bearer Token (optional)
-              <input
-                value={token}
-                onChange={(e) => setToken(e.target.value)}
-                placeholder="demo-token"
-                style={{ padding: "0.4rem", borderRadius: "6px" }}
-              />
-            </label>
-            <label style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
-              <input
-                type="checkbox"
-                checked={remember}
-                onChange={(e) => setRemember(e.target.checked)}
-              />
-              Remember settings locally
-            </label>
-            <details open={settingsOpen || isLocalBase}>
-              <summary
-                style={{ cursor: "pointer", color: "#94a3b8", marginBottom: "0.25rem" }}
-                onClick={(e) => {
-                  e.preventDefault();
-                  setSettingsOpen((prev) => !prev);
-                }}
-              >
-                Advanced headers
-              </summary>
-              <label style={{ display: "flex", flexDirection: "column", gap: "0.25rem" }}>
-                Dev subject (x-dev-sub)
-                <input
-                  value={devSub}
-                  onChange={(e) => setDevSub(e.target.value)}
-                  placeholder="dev|user"
-                  style={{ padding: "0.4rem", borderRadius: "6px" }}
-                />
-              </label>
-              <p style={{ fontSize: "0.8rem", color: "#94a3b8", marginTop: "0.25rem" }}>
-                Local dev auth usually requires Bearer dev-token + x-dev-sub.
+          <h2 style={{ fontSize: "1.1rem", marginBottom: "0.75rem" }}>
+            Workspace
+          </h2>
+          <div
+            style={{ display: "flex", flexDirection: "column", gap: "0.75rem" }}
+          >
+            <div>
+              <p style={{ fontSize: "0.9rem", color: "#94a3b8", margin: 0 }}>
+                Connected backend
               </p>
-            </details>
+              <code style={{ fontSize: "0.9rem" }}>
+                {normalizeApiBase(baseUrl)}
+              </code>
+            </div>
+            <p style={{ fontSize: "0.85rem", color: "#94a3b8", margin: 0 }}>
+              This demo auto-connects to the configured backend. For advanced
+              settings (custom base URL, tokens, dev headers) open{" "}
+              <a href="/dev" style={{ color: "#38bdf8" }}>
+                /dev
+              </a>
+              .
+            </p>
           </div>
 
           <div
