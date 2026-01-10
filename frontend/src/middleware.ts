@@ -77,10 +77,22 @@ export async function middleware(request: NextRequest) {
     return mw("next", NextResponse.next());
   }
 
-  const requiresAppLogin =
-    pathname.startsWith("/chat") || pathname.startsWith("/runs");
+  const isChatRoute = pathname === "/chat" || pathname.startsWith("/chat/");
+  const isRunsRoute = pathname === "/runs" || pathname.startsWith("/runs/");
+  const redirectToConsole = () => {
+    const url = request.nextUrl.clone();
+    url.pathname = "/console";
+    return mw("redirect:/console", NextResponse.redirect(url, 308));
+  };
 
-  if (requiresAppLogin) {
+  if (isChatRoute || isRunsRoute) {
+    return redirectToConsole();
+  }
+
+  const isConsoleRoute =
+    pathname === "/console" || pathname.startsWith("/console/");
+
+  if (isConsoleRoute) {
     if (!authConfigured) {
       if (inProduction) {
         return rewriteTo404();
@@ -90,12 +102,8 @@ export async function middleware(request: NextRequest) {
     const response = mw("next", NextResponse.next());
     const session = await auth0Edge().getSession(request, response);
     if (!session) {
-      const targetPath = `${pathname}${request.nextUrl.search || ""}`;
-      const fallback =
-        pathname.startsWith("/runs") || targetPath.startsWith("/runs")
-          ? "/runs"
-          : "/chat";
-      const returnTo = sanitizeReturnTo(targetPath, fallback);
+      const targetPath = `${pathname}${request.nextUrl.search || ""}` || "/console";
+      const returnTo = sanitizeReturnTo(targetPath, "/console");
       const loginUrl = request.nextUrl.clone();
       loginUrl.pathname = "/auth/login";
       loginUrl.search = `returnTo=${encodeURIComponent(returnTo)}`;
@@ -119,6 +127,7 @@ export const config = {
     "/admin/:path*",
     "/chat/:path*",
     "/runs/:path*",
+    "/console/:path*",
     "/dev/:path*",
   ],
 };
