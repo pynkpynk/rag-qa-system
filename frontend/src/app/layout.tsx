@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import "./globals.css";
+import { Inter, Press_Start_2P } from "next/font/google";
 
 const APP_NAME = process.env.NEXT_PUBLIC_APP_NAME || "Doc Q&A";
 const SITE_URL =
@@ -34,13 +35,26 @@ export const metadata: Metadata = {
   },
 };
 
+const inter = Inter({
+  subsets: ["latin"],
+  variable: "--font-sans",
+  display: "swap",
+});
+
+const pressStart = Press_Start_2P({
+  subsets: ["latin"],
+  weight: "400",
+  variable: "--font-display",
+  display: "swap",
+});
+
 export default function RootLayout({
   children,
 }: {
   children: React.ReactNode;
 }) {
   return (
-    <html lang="en">
+    <html lang="en" className={`${inter.variable} ${pressStart.variable}`}>
       <body className="app-body">{children}</body>
     </html>
   );
