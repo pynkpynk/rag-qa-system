@@ -3,8 +3,18 @@ import type { NextRequest } from "next/server";
 import { NextResponse } from "next/server";
 import { getAuth0, isAuthConfigured } from "@/lib/auth0";
 
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+
+const buildTag = process.env.VERCEL_GIT_COMMIT_SHA?.slice(0, 7) ?? "unknown";
+
+function withBuildHeader(response: Response): Response {
+  response.headers.set("x-ragqa-build", `v=1 commit=${buildTag}`);
+  return response;
+}
+
 function notConfiguredResponse() {
-  return new NextResponse(null, { status: 404 });
+  return withBuildHeader(new NextResponse(null, { status: 404 }));
 }
 
 function sanitizeReturnTo(value: string | null): string {
@@ -34,18 +44,20 @@ function buildHandler() {
   });
 }
 
-export const GET = (req: Request, ctx: AppRouteHandlerFnContext) => {
+export const GET = async (req: Request, ctx: AppRouteHandlerFnContext) => {
   if (!isAuthConfigured) {
     return notConfiguredResponse();
   }
   const handler = buildHandler();
-  return handler(req, ctx);
+  const response = await handler(req, ctx);
+  return withBuildHeader(response);
 };
 
-export const POST = (req: Request, ctx: AppRouteHandlerFnContext) => {
+export const POST = async (req: Request, ctx: AppRouteHandlerFnContext) => {
   if (!isAuthConfigured) {
     return notConfiguredResponse();
   }
   const handler = buildHandler();
-  return handler(req, ctx);
+  const response = await handler(req, ctx);
+  return withBuildHeader(response);
 };
