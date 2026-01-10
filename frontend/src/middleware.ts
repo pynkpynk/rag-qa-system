@@ -1,23 +1,9 @@
 import type { NextRequest } from "next/server";
 import { NextResponse } from "next/server";
 import { auth0Edge } from "@/lib/auth0-edge";
-
-const BUILD_PATHS = [
-  "/admin/:path*",
-  "/chat/:path*",
-  "/runs/:path*",
-  "/dev/:path*",
-];
+import { isAuthConfigured } from "@/lib/auth0-config";
 
 const MW_HEADER_NAME = "x-ragqa-mw";
-type MiddlewareAction = "next" | "redirect" | "rewrite";
-
-function createMarker(pathname: string) {
-  return (response: NextResponse, action: MiddlewareAction) => {
-    response.headers.set(MW_HEADER_NAME, `v=1 action=${action} path=${pathname}`);
-    return response;
-  };
-}
 
 function sanitizeReturnTo(value: string, fallback: string): string {
   if (!value) {
@@ -37,21 +23,22 @@ function sanitizeReturnTo(value: string, fallback: string): string {
 
 export async function middleware(request: NextRequest) {
   const pathname = request.nextUrl.pathname || "";
-  const mark = createMarker(pathname);
   const inProduction = process.env.NODE_ENV === "production";
   const allowDevRoutes = process.env.ALLOW_DEV_ROUTES === "1";
-  const authConfigured = Boolean(
-    process.env.AUTH0_BASE_URL &&
-      (process.env.AUTH0_ISSUER_BASE_URL || process.env.AUTH0_DOMAIN) &&
-      process.env.AUTH0_CLIENT_ID &&
-      process.env.AUTH0_CLIENT_SECRET &&
-      process.env.AUTH0_SECRET,
-  );
+  const authConfigured = isAuthConfigured;
+  const authFlag = authConfigured ? "1" : "0";
+  const mw = (action: string, response: NextResponse) => {
+    response.headers.set(
+      MW_HEADER_NAME,
+      `v=1 action=${action} path=${pathname} authcfg=${authFlag}`,
+    );
+    return response;
+  };
 
   const rewriteTo404 = () => {
     const url = request.nextUrl.clone();
     url.pathname = "/404";
-    return mark(NextResponse.rewrite(url), "rewrite");
+    return mw("rewrite:/404", NextResponse.rewrite(url));
   };
 
   const isAdminDevRoute =
@@ -64,7 +51,7 @@ export async function middleware(request: NextRequest) {
     }
     const url = request.nextUrl.clone();
     url.pathname = "/dev";
-    return mark(NextResponse.rewrite(url), "rewrite");
+    return mw("rewrite:/dev", NextResponse.rewrite(url));
   }
 
   if (isDevRoute) {
@@ -75,7 +62,7 @@ export async function middleware(request: NextRequest) {
       if (!authConfigured) {
         return rewriteTo404();
       }
-      const response = mark(NextResponse.next(), "next");
+      const response = mw("next", NextResponse.next());
       const session = await auth0Edge().getSession(request, response);
       if (!session) {
         const targetPath = `${pathname}${request.nextUrl.search || ""}` || "/dev";
@@ -83,11 +70,11 @@ export async function middleware(request: NextRequest) {
         const loginUrl = request.nextUrl.clone();
         loginUrl.pathname = "/auth/login";
         loginUrl.search = `returnTo=${encodeURIComponent(returnTo)}`;
-        return mark(NextResponse.redirect(loginUrl), "redirect");
+        return mw("redirect:/auth/login", NextResponse.redirect(loginUrl));
       }
       return response;
     }
-    return mark(NextResponse.next(), "next");
+    return mw("next", NextResponse.next());
   }
 
   const requiresAppLogin =
@@ -95,9 +82,12 @@ export async function middleware(request: NextRequest) {
 
   if (requiresAppLogin) {
     if (!authConfigured) {
-      return mark(NextResponse.next(), "next");
+      if (inProduction) {
+        return rewriteTo404();
+      }
+      return mw("next", NextResponse.next());
     }
-    const response = mark(NextResponse.next(), "next");
+    const response = mw("next", NextResponse.next());
     const session = await auth0Edge().getSession(request, response);
     if (!session) {
       const targetPath = `${pathname}${request.nextUrl.search || ""}`;
@@ -109,7 +99,7 @@ export async function middleware(request: NextRequest) {
       const loginUrl = request.nextUrl.clone();
       loginUrl.pathname = "/auth/login";
       loginUrl.search = `returnTo=${encodeURIComponent(returnTo)}`;
-      return mark(NextResponse.redirect(loginUrl), "redirect");
+      return mw("redirect:/auth/login", NextResponse.redirect(loginUrl));
     }
     return response;
   }
@@ -118,12 +108,17 @@ export async function middleware(request: NextRequest) {
     if (!authConfigured) {
       return rewriteTo404();
     }
-    return mark(NextResponse.next(), "next");
+    return mw("next", NextResponse.next());
   }
 
-  return mark(NextResponse.next(), "next");
+  return mw("next", NextResponse.next());
 }
 
 export const config = {
-  matcher: BUILD_PATHS,
+  matcher: [
+    "/admin/:path*",
+    "/chat/:path*",
+    "/runs/:path*",
+    "/dev/:path*",
+  ],
 };

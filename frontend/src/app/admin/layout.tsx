@@ -26,7 +26,7 @@ export default async function AdminLayout({
 
   const session = await getAuth0().getSession();
 
-  if (!session) {
+  if (!session?.user) {
     const returnTo = currentPath();
     redirect(`/auth/login?returnTo=${encodeURIComponent(returnTo)}`);
   }
