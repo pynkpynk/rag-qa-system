@@ -11,6 +11,9 @@ npm run dev
 - The dev server listens on `http://localhost:3000`. Requests to `/api/*` are proxied to `http://127.0.0.1:8000/api/*`
   automatically (only in `next dev`; production uses the Vercel rewrite).
 - Set `NEXT_PUBLIC_API_BASE` in `.env.local` if you need a non-default API origin.
+- `/dev` and `/admin/dev` are blocked when `NODE_ENV=production` unless you set `ALLOW_DEV_ROUTES=1`. When enabled, middleware rewrites `/admin/dev` to `/dev`, so the dev tools become publicly reachable unless another auth layer blocks them—toggle the env only for short, controlled debugging sessions. Even when enabled in production, `/dev` requires an Auth0 session with admin privileges.
+- The `/admin` console includes a token settings panel that writes the Bearer token to both `ragqa_token` and `ragqa.ui.token` in `localStorage`.
+- When Auth0 is configured, `/chat` and `/runs` require a valid session; unauthenticated visits are redirected to `/auth/login` with a safe `returnTo` so users land back on the page they asked for after logging in.
 
 ## Production (Vercel)
 

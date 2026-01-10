@@ -1,7 +1,7 @@
 import type { ReactNode } from "react";
 import { headers } from "next/headers";
 import { notFound, redirect } from "next/navigation";
-import { auth0, isAuthConfigured } from "@/lib/auth0";
+import { getAuth0, isAuthConfigured } from "@/lib/auth0";
 import { isAdminSession } from "@/lib/admin";
 
 export const dynamic = "force-dynamic";
@@ -24,7 +24,7 @@ export default async function AdminLayout({
     notFound();
   }
 
-  const session = await auth0.getSession();
+  const session = await getAuth0().getSession();
 
   if (!session) {
     const returnTo = currentPath();

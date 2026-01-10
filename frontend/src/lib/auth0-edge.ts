@@ -1,14 +1,24 @@
 import { initAuth0 as initAuth0Edge } from "@auth0/nextjs-auth0/edge";
 import type { NextRequest } from "next/server";
 import { NextResponse } from "next/server";
-import { auth0Config } from "./auth0-config";
+import { buildAuth0Config, isAuthConfigured } from "./auth0-config";
 
-const auth0EdgeInstance = initAuth0Edge(auth0Config);
+let edgeInstance: ReturnType<typeof initAuth0Edge> | null = null;
+
+function ensureEdge() {
+  if (!edgeInstance) {
+    edgeInstance = initAuth0Edge(buildAuth0Config());
+  }
+  return edgeInstance;
+}
 
 export async function runAuthMiddleware(request: NextRequest) {
+  if (!isAuthConfigured) {
+    return NextResponse.next();
+  }
   const response = NextResponse.next();
-  await auth0EdgeInstance.getSession(request, response);
+  await ensureEdge().getSession(request, response);
   return response;
 }
 
-export const auth0Edge = auth0EdgeInstance;
+export const auth0Edge = ensureEdge;

@@ -1,3 +1,5 @@
+import type { ConfigParameters } from "@auth0/nextjs-auth0";
+
 const isProdRuntime =
   process.env.NODE_ENV === "production" &&
   process.env.NEXT_PHASE !== "phase-production-build";
@@ -41,10 +43,23 @@ const hasSecret = Boolean(process.env.AUTH0_SECRET);
 
 export const isAuthConfigured = hasIssuer && hasClient && hasSecret;
 
-export const auth0Config = {
-  baseURL: baseUrl(),
-  issuerBaseURL: requireValue(issuerUrl(), "AUTH0_ISSUER_BASE_URL or AUTH0_DOMAIN"),
-  clientID: requireValue(process.env.AUTH0_CLIENT_ID, "AUTH0_CLIENT_ID"),
-  clientSecret: requireValue(process.env.AUTH0_CLIENT_SECRET, "AUTH0_CLIENT_SECRET"),
-  secret: requireValue(process.env.AUTH0_SECRET, "AUTH0_SECRET"),
-};
+export function buildAuth0Config(): ConfigParameters {
+  return {
+    baseURL: baseUrl(),
+    issuerBaseURL: requireValue(
+      issuerUrl(),
+      "AUTH0_ISSUER_BASE_URL or AUTH0_DOMAIN",
+    ),
+    clientID: requireValue(process.env.AUTH0_CLIENT_ID, "AUTH0_CLIENT_ID"),
+    clientSecret: requireValue(
+      process.env.AUTH0_CLIENT_SECRET,
+      "AUTH0_CLIENT_SECRET",
+    ),
+    secret: requireValue(process.env.AUTH0_SECRET, "AUTH0_SECRET"),
+    routes: {
+      login: "/auth/login",
+      callback: "/auth/callback",
+      postLogoutRedirect: "/",
+    },
+  };
+}

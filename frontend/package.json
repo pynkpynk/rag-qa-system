@@ -5,6 +5,7 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
+    "postbuild": "node scripts/scan_next_static_secrets.mjs",
     "start": "next start",
     "lint": "next lint"
   },
