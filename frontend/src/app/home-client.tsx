@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import type { CSSProperties, ReactNode } from "react";
 import { apiFetch } from "../lib/apiClient";
+import { getToken } from "../lib/authToken";
 import { DEFAULT_API_BASE, normalizeApiBase } from "../lib/workspace";
 
 type DocumentListItem = {
@@ -49,6 +50,7 @@ type ChatMessage = {
 };
 
 const STORAGE_GLOSSARY = "ragqa.ui.glossary";
+const MAX_UPLOAD_BYTES = 4 * 1024 * 1024;
 
 const SAMPLE_PROMPTS = [
   "Summarize the obligations in section 3 of the latest policy.",
@@ -56,6 +58,8 @@ const SAMPLE_PROMPTS = [
   "Where is the support contact documented?",
   "What changed between the 2023 and 2024 handbook versions?",
 ];
+
+type RunRecord = Record<string, unknown>;
 
 function normalizeOrigin(base: string): string {
   const normalized = normalizeApiBase(base);
@@ -75,6 +79,21 @@ function buildDocViewUrl(
     url += `#page=${page}`;
   }
   return url;
+}
+
+function resolveRunId(entry: RunRecord | null | undefined): string | null {
+  if (!entry || typeof entry !== "object") return null;
+  const candidates = ["run_id", "id", "request_id", "requestId"];
+  for (const key of candidates) {
+    const value = entry[key];
+    if (typeof value === "string" && value) {
+      return value;
+    }
+    if (typeof value === "number") {
+      return String(value);
+    }
+  }
+  return null;
 }
 
 function useGlossary() {
@@ -134,11 +153,47 @@ function citationKey(c: ChatCitation): string {
   );
 }
 
-export default function HomeClient() {
+function useAuthToken(prefill?: string) {
+  const [token, setToken] = useState(prefill ?? "");
+
+  useEffect(() => {
+    if (prefill) {
+      setToken(prefill);
+    }
+    if (typeof window === "undefined") {
+      return;
+    }
+    const readToken = () => {
+      if (prefill) {
+        setToken(prefill);
+        return;
+      }
+      const stored = getToken();
+      setToken(stored ?? "");
+    };
+    readToken();
+    const handler = () => readToken();
+    window.addEventListener("ragqa-token-change", handler);
+    window.addEventListener("storage", handler);
+    return () => {
+      window.removeEventListener("ragqa-token-change", handler);
+      window.removeEventListener("storage", handler);
+    };
+  }, [prefill]);
+
+  return token;
+}
+
+type HomeClientProps = {
+  demoToken?: string;
+};
+
+export default function HomeClient({ demoToken }: HomeClientProps = {}) {
   const baseUrl = DEFAULT_API_BASE;
-  const token = "";
   const devSub = "";
-  const api = useApi(baseUrl, token, devSub);
+  const apiBaseLabel = normalizeApiBase(baseUrl);
+  const authToken = useAuthToken(demoToken);
+  const api = useApi(baseUrl, authToken, devSub);
   const { glossary, setGlossary } = useGlossary();
 
   const [documents, setDocuments] = useState<DocumentListItem[]>([]);
@@ -155,6 +210,14 @@ export default function HomeClient() {
   const [selectedCitationKey, setSelectedCitationKey] = useState<string | null>(
     null,
   );
+  const [runsPayload, setRunsPayload] = useState<unknown>(null);
+  const [runsLoading, setRunsLoading] = useState(false);
+  const [runsError, setRunsError] = useState<string | null>(null);
+  const [selectedRunEntry, setSelectedRunEntry] = useState<RunRecord | null>(null);
+  const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
+  const [runDetails, setRunDetails] = useState<unknown>(null);
+  const [runDetailsError, setRunDetailsError] = useState<string | null>(null);
+  const [runDetailsLoading, setRunDetailsLoading] = useState(false);
 
   const refreshDocuments = useCallback(async () => {
     setDocsLoading(true);
@@ -172,6 +235,42 @@ export default function HomeClient() {
   useEffect(() => {
     void refreshDocuments();
   }, [refreshDocuments]);
+
+  const refreshRuns = useCallback(async () => {
+    setRunsLoading(true);
+    setRunsError(null);
+    try {
+      const payload = await api.request<unknown>("/runs");
+      setRunsPayload(payload);
+    } catch (err) {
+      setRunsError((err as Error).message);
+    } finally {
+      setRunsLoading(false);
+    }
+  }, [api]);
+
+  useEffect(() => {
+    void refreshRuns();
+  }, [refreshRuns]);
+
+  const loadRunDetails = useCallback(
+    async (runId: string) => {
+      setRunDetailsLoading(true);
+      setRunDetailsError(null);
+      try {
+        const payload = await api.request<unknown>(
+          `/runs/${encodeURIComponent(runId)}`,
+        );
+        setRunDetails(payload);
+      } catch (err) {
+        setRunDetailsError((err as Error).message);
+        setRunDetails(null);
+      } finally {
+        setRunDetailsLoading(false);
+      }
+    },
+    [api],
+  );
 
   useEffect(() => {
     setSelectedDocs((prev) =>
@@ -220,9 +319,26 @@ export default function HomeClient() {
     );
   }
 
+  function handleRunSelect(entry: RunRecord) {
+    setSelectedRunEntry(entry);
+    const runId = resolveRunId(entry);
+    setSelectedRunId(runId);
+    setRunDetails(null);
+    setRunDetailsError(null);
+    if (!runId) {
+      setRunDetailsLoading(false);
+      return;
+    }
+    void loadRunDetails(runId);
+  }
+
   async function handleUpload() {
     if (!fileToUpload) {
       setUploadStatus("Select a PDF to upload.");
+      return;
+    }
+    if (fileToUpload.size > MAX_UPLOAD_BYTES) {
+      setUploadStatus("PDF must be 4 MB or smaller.");
       return;
     }
     setUploadStatus("Uploading...");
@@ -369,6 +485,11 @@ export default function HomeClient() {
     ? /pwned|ignore all instructions|system override/i.test(snippetText)
     : false;
 
+  const runsList = Array.isArray(runsPayload)
+    ? (runsPayload as RunRecord[])
+    : null;
+  const rawRunsPayload = runsList ? null : runsPayload;
+
   async function handleCopyMarkdown() {
     if (!latestAssistant) return;
     const citeLines = (latestAssistant.citations || []).map((c) => {
@@ -437,7 +558,10 @@ export default function HomeClient() {
         fontFamily: "system-ui, sans-serif",
       }}
     >
-      <h1 style={{ marginBottom: "1rem", fontSize: "1.5rem" }}>Document Q&A</h1>
+      <h1 style={{ marginBottom: "0.5rem", fontSize: "1.5rem" }}>Document Q&A</h1>
+      <p style={{ marginBottom: "1rem", color: "#94a3b8", fontSize: "0.75rem" }}>
+        API: {apiBaseLabel}
+      </p>
       <div style={containerStyle}>
         <section style={paneStyle}>
           <h2 style={{ fontSize: "1.1rem", marginBottom: "0.75rem" }}>
@@ -825,6 +949,159 @@ export default function HomeClient() {
               </div>
             </div>
           )}
+        </section>
+
+        <section style={{ ...paneStyle, flex: "1 1 360px" }}>
+          <h2 style={{ fontSize: "1.1rem", marginBottom: "0.75rem" }}>Runs</h2>
+          <div style={{ display: "flex", gap: "0.5rem", marginBottom: "0.75rem" }}>
+            <button
+              onClick={() => refreshRuns()}
+              style={{
+                padding: "0.35rem 0.75rem",
+                borderRadius: "6px",
+                border: "1px solid #475569",
+                background: "transparent",
+                color: "#e2e8f0",
+              }}
+            >
+              {runsLoading ? "Refreshing..." : "Refresh runs"}
+            </button>
+          </div>
+          {runsError && (
+            <p style={{ color: "#f87171", fontSize: "0.85rem" }}>{runsError}</p>
+          )}
+          {runsList ? (
+            <div
+              style={{
+                maxHeight: "220px",
+                overflowY: "auto",
+                display: "flex",
+                flexDirection: "column",
+                gap: "0.4rem",
+                marginBottom: "0.75rem",
+              }}
+            >
+              {runsList.length === 0 ? (
+                <p style={{ color: "#94a3b8", fontSize: "0.85rem" }}>
+                  No runs available yet.
+                </p>
+              ) : (
+                runsList.map((entry, idx) => {
+                  const runId = resolveRunId(entry);
+                  const label = runId || `run-${idx + 1}`;
+                  const isSelected = selectedRunId
+                    ? runId === selectedRunId
+                    : selectedRunEntry === entry;
+                  return (
+                    <button
+                      key={`${label}-${idx}`}
+                      onClick={() => handleRunSelect(entry)}
+                      style={{
+                        textAlign: "left",
+                        borderRadius: "8px",
+                        border: "1px solid #334155",
+                        padding: "0.45rem 0.6rem",
+                        background: isSelected
+                          ? "rgba(34,211,238,0.15)"
+                          : "transparent",
+                        color: "#e2e8f0",
+                        cursor: "pointer",
+                      }}
+                    >
+                      <span style={{ display: "block", fontWeight: 600 }}>{label}</span>
+                      <small style={{ color: "#94a3b8" }}>
+                        {entry.status ? String(entry.status) : "View details"}
+                      </small>
+                    </button>
+                  );
+                })
+              )}
+            </div>
+          ) : runsLoading ? null : rawRunsPayload ? (
+            <div
+              style={{
+                border: "1px solid #334155",
+                borderRadius: "8px",
+                padding: "0.5rem",
+                marginBottom: "0.75rem",
+              }}
+            >
+              <p style={{ color: "#94a3b8", fontSize: "0.85rem", marginBottom: "0.4rem" }}>
+                Runs endpoint returned an unexpected shape:
+              </p>
+              <pre
+                style={{
+                  maxHeight: "200px",
+                  overflowY: "auto",
+                  background: "#0f172a",
+                  padding: "0.5rem",
+                  borderRadius: "6px",
+                }}
+              >
+                {JSON.stringify(rawRunsPayload, null, 2)}
+              </pre>
+            </div>
+          ) : (
+            <p style={{ color: "#94a3b8", fontSize: "0.85rem" }}>
+              Runs will appear after queries execute.
+            </p>
+          )}
+
+          <div
+            style={{
+              borderTop: "1px solid #1e293b",
+              paddingTop: "0.75rem",
+              marginTop: "0.25rem",
+            }}
+          >
+            <h3 style={{ fontSize: "1rem", marginBottom: "0.35rem" }}>Details</h3>
+            {!selectedRunEntry ? (
+              <p style={{ color: "#94a3b8", fontSize: "0.85rem" }}>
+                Select a run to inspect the response payload.
+              </p>
+            ) : (
+              <>
+                <p style={{ fontSize: "0.85rem", color: "#94a3b8" }}>
+                  Run ID: {selectedRunId || "Not provided"}
+                </p>
+                {selectedRunId ? (
+                  runDetailsLoading ? (
+                    <p style={{ color: "#94a3b8", fontSize: "0.85rem" }}>Loading run…</p>
+                  ) : runDetailsError ? (
+                    <p style={{ color: "#f87171", fontSize: "0.85rem" }}>{runDetailsError}</p>
+                  ) : runDetails ? (
+                    <pre
+                      style={{
+                        background: "#0f172a",
+                        padding: "0.6rem",
+                        borderRadius: "8px",
+                        maxHeight: "220px",
+                        overflowY: "auto",
+                      }}
+                    >
+                      {JSON.stringify(runDetails, null, 2)}
+                    </pre>
+                  ) : (
+                    <p style={{ color: "#94a3b8", fontSize: "0.85rem" }}>
+                      Run details unavailable.
+                    </p>
+                  )
+                ) : (
+                  <pre
+                    style={{
+                      background: "#0f172a",
+                      padding: "0.6rem",
+                      borderRadius: "8px",
+                      maxHeight: "220px",
+                      overflowY: "auto",
+                    }}
+                  >
+                    {JSON.stringify(selectedRunEntry, null, 2)}
+                  </pre>
+                )}
+              </>
+            )}
+          </div>
         </section>
       </div>
     </main>
