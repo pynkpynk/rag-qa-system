@@ -193,6 +193,7 @@ export default function HomeClient({ demoToken }: HomeClientProps = {}) {
   const devSub = "";
   const apiBaseLabel = normalizeApiBase(baseUrl);
   const authToken = useAuthToken(demoToken);
+  const authStatusLabel = authToken ? "present" : "absent";
   const api = useApi(baseUrl, authToken, devSub);
   const { glossary, setGlossary } = useGlossary();
 
@@ -560,7 +561,7 @@ export default function HomeClient({ demoToken }: HomeClientProps = {}) {
     >
       <h1 style={{ marginBottom: "0.5rem", fontSize: "1.5rem" }}>Document Q&A</h1>
       <p style={{ marginBottom: "1rem", color: "#94a3b8", fontSize: "0.75rem" }}>
-        API: {apiBaseLabel}
+        API: {apiBaseLabel} • Auth: {authStatusLabel}
       </p>
       <div style={containerStyle}>
         <section style={paneStyle}>
