@@ -1,5 +1,4 @@
-const DEFAULT_API_BASE =
-  process.env.NEXT_PUBLIC_API_BASE || "http://127.0.0.1:8000/api";
+const DEFAULT_API_BASE = process.env.NEXT_PUBLIC_API_BASE || "/api";
 
 export function normalizeApiBase(input: string): string {
   let value = (input || DEFAULT_API_BASE).trim();
