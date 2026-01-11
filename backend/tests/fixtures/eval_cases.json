@@ -207,6 +207,7 @@
     "principal_sub": "dev|admin",
     "payload": {
       "question": "このPDFについて教えて",
+      "mode": "selected_docs",
       "debug": true,
       "k": 2
     },
