@@ -41,6 +41,10 @@ export async function middleware(request: NextRequest) {
     return mw("rewrite:/404", NextResponse.rewrite(url));
   };
 
+  if (pathname === "/demo" || pathname.startsWith("/demo/")) {
+    return mw("next", NextResponse.next());
+  }
+
   const isAdminDevRoute =
     pathname === "/admin/dev" || pathname.startsWith("/admin/dev/");
   const isDevRoute = pathname === "/dev" || pathname.startsWith("/dev/");

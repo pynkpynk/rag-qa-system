@@ -90,8 +90,8 @@ export default function TokenGate({ children }: TokenGateProps) {
           placeholder="demo token"
         />
         <p style={{ margin: "0.25rem 0", fontSize: "0.85rem", color: "#555" }}>
-          Paste plaintext token (example: demo_token_a). The field accepts only the value,
-          not &ldquo;Bearer ...&rdquo;.
+          Paste plaintext token (example: demo_token_a). If you paste{" "}
+          <code>Bearer ...</code>, the prefix is removed automatically.
         </p>
         <div>
           <button
