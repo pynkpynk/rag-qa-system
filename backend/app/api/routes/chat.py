@@ -2814,7 +2814,8 @@ def ask(
         email_query_selected = False
         if not summary_mode:
             if (
-                REJECT_AMBIGUOUS_REFERENCE_WITHOUT_RUN
+                selected_docs_mode
+                and REJECT_AMBIGUOUS_REFERENCE_WITHOUT_RUN
                 and (not payload.run_id)
                 and not doc_scope
                 and has_ambiguous_reference(q_clean)

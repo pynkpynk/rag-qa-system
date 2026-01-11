@@ -33,13 +33,8 @@ export async function authFetch(
   path: string,
   init: RequestInit = {},
 ): Promise<Response> {
-  const headers = new Headers(init.headers || {});
-  const token = getToken();
-  if (token && !headers.has("Authorization")) {
-    headers.set("Authorization", `Bearer ${token}`);
-  }
-  const target = buildApiUrl(API_BASE, path);
-  return fetch(target, { ...init, headers });
+  const token = getToken() || undefined;
+  return apiFetch(API_BASE, path, token, undefined, init);
 }
 
 export async function apiFetch(

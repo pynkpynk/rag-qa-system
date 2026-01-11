@@ -4,6 +4,7 @@ import Link from "next/link";
 export const dynamic = "force-dynamic";
 
 export default function HomePage(): ReactElement {
+  const demoEnabled = process.env.DEMO_ENTRY_ENABLED === "1";
   return (
     <main
       style={{
@@ -84,6 +85,20 @@ export default function HomePage(): ReactElement {
           >
             Launch Console
           </Link>
+          {demoEnabled ? (
+            <Link
+              href="/demo"
+              style={{
+                padding: "0.95rem 1.9rem",
+                borderRadius: "999px",
+                border: "1px solid rgba(148,163,184,0.5)",
+                color: "#e2e8f0",
+                fontWeight: 600,
+              }}
+            >
+              Try Demo
+            </Link>
+          ) : null}
           <a
             href="https://github.com/pynkpynk"
             target="_blank"

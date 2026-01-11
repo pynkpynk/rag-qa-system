@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
+from fastapi.testclient import TestClient
 
 import app.api.routes.chat as chat
 from app.api.routes.chat import (
@@ -24,6 +25,7 @@ from app.core.authz import Principal, is_admin
 from app.main import normalize_http_exception_detail
 from app.core.run_access import ensure_run_access
 import app.core.run_access as run_access
+from app.main import app
 
 
 class DummyRequest:
@@ -56,6 +58,16 @@ class DummyDB:
         if not self.results:
             raise AssertionError("Unexpected SQL execute call")
         return self.results.pop(0)
+
+
+client = TestClient(app)
+
+
+def _dev_headers() -> dict[str, str]:
+    return {
+        "Authorization": "Bearer dev-token",
+        "x-dev-sub": "dev|chat-guard",
+    }
 
 
 def test_dev_mode_defaults_to_non_admin(monkeypatch):
@@ -177,6 +189,21 @@ def test_is_admin_debug_requires_token_hash_when_flag_enabled(monkeypatch):
     req_allowed = DummyRequest(f"Bearer {token}")
     user_principal = Principal(sub="user", permissions=set())
     assert chat.is_admin_debug(user_principal, req_allowed, is_admin_user=False) is True
+
+
+def test_library_mode_allows_cjk_without_run_id():
+    resp = client.post(
+        "/api/chat/ask",
+        headers=_dev_headers(),
+        json={
+            "mode": "library",
+            "question": "このPDFの要旨を日本語で簡潔にまとめて。根拠は引用（citations）で示して。",
+            "debug": False,
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert (body.get("error") or {}).get("code") != "ambiguous_reference"
 
 
 class FakeRunDB:
