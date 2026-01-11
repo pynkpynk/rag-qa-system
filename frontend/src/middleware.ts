@@ -25,6 +25,7 @@ export async function middleware(request: NextRequest) {
   const pathname = request.nextUrl.pathname || "";
   const inProduction = process.env.NODE_ENV === "production";
   const allowDevRoutes = process.env.ALLOW_DEV_ROUTES === "1";
+  const demoEnabled = process.env.DEMO_ENTRY_ENABLED === "1";
   const authConfigured = isAuthConfigured;
   const authFlag = authConfigured ? "1" : "0";
   const mw = (action: string, response: NextResponse) => {
@@ -42,7 +43,13 @@ export async function middleware(request: NextRequest) {
   };
 
   if (pathname === "/demo" || pathname.startsWith("/demo/")) {
-    return mw("next", NextResponse.next());
+    if (demoEnabled) {
+      return mw("next", NextResponse.next());
+    }
+    return mw(
+      "404:/demo",
+      new NextResponse("Not Found", { status: 404 }),
+    );
   }
 
   const isAdminDevRoute =
