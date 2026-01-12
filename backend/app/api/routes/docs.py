@@ -23,7 +23,7 @@ from fastapi import (
     Request,
     UploadFile,
 )
-from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import FileResponse, RedirectResponse, Response, StreamingResponse
 import httpx
 from sqlalchemy import text as sql_text
 from sqlalchemy.exc import IntegrityError
@@ -1037,7 +1037,7 @@ def view_pdf(
     "/docs/{document_id}/content",
     dependencies=[Depends(require_permissions("read:docs"))],
 )
-def proxy_pdf_content(
+async def proxy_pdf_content(
     document_id: str,
     request: Request,
     run_id: str | None = None,
@@ -1072,38 +1072,65 @@ def proxy_pdf_content(
         raise HTTPException(status_code=500, detail="storage_key missing")
 
     url = _s3_presign_get(doc.storage_key, inline=True, filename=doc.filename)
-    headers = {}
-    range_header = request.headers.get("range")
-    if range_header:
-        headers["range"] = range_header
+    timeout = httpx.Timeout(30.0, read=None)
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+        try:
+            # Range requests cause platform 502s; always fetch full PDF server-side.
+            resp = await client.get(url)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("pdf_proxy_fetch_failed", extra={"doc_id": doc.id})
+            raise HTTPException(status_code=502, detail="Failed to fetch document") from exc
+
+    status = resp.status_code
+    detail_error = {
+        "error": {
+            "code": "UPSTREAM_ERROR",
+            "message": "Failed to fetch document",
+            "doc_id": doc.id,
+            "upstream_status": status,
+        }
+    }
+    if status not in (200, 206):
+        raise HTTPException(status_code=502, detail=detail_error)
 
     try:
-        with httpx.stream("GET", url, headers=headers, timeout=30.0) as resp:
-            if resp.status_code not in (200, 206):
-                detail = resp.text
-                raise HTTPException(status_code=resp.status_code, detail=detail)
-            response_headers = {
-                "Content-Type": resp.headers.get("content-type", "application/pdf"),
-                "Content-Disposition": f"inline; filename=\"{_safe_cd_filename(doc.filename)}\"",
+        body = await resp.aread()
+    except Exception:  # noqa: BLE001
+        body = b""
+    if not body:
+        empty_detail = {
+            "error": {
+                "code": "UPSTREAM_EMPTY_BODY",
+                "message": "Upstream returned empty PDF.",
+                "doc_id": doc.id,
+                "upstream_status": status,
             }
-            if resp.status_code == 206:
-                if "content-range" in resp.headers:
-                    response_headers["Content-Range"] = resp.headers["content-range"]
-                if "accept-ranges" in resp.headers:
-                    response_headers["Accept-Ranges"] = resp.headers["accept-ranges"]
-                if "content-length" in resp.headers:
-                    response_headers["Content-Length"] = resp.headers["content-length"]
-            return StreamingResponse(
-                resp.iter_raw(),
-                status_code=resp.status_code,
-                media_type="application/pdf",
-                headers=response_headers,
-            )
-    except HTTPException:
-        raise
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("pdf_proxy_failed", extra={"doc_id": doc.id})
-        raise HTTPException(status_code=502, detail="Failed to fetch document") from exc
+        }
+        raise HTTPException(status_code=502, detail=empty_detail)
+    if not body.startswith(b"%PDF"):
+        invalid_detail = {
+            "error": {
+                "code": "UPSTREAM_INVALID_PDF",
+                "message": "Upstream response is not a PDF.",
+                "doc_id": doc.id,
+                "upstream_status": status,
+            }
+        }
+        raise HTTPException(status_code=502, detail=invalid_detail)
+
+    response_headers = {
+        "Content-Type": "application/pdf",
+        "Content-Disposition": f'inline; filename="{_safe_cd_filename(doc.filename)}"',
+        "Content-Length": str(len(body)),
+        "Accept-Ranges": "none",
+    }
+
+    return Response(
+        content=body,
+        status_code=200,
+        media_type="application/pdf",
+        headers=response_headers,
+    )
 
 
 @router.post(
