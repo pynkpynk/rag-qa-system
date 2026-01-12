@@ -23,7 +23,8 @@ from fastapi import (
     Request,
     UploadFile,
 )
-from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
+import httpx
 from sqlalchemy import text as sql_text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -1030,6 +1031,79 @@ def view_pdf(
 
     url = _s3_presign_get(doc.storage_key, inline=True, filename=doc.filename)
     return RedirectResponse(url, status_code=307)
+
+
+@router.get(
+    "/docs/{document_id}/content",
+    dependencies=[Depends(require_permissions("read:docs"))],
+)
+def proxy_pdf_content(
+    document_id: str,
+    request: Request,
+    run_id: str | None = None,
+    db: Session = Depends(get_db),
+    p: Principal = Depends(current_user),
+):
+    doc = _get_doc_for_read(db, document_id, p)
+    _enforce_run_access_if_needed(db, run_id, doc.id, p)
+
+    if _doc_uses_local_storage(doc):
+        local_path = _resolve_local_path(
+            (doc.meta or {}).get("path") or doc.storage_key
+        )
+        if not local_path.exists():
+            _not_found()
+        safe = _safe_cd_filename(doc.filename)
+        headers = {"Content-Disposition": f'inline; filename="{safe}"'}
+        return FileResponse(local_path, media_type="application/pdf", headers=headers)
+
+    if not _s3_configured():
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": {
+                    "code": "STORAGE_NOT_CONFIGURED",
+                    "message": "Object storage is not configured.",
+                }
+            },
+        )
+
+    if not doc.storage_key:
+        raise HTTPException(status_code=500, detail="storage_key missing")
+
+    url = _s3_presign_get(doc.storage_key, inline=True, filename=doc.filename)
+    headers = {}
+    range_header = request.headers.get("range")
+    if range_header:
+        headers["range"] = range_header
+
+    try:
+        with httpx.stream("GET", url, headers=headers, timeout=30.0) as resp:
+            if resp.status_code not in (200, 206):
+                detail = resp.text
+                raise HTTPException(status_code=resp.status_code, detail=detail)
+            response_headers = {
+                "Content-Type": resp.headers.get("content-type", "application/pdf"),
+                "Content-Disposition": f"inline; filename=\"{_safe_cd_filename(doc.filename)}\"",
+            }
+            if resp.status_code == 206:
+                if "content-range" in resp.headers:
+                    response_headers["Content-Range"] = resp.headers["content-range"]
+                if "accept-ranges" in resp.headers:
+                    response_headers["Accept-Ranges"] = resp.headers["accept-ranges"]
+                if "content-length" in resp.headers:
+                    response_headers["Content-Length"] = resp.headers["content-length"]
+            return StreamingResponse(
+                resp.iter_raw(),
+                status_code=resp.status_code,
+                media_type="application/pdf",
+                headers=response_headers,
+            )
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("pdf_proxy_failed", extra={"doc_id": doc.id})
+        raise HTTPException(status_code=502, detail="Failed to fetch document") from exc
 
 
 @router.post(

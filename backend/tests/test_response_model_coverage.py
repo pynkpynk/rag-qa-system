@@ -7,6 +7,7 @@ from app.main import app
 
 STREAMING_ALLOWLIST = {
     ("GET", "/api/docs/{document_id}/download"),
+    ("GET", "/api/docs/{document_id}/content"),
     ("GET", "/api/docs/{document_id}/view"),
     ("DELETE", "/api/docs/{document_id}"),  # 204 No Content
 }

@@ -56,7 +56,7 @@ export default function CitationPreviewModal({
       try {
         const resp = await apiFetch(
           DEFAULT_API_BASE,
-          `/docs/${target.documentId}/view`,
+          `/docs/${target.documentId}/content`,
           token || undefined,
           devSub || undefined,
         );

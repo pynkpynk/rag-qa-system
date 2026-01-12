@@ -106,6 +106,14 @@ def test_upload_and_view_local_storage(sqlite_docs_storage):
     assert view_resp.headers.get("content-type") == "application/pdf"
     assert view_resp.content.startswith(b"%PDF-")
 
+    content_resp = client.get(
+        f"/api/docs/{doc_id}/content",
+        headers=_dev_headers(),
+    )
+    assert content_resp.status_code == 200
+    assert content_resp.headers.get("content-type") == "application/pdf"
+    assert content_resp.content.startswith(b"%PDF-")
+
 
 def test_upload_marks_failed_when_openai_missing(
     monkeypatch: pytest.MonkeyPatch, sqlite_docs_storage
