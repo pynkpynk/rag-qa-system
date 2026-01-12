@@ -5,6 +5,7 @@ import type { CSSProperties, ReactNode } from "react";
 import { apiFetch } from "../lib/apiClient";
 import { getToken } from "../lib/authToken";
 import { DEFAULT_API_BASE, normalizeApiBase } from "../lib/workspace";
+import CitationPreviewModal from "../components/CitationPreviewModal";
 
 type DocumentListItem = {
   document_id: string;
@@ -60,26 +61,10 @@ const SAMPLE_PROMPTS = [
 ];
 
 type RunRecord = Record<string, unknown>;
-
-function normalizeOrigin(base: string): string {
-  const normalized = normalizeApiBase(base);
-  const origin = normalized.slice(0, -4);
-  return origin || "/";
-}
-
-function buildDocViewUrl(
-  baseUrl: string,
-  documentId?: string | null,
-  page?: number | null,
-): string | null {
-  if (!documentId) return null;
-  const origin = normalizeOrigin(baseUrl);
-  let url = `${origin}/api/docs/${documentId}/view`;
-  if (page && Number.isFinite(page)) {
-    url += `#page=${page}`;
-  }
-  return url;
-}
+type PreviewTarget = {
+  documentId: string;
+  page: number | null;
+};
 
 function resolveRunId(entry: RunRecord | null | undefined): string | null {
   if (!entry || typeof entry !== "object") return null;
@@ -219,6 +204,9 @@ export default function HomeClient({ demoToken }: HomeClientProps = {}) {
   const [runDetails, setRunDetails] = useState<unknown>(null);
   const [runDetailsError, setRunDetailsError] = useState<string | null>(null);
   const [runDetailsLoading, setRunDetailsLoading] = useState(false);
+  const [previewOpen, setPreviewOpen] = useState(false);
+  const [previewTarget, setPreviewTarget] = useState<PreviewTarget | null>(null);
+  const [previewMessage, setPreviewMessage] = useState<string | null>(null);
 
   const refreshDocuments = useCallback(async () => {
     setDocsLoading(true);
@@ -515,6 +503,28 @@ export default function HomeClient({ demoToken }: HomeClientProps = {}) {
     }
   }
 
+  function handlePreviewTrigger() {
+    const docId =
+      selectedCitation?.document_id || matchingSource?.document_id || null;
+    const pageNumber =
+      selectedCitation?.page != null
+        ? selectedCitation.page
+        : matchingSource?.page ?? null;
+    if (!docId) {
+      setPreviewMessage("This citation does not include an evidence file.");
+      setPreviewOpen(false);
+      return;
+    }
+    if (!authToken) {
+      setPreviewMessage("Provide a demo token to preview evidence.");
+      setPreviewOpen(false);
+      return;
+    }
+    setPreviewMessage(null);
+    setPreviewTarget({ documentId: docId, page: pageNumber });
+    setPreviewOpen(true);
+  }
+
   function renderSnippet(text?: string | null): ReactNode {
     if (!text) return "Snippet unavailable";
     const tokens = text.split(/(\[\[POTENTIAL_INJECTION_REDACTED_LINE\]\])/g);
@@ -526,12 +536,6 @@ export default function HomeClient({ demoToken }: HomeClientProps = {}) {
       ),
     );
   }
-
-  const docPreviewUrl = buildDocViewUrl(
-    baseUrl,
-    selectedCitation?.document_id || matchingSource?.document_id,
-    selectedCitation?.page || matchingSource?.page,
-  );
 
   const containerStyle: CSSProperties = {
     display: "flex",
@@ -550,7 +554,8 @@ export default function HomeClient({ demoToken }: HomeClientProps = {}) {
   };
 
   return (
-    <main
+    <>
+      <main
       style={{
         minHeight: "100vh",
         background: "radial-gradient(circle at top,#0f172a,#020617)",
@@ -916,21 +921,27 @@ export default function HomeClient({ demoToken }: HomeClientProps = {}) {
                     Lines {matchingSource.line_start}–{matchingSource.line_end}
                   </p>
                 )}
-                {docPreviewUrl && (
-                  <a
-                    href={docPreviewUrl}
-                    target="_blank"
-                    rel="noreferrer"
+                <div style={{ marginTop: "0.6rem" }}>
+                  <button
+                    type="button"
+                    onClick={() => handlePreviewTrigger()}
                     style={{
-                      display: "inline-block",
-                      marginTop: "0.4rem",
-                      color: "#38bdf8",
-                      fontSize: "0.9rem",
+                      borderRadius: "8px",
+                      padding: "0.45rem 0.9rem",
+                      border: "1px solid #334155",
+                      background: "transparent",
+                      color: "#e2e8f0",
+                      cursor: "pointer",
                     }}
                   >
-                    Open PDF
-                  </a>
-                )}
+                    Preview evidence
+                  </button>
+                  {previewMessage && (
+                    <p style={{ color: "#fbbf24", fontSize: "0.85rem", marginTop: "0.35rem" }}>
+                      {previewMessage}
+                    </p>
+                  )}
+                </div>
               </div>
 
               <div style={{ borderTop: "1px solid #1e293b", paddingTop: "0.75rem" }}>
@@ -1106,5 +1117,13 @@ export default function HomeClient({ demoToken }: HomeClientProps = {}) {
         </section>
       </div>
     </main>
+    <CitationPreviewModal
+      open={previewOpen}
+      onClose={() => setPreviewOpen(false)}
+      target={previewTarget}
+      token={authToken || null}
+      devSub={devSub || undefined}
+    />
+    </>
   );
 }

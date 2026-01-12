@@ -7,10 +7,12 @@
     "build": "next build",
     "postbuild": "node scripts/scan_next_static_secrets.mjs",
     "start": "next start",
-    "lint": "next lint"
+    "lint": "next lint",
+    "postinstall": "node scripts/copy-pdf-worker.cjs"
   },
   "dependencies": {
     "@auth0/nextjs-auth0": "^3.5.0",
+    "pdfjs-dist": "^4.6.82",
     "next": "14.2.35",
     "react": "18.3.1",
     "react-dom": "18.3.1"
