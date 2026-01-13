@@ -82,8 +82,9 @@ fi
 # Env validation (mode-aware)
 # -------------------------------
 AUTH_MODE_EFFECTIVE="${AUTH_MODE:-auth0}"
+AUTH_MODE_LOWER="$(printf '%s' "${AUTH_MODE_EFFECTIVE}" | tr '[:upper:]' '[:lower:]')"
 
-if [[ "${AUTH_MODE_EFFECTIVE}" != "dev" ]]; then
+if [[ "${AUTH_MODE_LOWER}" != "dev" && "${AUTH_MODE_LOWER}" != "demo" ]]; then
     # Auth0 mode requires these to be present (CI doesn't have .env.local)
     REQUIRED_VARS=("AUTH0_DOMAIN" "AUTH0_AUDIENCE" "AUTH0_ISSUER")
     for key in "${REQUIRED_VARS[@]}"; do

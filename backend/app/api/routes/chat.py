@@ -23,6 +23,8 @@ from app.core.config import settings
 from app.core.llm_status import is_openai_offline, is_llm_enabled
 from app.core.output_contract import sanitize_nonfinite_floats
 from app.core.run_access import ensure_run_access
+from app.core.answer_composer import compose_answer
+from app.core.retrieval_noise import filter_noise_candidates
 from app.core.text_utils import strip_control_chars
 from app.db.hybrid_search import HybridHit, HybridMeta, hybrid_search_chunks_rrf
 from app.db.models import Run, Document, Chunk
@@ -133,6 +135,22 @@ SUMMARY_NO_SOURCES_MESSAGE = (
 )
 SUMMARY_DRILLDOWN_BLOCKED_REASON = (
     "Summary run is still provisioning drilldown access for this citation."
+)
+
+SUMMARY_POSITIVE_HINTS = (
+    "abstract",
+    "introduction",
+    "preface",
+    "overview",
+    "executive summary",
+    "summary",
+)
+SUMMARY_NEGATIVE_HINTS = (
+    "acknowledg",
+    "national institute of standards and technology",
+    "this publication is available free of charge",
+    "doi.org",
+    "nist cswp",
 )
 
 _CITATION_FORMAT_HINT_RE = re.compile(r"\[S\?\s*p\.\?\]")
@@ -983,6 +1001,30 @@ def _utcnow() -> datetime:
 
 def _is_summary_question(q: str) -> bool:
     return bool(SUMMARY_Q_RE.search(q or ""))
+
+
+def _score_summary_chunk(row: dict[str, Any]) -> float:
+    text = str(row.get("text") or "")
+    lower = text.lower()
+    score = 0.0
+    for phrase in SUMMARY_POSITIVE_HINTS:
+        if phrase in lower:
+            score += 1.5
+    for phrase in SUMMARY_NEGATIVE_HINTS:
+        if phrase in lower:
+            score -= 1.0
+    if "abstract" in lower and len(text) < 800:
+        score += 0.5
+    return score
+
+
+def _prefer_summary_chunks(rows: list[dict[str, Any]], keep: int) -> list[dict[str, Any]]:
+    if not rows:
+        return []
+    ranked = [(-_score_summary_chunk(row), idx, row) for idx, row in enumerate(rows)]
+    ranked.sort()
+    ordered = [row for _, _, row in ranked]
+    return ordered[:keep]
 
 
 def sanitize_question_for_llm(question: str) -> str:
@@ -2185,26 +2227,6 @@ def validate_citations(
     return True, "ok"
 
 
-def add_page_to_inline_citations(answer: str, citations: list[dict[str, Any]]) -> str:
-    if not answer:
-        return answer
-
-    page_by_sid: dict[str, Any] = {
-        c.get("source_id"): c.get("page")
-        for c in (citations or [])
-        if c.get("source_id")
-    }
-
-    pattern = re.compile(r"\[(S\d+)\](?!\s*p\.)")
-
-    def repl(m: re.Match) -> str:
-        sid = m.group(1)
-        page = page_by_sid.get(sid)
-        return f"[{sid} p.{page}]" if page is not None else f"[{sid}]"
-
-    return pattern.sub(repl, answer)
-
-
 def public_citations(citations: list[dict[str, Any]]) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for c in citations or []:
@@ -2851,12 +2873,14 @@ def ask(
                 qvec = embed_query(q_clean)
                 qvec_lit = to_pgvector_literal(qvec)
 
+                retrieval_keep_k = max(int(payload.k or 1), 1)
+                retrieval_candidate_k = min(max(retrieval_keep_k * 10, 30), 200)
                 rows, retrieval_debug_raw = fetch_chunks(
                     db,
                     qvec_lit=qvec_lit,
                     qvec_list=qvec,
                     q_text=q_clean,
-                    k=payload.k,
+                    k=retrieval_candidate_k,
                     run_id=effective_run_id,
                     document_ids=doc_scope,
                     p=p,
@@ -2864,6 +2888,13 @@ def ask(
                     trgm_available=trgm_available_flag,
                     admin_debug_hybrid=force_admin_hybrid,
                 )
+                clean_rows = filter_noise_candidates(
+                    rows, payload.question or "", retrieval_candidate_k
+                )
+                if summary_request:
+                    rows = _prefer_summary_chunks(clean_rows, retrieval_keep_k)
+                else:
+                    rows = clean_rows[:retrieval_keep_k]
             else:
                 rows = direct_email_result["rows"]
                 retrieval_debug_raw = {"strategy": "selected_docs_email"}
@@ -2885,6 +2916,7 @@ def ask(
         used_min_score = 0.0
         used_max_vec_distance = VEC_MAX_COS_DIST
         llm_called = False
+        llm_answer_used = False
         llm_error: str | None = None
 
         used_fts_flag = bool((retrieval_debug_raw or {}).get("used_fts"))
@@ -3125,6 +3157,7 @@ def ask(
                 answer, used_ids = _offline_answer_from_rows(
                     rows, sources, summary_hint=summary_request, question=payload.question or ""
                 )
+                llm_answer_used = False
             else:
                 try:
                     llm_called = True
@@ -3136,6 +3169,7 @@ def ask(
                         allowed_ids,
                         llm_messages,
                     )
+                    llm_answer_used = True
                 except Exception as exc:
                     llm_error = type(exc).__name__
                     logger.exception(
@@ -3147,6 +3181,7 @@ def ask(
                         summary_hint=summary_request,
                         question=payload.question or "",
                     )
+                    llm_answer_used = False
 
             if run:
                 run.t2 = _utcnow()
@@ -3195,10 +3230,20 @@ def ask(
             joined_lower=joined_lower,
             all_sources=sources,
         )
-        # サーバで [S#] -> [S# p.#]
-        answer = add_page_to_inline_citations(answer, used_sources)
+        row_by_sid = {f"S{idx}": row for idx, row in enumerate(rows, start=1)}
+        answer_source_rows = [
+            row_by_sid[sid] for sid in used_ids if row_by_sid.get(sid) is not None
+        ]
+        if not answer_source_rows:
+            answer_source_rows = rows
 
-        # ★ NEW: 箇条書き正規化（見た目で契約を担保）
+        answer = compose_answer(
+            payload.question or "",
+            answer,
+            answer_source_rows,
+            llm_used=llm_answer_used,
+            is_summary=summary_request,
+        )
         answer = normalize_bullets(answer)
 
         if run:
