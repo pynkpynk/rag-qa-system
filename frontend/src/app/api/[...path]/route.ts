@@ -18,11 +18,10 @@ const REQUEST_HEADER_ALLOWLIST = [
   "if-unmodified-since",
   "cache-control",
   "pragma",
-  // auth / demo headers must pass through
+  // auth / demo / dev headers
   "authorization",
   "x-demo-sub",
   "x-demo-permissions",
-  // keep existing (used in local/dev flows)
   "x-dev-sub",
 ];
 
@@ -30,7 +29,6 @@ const HOP_BY_HOP_HEADERS = new Set([
   "connection",
   "transfer-encoding",
   "content-length",
-  "content-encoding",
   "keep-alive",
   "proxy-authenticate",
   "proxy-authorization",
@@ -52,16 +50,17 @@ function buildUpstreamUrl(path: string[], search: string): string {
 
 function collectRequestHeaders(request: NextRequest): Headers {
   const headers = new Headers();
-
   for (const name of REQUEST_HEADER_ALLOWLIST) {
     const value = request.headers.get(name);
-    if (value) headers.set(name, value);
+    if (value) {
+      headers.set(name, value);
+    }
   }
 
-  // Optional: inject demo token if not provided by caller
+  // Optional: inject demo token if caller didn't provide Authorization.
   const token = process.env.RAGQA_DEMO_TOKEN;
-  const hasAuth = Boolean(headers.get("authorization")?.trim());
-  if (token && !hasAuth) {
+  const auth = headers.get("authorization") || "";
+  if (token && !auth.trim()) {
     headers.set("authorization", `Bearer ${token}`);
   }
 
@@ -106,12 +105,11 @@ async function handleProxy(
           message: (err as Error).message,
         },
       }),
-      { status: 500, headers: { "Content-Type": "application/json" } },
+      { status: 500, headers: { "Content-Type": "application/json; charset=utf-8" } },
     );
   }
 
   const headers = collectRequestHeaders(request);
-
   const init: RequestInit = {
     method: request.method,
     headers,
@@ -134,32 +132,54 @@ async function handleProxy(
           message: (err as Error).message,
         },
       }),
-      { status: 502, headers: { "Content-Type": "application/json" } },
+      { status: 502, headers: { "Content-Type": "application/json; charset=utf-8" } },
     );
   }
 
   const responseHeaders = filterResponseHeaders(upstreamResponse.headers);
-  const upstreamContentType = upstreamResponse.headers.get("content-type");
-  const jsonish = isJsonLike(upstreamContentType);
 
-  // Stop-the-bleed: always fully buffer to avoid “first chunk only” truncation on Vercel.
-  const buf = await upstreamResponse.arrayBuffer();
+  // Debug markers (remove later if you want)
+  responseHeaders.set("x-ragqa-proxy", "1");
 
-  let body: BodyInit | null = null;
-  if (jsonish) {
-    body = decoder.decode(buf);
-    // Ensure JSON content-type if upstream omitted/mangled
-    if (!responseHeaders.has("content-type")) {
-      responseHeaders.set("content-type", "application/json; charset=utf-8");
-    }
-  } else {
-    body = buf;
+  if (request.method.toUpperCase() === "HEAD") {
+    return new Response(null, { status: upstreamResponse.status, headers: responseHeaders });
   }
 
-  return new Response(body, {
-    status: upstreamResponse.status,
-    headers: responseHeaders,
-  });
+  // Stop-the-bleed: always fully buffer so Vercel/edge streaming quirks can't truncate mid-field.
+  const buf = await upstreamResponse.arrayBuffer();
+  responseHeaders.set("x-ragqa-proxy-upstream-bytes", String(buf.byteLength));
+
+  const contentType = upstreamResponse.headers.get("content-type");
+  const jsonish = isJsonLike(contentType);
+
+  if (jsonish) {
+    const textBody = decoder.decode(buf);
+
+    // If upstream returns broken JSON, never pass broken JSON to clients.
+    try {
+      JSON.parse(textBody);
+    } catch {
+      return new Response(
+        JSON.stringify({
+          error: {
+            code: "UPSTREAM_INVALID_JSON",
+            message: "Upstream returned invalid JSON (possibly truncated).",
+            upstream_status: upstreamResponse.status,
+            upstream_bytes: buf.byteLength,
+          },
+        }),
+        { status: 502, headers: { "Content-Type": "application/json; charset=utf-8" } },
+      );
+    }
+
+    if (!responseHeaders.get("content-type")?.toLowerCase().includes("json")) {
+      responseHeaders.set("content-type", "application/json; charset=utf-8");
+    }
+
+    return new Response(textBody, { status: upstreamResponse.status, headers: responseHeaders });
+  }
+
+  return new Response(buf, { status: upstreamResponse.status, headers: responseHeaders });
 }
 
 export function GET(request: NextRequest, context: HandlerContext) {

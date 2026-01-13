@@ -2,6 +2,7 @@ import json
 
 from app.api.routes import chat as chat_module
 from app.api.routes.chat import (
+    _apply_cannot_answer_override,
     _maybe_localize_summary_answer,
     build_answer_units_for_response,
     determine_answerability,
@@ -168,6 +169,64 @@ def test_summary_rewrite_skipped_in_offline_mode(monkeypatch):
     assert len(units) == 1
     assert units[0].text == unit.text
     assert units[0].citations and units[0].citations[0].source_id == "S1"
+
+
+def test_unknown_answer_forces_answerability_false_en():
+    evidence = _sample_evidence()
+    answer = "- I don't know based on the provided sources."
+    units = build_answer_units_for_response(answer, evidence)
+    answerability = determine_answerability("question", evidence, units)
+    assert answerability.answerable is True
+    updated = _apply_cannot_answer_override(
+        "I don't know based on the provided sources.", answerability
+    )
+    assert updated.answerable is False
+    assert updated.reason_code == "INSUFFICIENT_EVIDENCE"
+
+
+def test_unknown_answer_forces_answerability_false_ja():
+    evidence = _sample_evidence()
+    answer = "- 提供された資料からは判断できません。"
+    units = build_answer_units_for_response(answer, evidence)
+    answerability = determine_answerability("question", evidence, units)
+    assert answerability.answerable is True
+    updated = _apply_cannot_answer_override(
+        "提供された資料からは判断できません。", answerability
+    )
+    assert updated.answerable is False
+    assert updated.reason_code == "INSUFFICIENT_EVIDENCE"
+
+
+def test_unknown_answer_forces_answerability_false_en_variant():
+    evidence = _sample_evidence()
+    units = build_answer_units_for_response("- Valid [S1]", evidence)
+    answerability = determine_answerability("question", evidence, units)
+    updated = _apply_cannot_answer_override(
+        "I can't answer based on the provided materials.", answerability
+    )
+    assert updated.answerable is False
+    assert updated.reason_code == "INSUFFICIENT_EVIDENCE"
+
+
+def test_unknown_answer_forces_answerability_false_ja_variant():
+    evidence = _sample_evidence()
+    units = build_answer_units_for_response("- Valid [S1]", evidence)
+    answerability = determine_answerability("question", evidence, units)
+    updated = _apply_cannot_answer_override(
+        "提供された参照資料には具体的な手順が含まれていないため、要約できません。", answerability
+    )
+    assert updated.answerable is False
+    assert updated.reason_code == "INSUFFICIENT_EVIDENCE"
+
+
+def test_missing_info_without_cannot_signal_does_not_flip():
+    evidence = _sample_evidence()
+    units = build_answer_units_for_response("- Valid [S1]", evidence)
+    answerability = determine_answerability("question", evidence, units)
+    updated = _apply_cannot_answer_override(
+        "資料には記述が含まれていませんが、他の情報を確認してください。", answerability
+    )
+    assert updated.answerable is True
 
 
 def test_localized_units_preserve_citations(monkeypatch):

@@ -527,6 +527,69 @@ def determine_answerability(
     )
 
 
+_CANONICAL_NO_ANSWER = (
+    "i don't know based on the provided sources",
+    "i do not know based on the provided sources",
+)
+_CANNOT_DO_SIGNALS = (
+    "i don't know",
+    "i do not know",
+    "cannot answer",
+    "can't answer",
+    "unable to",
+    "cannot determine",
+    "cannot summarize",
+    "unable to summarize",
+    "わかりません",
+    "判断できません",
+    "要約できません",
+    "回答できません",
+)
+_MISSING_IN_SOURCES_SIGNALS = (
+    "provided sources",
+    "provided materials",
+    "provided references",
+    "based on the provided",
+    "not included",
+    "not mentioned",
+    "情報が含まれていない",
+    "記述が含まれていない",
+    "提供された",
+    "参照資料",
+    "資料には含まれていない",
+)
+
+
+def _is_cannot_answer_message(answer: str) -> bool:
+    text = (answer or "").strip()
+    if not text:
+        return False
+    lower = re.sub(r"\s+", " ", text.lower())
+    if any(pat in lower for pat in _CANONICAL_NO_ANSWER):
+        return True
+
+    def _contains_signal(signal: str) -> bool:
+        if re.search(r"[A-Za-z]", signal):
+            return signal in lower
+        return signal in text
+
+    has_cannot = any(_contains_signal(sig) for sig in _CANNOT_DO_SIGNALS)
+    has_missing = any(_contains_signal(sig) for sig in _MISSING_IN_SOURCES_SIGNALS)
+    return has_cannot and has_missing
+
+
+def _apply_cannot_answer_override(
+    answer: str, answerability: Answerability
+) -> Answerability:
+    if answerability.answerable and _is_cannot_answer_message(answer):
+        return Answerability(
+            answerable=False,
+            reason_code="INSUFFICIENT_EVIDENCE",
+            reason_message="Answer text indicated the evidence was insufficient.",
+        )
+    return answerability
+
+
 # ============================================================
 # Optional: Hybrid retrieval knobs
 # ============================================================
@@ -3577,6 +3640,7 @@ def ask(
         answerability = determine_answerability(
             payload.question or "", source_evidence, answer_units
         )
+        answerability = _apply_cannot_answer_override(answer, answerability)
         citation_sources = used_sources
         preserve_answer_text = answer.strip().startswith("[NO_SOURCES]")
         if not answerability.answerable and not preserve_answer_text:
