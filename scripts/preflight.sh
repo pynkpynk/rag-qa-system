@@ -13,6 +13,12 @@ export APP_ENV="dev"
 export AUTH_MODE="dev"
 export DEV_SUB="test-user"
 export CORS_ORIGIN="http://localhost:5173"
+unset AUTH_DISABLED || true
+unset APP_ENV || true
+unset AUTH_MODE || true
+unset DEMO_TOKEN_PLAINTEXT || true
+unset DEMO_TOKEN_SHA256_LIST || true
+unset OPENAI_OFFLINE || true
 if [[ -z "${DATABASE_URL:-}" ]]; then
   export DATABASE_URL="postgresql+psycopg://postgres:postgres@127.0.0.1:5432/ragqa_test"
 else
