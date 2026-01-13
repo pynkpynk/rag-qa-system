@@ -172,6 +172,7 @@ _SUMMARY_HEADER_HINTS = (
     "まとめ:",
 )
 _BULLET_PREFIXES = ("- ", "* ", "• ", "・")
+_SPACE_RE = re.compile(r"\s+")
 
 # ============================================================
 # Safety/quality gates
@@ -289,6 +290,34 @@ def _split_answer_units_for_attribution(text: str) -> list[str]:
     return sentences or [text_for_sentences.strip()]
 
 
+def _normalize_for_match(text: str | None) -> str:
+    if not text:
+        return ""
+    return _SPACE_RE.sub(" ", text).strip().lower()
+
+
+def _match_source_by_text(
+    unit_text: str, normalized_sources: dict[str, str]
+) -> str | None:
+    target = _normalize_for_match(unit_text)
+    if not target:
+        return None
+    best_sid: str | None = None
+    best_score = 0.0
+    for sid, source_text in normalized_sources.items():
+        if not source_text:
+            continue
+        if target and target in source_text:
+            return sid
+        score = SequenceMatcher(None, target, source_text).ratio()
+        if score > best_score:
+            best_score = score
+            best_sid = sid
+    if best_score >= 0.35:
+        return best_sid
+    return None
+
+
 def build_answer_units_for_response(
     answer_text: str, source_evidence: list[dict[str, Any]]
 ) -> list[AnswerUnit]:
@@ -296,7 +325,13 @@ def build_answer_units_for_response(
     if not units_text:
         return []
     evidence_map = {
-        str(item.get("source_id")): item for item in source_evidence if item.get("source_id")
+        str(item.get("source_id")): item
+        for item in source_evidence
+        if item.get("source_id")
+    }
+    normalized_sources = {
+        sid: _normalize_for_match(data.get("text"))
+        for sid, data in evidence_map.items()
     }
     units: list[AnswerUnit] = []
     prior_sids: list[str] = []
@@ -327,6 +362,10 @@ def build_answer_units_for_response(
 
     for raw in units_text:
         extracted = [f"S{match}" for match in SOURCE_ID_RE.findall(raw)]
+        if not extracted:
+            matched = _match_source_by_text(raw, normalized_sources)
+            if matched:
+                extracted = [matched]
         if not extracted and prior_sids:
             extracted = list(prior_sids)
         if not extracted and fallback_sid:
