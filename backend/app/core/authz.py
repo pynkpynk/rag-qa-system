@@ -122,7 +122,7 @@ def _auth_disabled() -> bool:
 
 
 def _auth_mode() -> str:
-    # "auth0" (default) or "dev" or "demo"
+    # "auth0" (default) or "dev" or "demo" or "disabled"
     return (_env("AUTH_MODE", "auth0") or "auth0").lower()
 
 
@@ -130,13 +130,13 @@ def _effective_mode() -> str:
     """
     Priority:
       1) AUTH_DISABLED=1 -> "disabled"
-      2) AUTH_MODE in {"dev","demo"} -> same
+      2) AUTH_MODE in {"disabled","dev","demo"} -> same
       3) otherwise       -> "auth0"
     """
     if _auth_disabled():
         return "disabled"
     m = _auth_mode()
-    if m in {"dev", "demo"}:
+    if m in {"disabled", "dev", "demo"}:
         return m
     return "auth0"
 
@@ -292,7 +292,7 @@ def _maybe_guard_prod_mode() -> None:
         raise HTTPException(
             status_code=403,
             detail=_auth_bypass_forbidden_detail(
-                "Auth bypass (AUTH_MODE=dev or AUTH_DISABLED=1) is not allowed in production."
+                "Auth bypass (AUTH_MODE=dev/disabled or AUTH_DISABLED=1) is not allowed in production."
             ),
         )
 
