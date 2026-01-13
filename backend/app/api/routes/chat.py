@@ -23,7 +23,7 @@ from app.core.config import settings
 from app.core.llm_status import is_openai_offline, is_llm_enabled
 from app.core.output_contract import sanitize_nonfinite_floats
 from app.core.run_access import ensure_run_access
-from app.core.answer_composer import compose_answer
+from app.core.answer_composer import compose_answer, detect_language
 from app.core.retrieval_noise import filter_noise_candidates
 from app.core.text_utils import strip_control_chars
 from app.db.hybrid_search import HybridHit, HybridMeta, hybrid_search_chunks_rrf
@@ -375,6 +375,125 @@ def build_answer_units_for_response(
             prior_sids = [ref.source_id for ref in refs]
         units.append(AnswerUnit(text=raw, citations=refs))
     return units
+
+
+def inline_annotation_from_refs(
+    refs: list[AnswerUnitEvidenceRef] | None,
+) -> str:
+    if not refs:
+        return ""
+    for ref in refs:
+        if not ref:
+            continue
+        page = ref.page
+        if not isinstance(page, int) or page <= 0:
+            continue
+        start = ref.line_start if isinstance(ref.line_start, int) else 0
+        end = ref.line_end if isinstance(ref.line_end, int) else 0
+        if start > 0 and end >= start:
+            return f"(p{page} L{start}-{end})"
+        return f"(p{page})"
+    return ""
+
+
+def _maybe_localize_summary_answer(
+    question: str,
+    answer_text: str,
+    answer_units: list[AnswerUnit],
+    source_evidence: list[dict[str, Any]],
+    *,
+    summary_request: bool,
+    llm_enabled: bool,
+    offline_mode: bool,
+    model: str,
+    gen: dict[str, Any],
+) -> tuple[str, list[AnswerUnit]]:
+    if (
+        not summary_request
+        or offline_mode
+        or not llm_enabled
+        or not answer_units
+        or not source_evidence
+        or not (answer_text or "").strip()
+        or is_openai_offline()
+    ):
+        return answer_text, answer_units
+    lang = detect_language(question or "")
+    if not lang or lang == "en":
+        return answer_text, answer_units
+    if answer_text.strip().startswith("[NO_SOURCES]"):
+        return answer_text, answer_units
+
+    expected = len(answer_units)
+    target_label = "Japanese" if lang == "ja" else f"the detected language ({lang})"
+    lines: list[str] = []
+    for idx, unit in enumerate(answer_units, start=1):
+        citations = [
+            ref.source_id for ref in unit.citations or [] if ref and ref.source_id
+        ]
+        cite_text = " ".join(citations)
+        annotation = inline_annotation_from_refs(unit.citations or [])
+        unit_line = unit.text
+        if annotation:
+            unit_line = f"{unit_line} {annotation}"
+        lines.append(
+            f"{idx}. TEXT: {unit_line}\n"
+            f"CITATIONS: {cite_text if cite_text else '[NONE]'}"
+        )
+    prompt = (
+        f"Rewrite the bullet points into {target_label} without adding new facts.\n"
+        "Preserve bullet order/count, keep inline annotation text (inside parentheses) unchanged, "
+        "and keep the [S#] citations exactly as given.\n"
+        f"Return ONLY a JSON array of {expected} strings (UTF-8), where element i corresponds to entry i.\n"
+        + "\n\n".join(lines)
+    )
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You rewrite governance summaries into the requester's language for business readers. "
+                "Keep meaning identical, retain inline annotations, never introduce new claims, and respond strictly as JSON."
+            ),
+        },
+        {"role": "user", "content": prompt},
+    ]
+    try:
+        rewritten = call_llm(model, gen, messages)
+        localized = json.loads(rewritten)
+    except Exception as exc:
+        logger.warning("localize_summary_failed: %s", exc)
+        return answer_text, answer_units
+
+    if (
+        not isinstance(localized, list)
+        or len(localized) != expected
+        or not all(isinstance(item, str) and item.strip() for item in localized)
+    ):
+        return answer_text, answer_units
+
+    new_units: list[AnswerUnit] = []
+    # Citations are derived pre-localization; rewriting text must not remap them.
+    bullet_lines: list[str] = []
+    for localized_text, unit in zip(localized, answer_units):
+        cleaned = localized_text.strip()
+        new_units.append(
+            AnswerUnit(
+                text=cleaned,
+                citations=unit.citations or [],
+            )
+        )
+        if cleaned.startswith(_BULLET_PREFIXES):
+            bullet_lines.append(cleaned)
+        else:
+            bullet_lines.append(f"- {cleaned}")
+
+    header = "要点:" if lang == "ja" else None
+    if header:
+        new_answer = f"{header}\n" + "\n".join(bullet_lines)
+    else:
+        new_answer = "\n".join(bullet_lines)
+    # Citations must remain as originally matched; only text is localized.
+    return new_answer or answer_text, new_units
 
 
 def determine_answerability(
@@ -3443,6 +3562,18 @@ def ask(
 
         source_evidence = build_source_evidence(rows, used_sources)
         answer_units = build_answer_units_for_response(answer, source_evidence)
+        rewrite_model, rewrite_gen = get_model_and_gen_from_run(run)
+        answer, answer_units = _maybe_localize_summary_answer(
+            payload.question or "",
+            answer,
+            answer_units,
+            source_evidence,
+            summary_request=summary_request,
+            llm_enabled=llm_enabled,
+            offline_mode=offline_mode,
+            model=rewrite_model,
+            gen=rewrite_gen,
+        )
         answerability = determine_answerability(
             payload.question or "", source_evidence, answer_units
         )

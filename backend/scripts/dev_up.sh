@@ -9,6 +9,26 @@ PID_FILE="${BACKEND_DIR}/.devserver.pid"
 LOG_FILE="${BACKEND_DIR}/.devserver.log"
 DOTENV_HELPER="${SCRIPT_DIR}/_dotenv.sh"
 
+preserve_keys=(
+    AUTH_MODE
+    APP_ENV
+    OPENAI_OFFLINE
+    LLM_ENABLED
+    ADMIN_DEBUG_STRATEGY
+    ENABLE_RETRIEVAL_DEBUG
+    RETRIEVAL_DEBUG_REQUIRE_TOKEN_HASH
+    MAX_REQUEST_BYTES
+    RATE_LIMIT_ENABLED
+    CORS_ORIGIN
+)
+preserved_vars=()
+for key in "${preserve_keys[@]}"; do
+    if [[ -n "${!key+x}" ]]; then
+        preserved_vars+=("${key}")
+        printf -v "PRESERVED_VALUE_${key}" '%s' "${!key}"
+    fi
+done
+
 if [[ -f "${DOTENV_HELPER}" ]]; then
     # shellcheck disable=SC1090
     source "${DOTENV_HELPER}"
@@ -17,6 +37,20 @@ fi
 if [[ -f "${ENV_FILE}" ]]; then
     dotenv_load_preserve_existing "${ENV_FILE}"
 fi
+
+for key in "${preserved_vars[@]}"; do
+    value_var="PRESERVED_VALUE_${key}"
+    export "${key}=${!value_var}"
+done
+
+truthy() {
+    local raw
+    raw="$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')"
+    case "${raw}" in
+        1|true|yes|y|on) return 0 ;;
+    esac
+    return 1
+}
 
 # ---- Required env for Settings (smoke defaults) ----
 # NOTE:
@@ -81,11 +115,19 @@ fi
 # -------------------------------
 # Env validation (mode-aware)
 # -------------------------------
-AUTH_MODE_EFFECTIVE="${AUTH_MODE:-auth0}"
-AUTH_MODE_LOWER="$(printf '%s' "${AUTH_MODE_EFFECTIVE}" | tr '[:upper:]' '[:lower:]')"
+RAW_AUTH_MODE="${AUTH_MODE:-auth0}"
+AUTH_MODE_LOWER="$(printf '%s' "${RAW_AUTH_MODE}" | tr '[:upper:]' '[:lower:]')"
+if truthy "${AUTH_DISABLED:-0}"; then
+    AUTH_MODE_EFFECTIVE="disabled"
+elif [[ "${AUTH_MODE_LOWER}" == "disabled" ]]; then
+    AUTH_MODE_EFFECTIVE="disabled"
+elif [[ "${AUTH_MODE_LOWER}" == "dev" || "${AUTH_MODE_LOWER}" == "demo" ]]; then
+    AUTH_MODE_EFFECTIVE="${AUTH_MODE_LOWER}"
+else
+    AUTH_MODE_EFFECTIVE="auth0"
+fi
 
-if [[ "${AUTH_MODE_LOWER}" != "dev" && "${AUTH_MODE_LOWER}" != "demo" ]]; then
-    # Auth0 mode requires these to be present (CI doesn't have .env.local)
+if [[ "${AUTH_MODE_EFFECTIVE}" == "auth0" ]]; then
     REQUIRED_VARS=("AUTH0_DOMAIN" "AUTH0_AUDIENCE" "AUTH0_ISSUER")
     for key in "${REQUIRED_VARS[@]}"; do
         if [[ -z "${!key:-}" ]]; then

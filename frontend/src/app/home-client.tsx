@@ -541,10 +541,86 @@ export default function HomeClient() {
     return `${sid}${page}${lines}`;
   }
 
+  function formatAnnotationChip(
+    ref: AnswerUnitEvidenceRef | null | undefined,
+  ): string | null {
+    if (!ref) return null;
+    const page = ref.page;
+    if (typeof page !== "number" || page <= 0) return null;
+    const start = ref.line_start;
+    const end = ref.line_end;
+    if (
+      typeof start === "number" &&
+      typeof end === "number" &&
+      start > 0 &&
+      end >= start
+    ) {
+      return `p${page} L${start}–${end}`;
+    }
+    return `p${page}`;
+  }
+
   function handleAnswerUnitPreview(ref: AnswerUnitEvidenceRef, label?: string) {
     const docId = ref.document_id || null;
     const page = ref.page ?? null;
     triggerPreview(docId, page, label || ref.source_id || "Evidence preview");
+  }
+
+  function renderAssistantContent(msg: ChatMessage): ReactNode {
+    const units = msg.answerUnits || [];
+    if (units.length === 0) {
+      return msg.content;
+    }
+    return (
+      <ul
+        style={{
+          listStyle: "disc",
+          paddingLeft: "1.25rem",
+          margin: 0,
+          display: "flex",
+          flexDirection: "column",
+          gap: "0.45rem",
+        }}
+      >
+        {units.map((unit, idx) => {
+          const primaryRef = unit.citations?.[0] || null;
+          const chipLabel = formatAnnotationChip(primaryRef);
+          return (
+            <li key={`${msg.id}-unit-${idx}`}>
+              <div
+                style={{
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: "0.3rem",
+                }}
+              >
+                <span style={{ color: "#e2e8f0" }}>{unit.text}</span>
+                {chipLabel && primaryRef && (
+                  <button
+                    type="button"
+                    onClick={() =>
+                      handleAnswerUnitPreview(primaryRef, unit.text)
+                    }
+                    style={{
+                      borderRadius: "999px",
+                      border: "1px solid #334155",
+                      background: "rgba(56,189,248,0.15)",
+                      color: "#38bdf8",
+                      fontSize: "0.75rem",
+                      padding: "0.1rem 0.5rem",
+                      alignSelf: "flex-start",
+                      cursor: "pointer",
+                    }}
+                  >
+                    {chipLabel}
+                  </button>
+                )}
+              </div>
+            </li>
+          );
+        })}
+      </ul>
+    );
   }
 
   function renderSnippet(text?: string | null): ReactNode {
@@ -800,7 +876,9 @@ export default function HomeClient() {
                         whiteSpace: "pre-wrap",
                       }}
                     >
-                      {msg.content}
+                      {msg.role === "assistant"
+                        ? renderAssistantContent(msg)
+                        : msg.content}
                     </div>
                   </div>
                 ))}
@@ -993,6 +1071,10 @@ export default function HomeClient() {
               {answerUnits.length > 0 && (
                 <div>
                   <h3 style={{ fontSize: "1rem", marginBottom: "0.25rem" }}>Answer units</h3>
+                  <p style={{ color: "#94a3b8", fontSize: "0.8rem", marginTop: 0 }}>
+                    Bullets are rendered inline in the conversation. Use the chips below to preview
+                    the supporting evidence for each unit.
+                  </p>
                   <div style={{ display: "flex", flexDirection: "column", gap: "0.5rem" }}>
                     {answerUnits.map((unit, idx) => (
                       <div
@@ -1004,7 +1086,9 @@ export default function HomeClient() {
                           background: "rgba(15,23,42,0.6)",
                         }}
                       >
-                        <p style={{ margin: 0, color: "#e2e8f0" }}>{unit.text}</p>
+                        <p style={{ margin: 0, color: "#cbd5f5", fontSize: "0.85rem" }}>
+                          Unit {idx + 1}
+                        </p>
                         <div
                           style={{
                             marginTop: "0.35rem",

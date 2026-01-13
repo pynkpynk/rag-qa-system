@@ -1,7 +1,13 @@
+import json
+
+from app.api.routes import chat as chat_module
 from app.api.routes.chat import (
+    _maybe_localize_summary_answer,
     build_answer_units_for_response,
     determine_answerability,
+    inline_annotation_from_refs,
 )
+from app.schemas.api_contract import AnswerUnit, AnswerUnitEvidenceRef
 
 
 def _sample_evidence():
@@ -99,3 +105,136 @@ def test_units_match_best_source_text():
     assert units[0].citations and units[0].citations[0].source_id == "S4"
     assert units[1].citations and units[1].citations[0].source_id == "S5"
     assert units[2].citations and units[2].citations[0].source_id == "S3"
+
+
+def test_inline_annotation_helper_formats_page_and_lines():
+    refs = [
+        AnswerUnitEvidenceRef(
+            source_id="S9",
+            page=7,
+            line_start=10,
+            line_end=18,
+            filename="delta.pdf",
+            document_id="doc-9",
+        )
+    ]
+    assert inline_annotation_from_refs(refs) == "(p7 L10-18)"
+
+    refs_short = [
+        AnswerUnitEvidenceRef(
+            source_id="S10",
+            page=3,
+            filename="epsilon.pdf",
+            document_id="doc-10",
+        )
+    ]
+    assert inline_annotation_from_refs(refs_short) == "(p3)"
+
+
+def test_summary_rewrite_skipped_in_offline_mode(monkeypatch):
+    tracker = {"called": False}
+
+    def _fake_call_llm(*args, **kwargs):
+        tracker["called"] = True
+        raise AssertionError("call_llm should not execute in offline mode")
+
+    monkeypatch.setattr(chat_module, "call_llm", _fake_call_llm)
+    unit = AnswerUnit(
+        text="- 要約 [S1]",
+        citations=[
+            AnswerUnitEvidenceRef(
+                source_id="S1",
+                page=1,
+                line_start=2,
+                line_end=6,
+                filename="alpha.pdf",
+                document_id="doc-1",
+            )
+        ],
+    )
+    answer, units = _maybe_localize_summary_answer(
+        question="要約して",
+        answer_text=unit.text,
+        answer_units=[unit],
+        source_evidence=_sample_evidence(),
+        summary_request=True,
+        llm_enabled=False,
+        offline_mode=True,
+        model="gpt-5-mini",
+        gen={},
+    )
+    assert tracker["called"] is False
+    assert answer == unit.text
+    assert len(units) == 1
+    assert units[0].text == unit.text
+    assert units[0].citations and units[0].citations[0].source_id == "S1"
+
+
+def test_localized_units_preserve_citations(monkeypatch):
+    evidence = [
+        {
+            "source_id": "S1",
+            "page": 2,
+            "line_start": 1,
+            "line_end": 9,
+            "filename": "alpha.pdf",
+            "document_id": "doc-1",
+            "chunk_id": "chunk-1",
+            "text": "Alpha section covers governance basics.",
+        },
+        {
+            "source_id": "S2",
+            "page": 5,
+            "line_start": 12,
+            "line_end": 22,
+            "filename": "beta.pdf",
+            "document_id": "doc-2",
+            "chunk_id": "chunk-2",
+            "text": "Beta section covers controls cadence.",
+        },
+        {
+            "source_id": "S3",
+            "page": 7,
+            "line_start": 3,
+            "line_end": 15,
+            "filename": "gamma.pdf",
+            "document_id": "doc-3",
+            "chunk_id": "chunk-3",
+            "text": "Gamma section covers escalation.",
+        },
+    ]
+    answer = "- Governance basics [S1]\n- Controls cadence [S2]\n- Escalation steps [S3]"
+    units = build_answer_units_for_response(answer, evidence)
+    localized_lines = [
+        "- ガバナンスの基本 [S1]",
+        "- 管理サイクル [S2]",
+        "- エスカレーション手順 [S3]",
+    ]
+
+    monkeypatch.setattr(
+        chat_module,
+        "call_llm",
+        lambda *args, **kwargs: json.dumps(localized_lines),
+    )
+    monkeypatch.setattr(chat_module, "is_openai_offline", lambda: False)
+
+    new_answer, new_units = _maybe_localize_summary_answer(
+        question="要約して",
+        answer_text=answer,
+        answer_units=units,
+        source_evidence=evidence,
+        summary_request=True,
+        llm_enabled=True,
+        offline_mode=False,
+        model="gpt-5-mini",
+        gen={},
+    )
+
+    assert len(new_units) == len(units)
+    for original, updated in zip(units, new_units):
+        assert updated.text != original.text
+        assert updated.citations == original.citations
+        assert updated.citations[0].page == original.citations[0].page
+
+    assert "要点" in new_answer
+    assert "ガバナンス" in new_answer
