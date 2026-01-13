@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import Any, Literal, Optional, List
+from typing import Any, ClassVar, List, Literal, Optional, TypeAlias
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -114,6 +114,44 @@ class SourceEvidence(BaseModel):
     text: str
 
 
+class AnswerUnitEvidenceRef(BaseModel):
+    source_id: str | None = None
+    page: int | None = None
+    line_start: int | None = None
+    line_end: int | None = None
+    filename: str | None = None
+    document_id: str | None = None
+    chunk_id: str | None = None
+
+
+class AnswerUnit(BaseModel):
+    text: str
+    citations: list[AnswerUnitEvidenceRef] = Field(default_factory=list)
+
+
+AnswerabilityReason: TypeAlias = Literal[
+    "INSUFFICIENT_EVIDENCE",
+    "QUESTION_AMBIGUOUS",
+    "NO_SOURCES",
+    "CONTRADICTION",
+    "OTHER",
+]
+
+
+class Answerability(BaseModel):
+    reason_choices: ClassVar[tuple[str, ...]] = (
+        "INSUFFICIENT_EVIDENCE",
+        "QUESTION_AMBIGUOUS",
+        "NO_SOURCES",
+        "CONTRADICTION",
+        "OTHER",
+    )
+    answerable: bool
+    reason_code: AnswerabilityReason
+    reason_message: str
+    suggested_followups: list[str] = Field(default_factory=list)
+
+
 class ChatResponse(BaseModel):
     answer: str
     citations: list[ChatCitation]
@@ -125,7 +163,8 @@ class ChatResponse(BaseModel):
 
 
 class ChatAskResponse(ChatResponse):
-    pass
+    answerability: Answerability | None = None
+    answer_units: list[AnswerUnit] | None = None
 
 
 class SearchMode(str, Enum):
