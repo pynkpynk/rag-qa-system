@@ -52,3 +52,50 @@ def test_units_inherit_previous_citation_when_missing():
     assert units[1].citations and units[1].citations[0].source_id == "S1"
     answerability = determine_answerability("question", _sample_evidence(), units)
     assert answerability.answerable is True
+
+
+def test_units_match_best_source_text():
+    evidence = [
+        {
+            "source_id": "S3",
+            "page": 7,
+            "line_start": 30,
+            "line_end": 45,
+            "filename": "gamma.pdf",
+            "document_id": "doc-3",
+            "chunk_id": "chunk-3",
+            "text": "Gamma finding mentions escalation runbooks and approvals.",
+        },
+        {
+            "source_id": "S4",
+            "page": 2,
+            "line_start": 5,
+            "line_end": 15,
+            "filename": "delta.pdf",
+            "document_id": "doc-4",
+            "chunk_id": "chunk-4",
+            "text": "Delta overview: governance structure prioritizes transparency.",
+        },
+        {
+            "source_id": "S5",
+            "page": 5,
+            "line_start": 20,
+            "line_end": 32,
+            "filename": "epsilon.pdf",
+            "document_id": "doc-5",
+            "chunk_id": "chunk-5",
+            "text": "Epsilon section highlights control testing cadence and reviewers.",
+        },
+    ]
+    answer = "\n".join(
+        [
+            "- Governance structure prioritizes transparency.",
+            "- Control testing cadence and reviewers are defined.",
+            "- Escalation runbooks require approvals.",
+        ]
+    )
+    units = build_answer_units_for_response(answer, evidence)
+    assert len(units) == 3
+    assert units[0].citations and units[0].citations[0].source_id == "S4"
+    assert units[1].citations and units[1].citations[0].source_id == "S5"
+    assert units[2].citations and units[2].citations[0].source_id == "S3"
