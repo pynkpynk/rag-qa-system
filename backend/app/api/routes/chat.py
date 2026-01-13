@@ -29,7 +29,12 @@ from app.core.text_utils import strip_control_chars
 from app.db.hybrid_search import HybridHit, HybridMeta, hybrid_search_chunks_rrf
 from app.db.models import Run, Document, Chunk
 from app.db.session import get_db
-from app.schemas.api_contract import ChatAskResponse
+from app.schemas.api_contract import (
+    Answerability,
+    AnswerUnit,
+    AnswerUnitEvidenceRef,
+    ChatAskResponse,
+)
 from app.services.prompt_builder import build_chat_messages
 
 router = APIRouter()
@@ -156,6 +161,18 @@ SUMMARY_NEGATIVE_HINTS = (
 _CITATION_FORMAT_HINT_RE = re.compile(r"\[S\?\s*p\.\?\]")
 _FORMAT_SENTENCE_RE = re.compile(r"形式は[「\"']?\[S\?\s*p\.\?\][」\"']?とする。?")
 
+_JA_CHAR_RE = re.compile(r"[ぁ-んァ-ン一-龯]")
+_SUMMARY_HEADER_HINTS = (
+    "summary:",
+    "summary：",
+    "要点:",
+    "要約:",
+    "要旨:",
+    "概要:",
+    "まとめ:",
+)
+_BULLET_PREFIXES = ("- ", "* ", "• ", "・")
+
 # ============================================================
 # Safety/quality gates
 # ============================================================
@@ -225,6 +242,131 @@ def normalize_bullets(text: str) -> str:
         # " - " を "\n- " に。日本語でも起きるのでシンプルに置換。
         t = t.replace(" - ", "\n- ")
     return t
+
+
+def _is_japanese_text(text: str) -> bool:
+    return bool(_JA_CHAR_RE.search(text or ""))
+
+
+def _unknown_answer_text(question: str) -> str:
+    return (
+        "不明"
+        if _is_japanese_text(question)
+        else "I don't know based on the provided sources."
+    )
+
+
+def _split_answer_units_for_attribution(text: str) -> list[str]:
+    t = (text or "").strip()
+    if not t:
+        return []
+    lines = [ln.strip() for ln in t.splitlines() if ln.strip()]
+    bullet_units: list[str] = []
+    fallback_lines: list[str] = []
+    for ln in lines:
+        lower = ln.lower()
+        if any(lower.startswith(h) for h in _SUMMARY_HEADER_HINTS):
+            continue
+        stripped = ln.strip()
+        prefix_removed = stripped
+        for prefix in _BULLET_PREFIXES:
+            if stripped.startswith(prefix):
+                prefix_removed = stripped[len(prefix) :].strip()
+                break
+        if prefix_removed != stripped:
+            if prefix_removed:
+                bullet_units.append(prefix_removed)
+            continue
+        fallback_lines.append(stripped)
+    if bullet_units:
+        return bullet_units
+    text_for_sentences = " ".join(fallback_lines) if fallback_lines else t
+    sentences = [
+        s.strip()
+        for s in re.split(r"(?<=[.!?。！？])\s+", text_for_sentences)
+        if s.strip()
+    ]
+    return sentences or [text_for_sentences.strip()]
+
+
+def build_answer_units_for_response(
+    answer_text: str, source_evidence: list[dict[str, Any]]
+) -> list[AnswerUnit]:
+    units_text = _split_answer_units_for_attribution(answer_text)
+    if not units_text:
+        return []
+    evidence_map = {
+        str(item.get("source_id")): item for item in source_evidence if item.get("source_id")
+    }
+    units: list[AnswerUnit] = []
+    prior_sids: list[str] = []
+    fallback_sid = next(iter(evidence_map.keys()), None)
+
+    def _refs_from_sids(ids: list[str]) -> list[AnswerUnitEvidenceRef]:
+        refs_local: list[AnswerUnitEvidenceRef] = []
+        seen_local: set[str] = set()
+        for sid in ids:
+            if not sid or sid in seen_local:
+                continue
+            seen_local.add(sid)
+            data = evidence_map.get(sid)
+            if not data:
+                continue
+            refs_local.append(
+                AnswerUnitEvidenceRef(
+                    source_id=sid,
+                    page=data.get("page"),
+                    line_start=data.get("line_start"),
+                    line_end=data.get("line_end"),
+                    filename=data.get("filename"),
+                    document_id=data.get("document_id"),
+                    chunk_id=data.get("chunk_id"),
+                )
+            )
+        return refs_local
+
+    for raw in units_text:
+        extracted = [f"S{match}" for match in SOURCE_ID_RE.findall(raw)]
+        if not extracted and prior_sids:
+            extracted = list(prior_sids)
+        if not extracted and fallback_sid:
+            extracted = [fallback_sid]
+        refs = _refs_from_sids(extracted)
+        if refs:
+            prior_sids = [ref.source_id for ref in refs]
+        units.append(AnswerUnit(text=raw, citations=refs))
+    return units
+
+
+def determine_answerability(
+    question: str,
+    source_evidence: list[dict[str, Any]],
+    answer_units: list[AnswerUnit],
+) -> Answerability:
+    if not source_evidence:
+        return Answerability(
+            answerable=False,
+            reason_code="NO_SOURCES",
+            reason_message="No supporting sources were retrieved for this question.",
+        )
+    if not answer_units:
+        return Answerability(
+            answerable=False,
+            reason_code="INSUFFICIENT_EVIDENCE",
+            reason_message="No answer units with supporting citations were generated.",
+        )
+    for unit in answer_units:
+        if not unit.citations:
+            return Answerability(
+                answerable=False,
+                reason_code="INSUFFICIENT_EVIDENCE",
+                reason_message="Some answer lines do not reference any supporting sources.",
+            )
+    return Answerability(
+        answerable=True,
+        reason_code="OTHER",
+        reason_message="Answer is supported by the provided sources.",
+    )
 
 
 # ============================================================
@@ -2094,7 +2236,7 @@ def to_pgvector_literal(vec: list[float]) -> str:
 # Sources / Citations + injection guard
 # ============================================================
 
-SOURCE_ID_RE = re.compile(r"\[S(\d+)\]")
+SOURCE_ID_RE = re.compile(r"\[S(\d+)(?:[^\]]*)\]")
 FORBIDDEN_INLINE_PAGE_RE = re.compile(r"\[S\d+\s+p\.\d+\]")
 FORBIDDEN_PLACEHOLDER_RE = re.compile(r"\[S\?\s*p\.\?\]|\?")
 
@@ -3030,12 +3172,20 @@ def ask(
                     if is_admin_user
                     else public_citations(fallback_sources)
                 )
+                source_evidence = build_source_evidence(rows, fallback_sources)
+                answerability = Answerability(
+                    answerable=False,
+                    reason_code="INSUFFICIENT_EVIDENCE",
+                    reason_message="Top retrieval results were below the relevance threshold.",
+                )
                 resp = {
-                    "answer": "I don't know based on the provided sources.",
+                    "answer": _unknown_answer_text(payload.question or ""),
                     "citations": citations_out,
-                    "sources": build_source_evidence(rows, fallback_sources),
+                    "sources": source_evidence,
                     "run_id": effective_run_id,
                     "request_id": req_id,
+                    "answerability": answerability,
+                    "answer_units": [],
                 }
                 included_retrieval_debug = include_debug
                 included_debug_meta = include_debug and debug_meta is not None
@@ -3086,21 +3236,23 @@ def ask(
                 run.t3 = _utcnow()
                 db.commit()
             if summary_mode:
-                resp = {
-                    "answer": SUMMARY_NO_SOURCES_MESSAGE,
-                    "citations": [],
-                    "sources": [],
-                    "run_id": effective_run_id,
-                    "request_id": req_id,
-                }
+                answer_text = SUMMARY_NO_SOURCES_MESSAGE
             else:
-                resp = {
-                    "answer": "I don't know based on the provided sources.",
-                    "citations": [],
-                    "sources": [],
-                    "run_id": effective_run_id,
-                    "request_id": req_id,
-                }
+                answer_text = _unknown_answer_text(payload.question or "")
+            answerability = Answerability(
+                answerable=False,
+                reason_code="NO_SOURCES",
+                reason_message="No supporting sources were retrieved for this question.",
+            )
+            resp = {
+                "answer": answer_text,
+                "citations": [],
+                "sources": [],
+                "run_id": effective_run_id,
+                "request_id": req_id,
+                "answerability": answerability,
+                "answer_units": [],
+            }
             included_retrieval_debug = False
             included_debug_meta = False
             debug_payload_extra: dict[str, Any] | None = None
@@ -3250,24 +3402,41 @@ def ask(
             run.t3 = _utcnow()
             db.commit()
 
+        source_evidence = build_source_evidence(rows, used_sources)
+        answer_units = build_answer_units_for_response(answer, source_evidence)
+        answerability = determine_answerability(
+            payload.question or "", source_evidence, answer_units
+        )
+        citation_sources = used_sources
+        preserve_answer_text = answer.strip().startswith("[NO_SOURCES]")
+        if not answerability.answerable and not preserve_answer_text:
+            answer = _unknown_answer_text(payload.question or "")
+            answer_units = []
+            citation_sources = used_sources[:1] if used_sources else []
+
         citations_out = (
-            used_sources if is_admin_user else public_citations(used_sources)
+            citation_sources if is_admin_user else public_citations(citation_sources)
         )
 
         resp = {
             "answer": answer,
             "citations": citations_out,
-            "sources": build_source_evidence(rows, used_sources),
+            "sources": source_evidence,
             "run_id": effective_run_id,
             "request_id": req_id,
+            "answerability": answerability,
         }
+        if answer_units:
+            resp["answer_units"] = answer_units
+        elif not answerability.answerable:
+            resp["answer_units"] = []
         included_retrieval_debug = include_debug
         included_debug_meta = include_debug and debug_meta is not None
         debug_payload_extra: dict[str, Any] | None = None
         debug_meta_payload_extra: dict[str, Any] | None = None
         if include_debug:
             debug_payload_extra, debug_meta_payload_extra = _prepare_debug_payload(
-                citations_count=len(used_sources),
+                citations_count=len(citation_sources),
                 guardrail_reason=guardrail_reason,
             )
             resp["retrieval_debug"] = debug_payload_extra or {}
