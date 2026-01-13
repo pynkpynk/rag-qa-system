@@ -8,7 +8,7 @@
     "postbuild": "node scripts/scan_next_static_secrets.mjs",
     "start": "next start",
     "lint": "next lint",
-    "postinstall": "node scripts/copy-pdf-worker.cjs"
+    "postinstall": "node scripts/copy-pdf-worker.cjs && node scripts/copy_pdfjs_assets.mjs"
   },
   "dependencies": {
     "@auth0/nextjs-auth0": "^3.5.0",

@@ -28,59 +28,32 @@ type HealthPayload = Record<string, unknown>;
 
 type TabKey = "ask" | "documents" | "health";
 
-const STORAGE_BASE = "ragqa.ui.apiBase";
-const STORAGE_TOKEN = "ragqa.ui.token";
 const STORAGE_DEV_SUB = "ragqa.ui.devSub";
 
-function useRememberedConfig() {
-  const [baseUrl, setBaseUrl] = useState(DEFAULT_API_BASE);
-  const [token, setToken] = useState("");
+function useDevSub() {
   const [devSub, setDevSub] = useState("dev|user");
-  const [remember, setRemember] = useState(false);
 
   useEffect(() => {
     if (typeof window === "undefined") {
       return;
     }
-    const savedBase = window.localStorage.getItem(STORAGE_BASE);
-    const savedToken = window.localStorage.getItem(STORAGE_TOKEN);
-    const savedDev = window.localStorage.getItem(STORAGE_DEV_SUB);
-    if (savedBase || savedToken || savedDev) {
-      setBaseUrl(savedBase || DEFAULT_API_BASE);
-      setToken(savedToken || "");
-      setDevSub(savedDev || "dev|user");
-      setRemember(true);
+    const saved = window.localStorage.getItem(STORAGE_DEV_SUB);
+    if (saved) {
+      setDevSub(saved);
     }
   }, []);
 
-  useEffect(() => {
-    if (typeof window === "undefined") {
-      return;
+  const update = useCallback((value: string) => {
+    setDevSub(value);
+    if (typeof window !== "undefined") {
+      window.localStorage.setItem(STORAGE_DEV_SUB, value);
     }
-    if (remember) {
-      window.localStorage.setItem(STORAGE_BASE, baseUrl);
-      window.localStorage.setItem(STORAGE_TOKEN, token);
-      window.localStorage.setItem(STORAGE_DEV_SUB, devSub);
-    } else {
-      window.localStorage.removeItem(STORAGE_BASE);
-      window.localStorage.removeItem(STORAGE_TOKEN);
-      window.localStorage.removeItem(STORAGE_DEV_SUB);
-    }
-  }, [remember, baseUrl, token, devSub]);
+  }, []);
 
-  return {
-    baseUrl,
-    token,
-    devSub,
-    remember,
-    setBaseUrl,
-    setToken,
-    setDevSub,
-    setRemember,
-  };
+  return { devSub, setDevSub: update };
 }
 
-function useApi(baseUrl: string, token: string, devSub: string) {
+function useApi(baseUrl: string, devSub: string) {
   const normalized = normalizeApiBase(baseUrl);
   return useMemo(() => {
     async function request<T>(
@@ -90,7 +63,6 @@ function useApi(baseUrl: string, token: string, devSub: string) {
       const resp = await apiFetch(
         normalized,
         path,
-        token || undefined,
         devSub || undefined,
         init,
       );
@@ -112,27 +84,18 @@ function useApi(baseUrl: string, token: string, devSub: string) {
       return apiFetch(
         normalized,
         path,
-        token || undefined,
         devSub || undefined,
         init,
       );
     }
     return { request, requestRaw };
-  }, [normalized, token, devSub]);
+  }, [normalized, devSub]);
 }
 
 export default function DevClient() {
-  const {
-    baseUrl,
-    token,
-    devSub,
-    remember,
-    setBaseUrl,
-    setToken,
-    setDevSub,
-    setRemember,
-  } = useRememberedConfig();
-  const api = useApi(baseUrl, token, devSub);
+  const { devSub, setDevSub } = useDevSub();
+  const baseUrl = DEFAULT_API_BASE;
+  const api = useApi(baseUrl, devSub);
   const [activeTab, setActiveTab] = useState<TabKey>("ask");
 
   const [healthData, setHealthData] = useState<HealthPayload | null>(null);
@@ -268,7 +231,7 @@ export default function DevClient() {
           /* ignore */
         }
         if (resp.status === 401) {
-          detail = `${detail} — check Bearer token and x-dev-sub.`;
+          detail = `${detail} — verify server credentials and x-dev-sub.`;
         }
         throw new Error(detail);
       }
@@ -301,52 +264,19 @@ export default function DevClient() {
         }}
       >
         <h1 style={{ marginBottom: "0.5rem" }}>RAG QA Console (MVP)</h1>
-        <div
-          style={{
-            display: "flex",
-            flexDirection: "column",
-            gap: "0.75rem",
-          }}
-        >
-          <label style={{ display: "flex", flexDirection: "column", gap: "0.25rem" }}>
-            API Base URL
-            <input
-              value={baseUrl}
-              onChange={(e) => setBaseUrl(e.target.value)}
-              placeholder="https://host/api"
-              style={{ padding: "0.4rem", borderRadius: "4px" }}
-            />
-          </label>
-          <label style={{ display: "flex", flexDirection: "column", gap: "0.25rem" }}>
-            Bearer Token (optional)
-            <input
-              value={token}
-              onChange={(e) => setToken(e.target.value)}
-              placeholder="demo-token"
-              style={{ padding: "0.4rem", borderRadius: "4px" }}
-            />
-          </label>
-          <label style={{ display: "flex", flexDirection: "column", gap: "0.25rem" }}>
-            Dev subject (x-dev-sub)
-            <input
-              value={devSub}
-              onChange={(e) => setDevSub(e.target.value)}
-              placeholder="dev|user"
-              style={{ padding: "0.4rem", borderRadius: "4px" }}
-            />
-          </label>
-          <label style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
-            <input
-              type="checkbox"
-              checked={remember}
-              onChange={(e) => setRemember(e.target.checked)}
-            />
-            Remember settings locally
-          </label>
-          <p style={{ fontSize: "0.85rem", color: "#94a3b8" }}>
-            Local dev auth typically requires Bearer dev-token and x-dev-sub headers.
-          </p>
-        </div>
+        <p style={{ marginBottom: "0.75rem", color: "#94a3b8" }}>
+          Requests proxy through <code>/api</code> with server-managed credentials.
+          Adjust the dev subject if you need to impersonate a specific tenant user.
+        </p>
+        <label style={{ display: "flex", flexDirection: "column", gap: "0.25rem" }}>
+          Dev subject (x-dev-sub)
+          <input
+            value={devSub}
+            onChange={(e) => setDevSub(e.target.value)}
+            placeholder="dev|user"
+            style={{ padding: "0.4rem", borderRadius: "4px" }}
+          />
+        </label>
       </section>
 
       <section>

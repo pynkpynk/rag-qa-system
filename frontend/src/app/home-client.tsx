@@ -3,7 +3,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import type { CSSProperties, ReactNode } from "react";
 import { apiFetch } from "../lib/apiClient";
-import { getToken } from "../lib/authToken";
 import { DEFAULT_API_BASE, normalizeApiBase } from "../lib/workspace";
 import CitationPreviewModal from "../components/CitationPreviewModal";
 
@@ -95,14 +94,13 @@ function useGlossary() {
   return { glossary, setGlossary };
 }
 
-function useApi(baseUrl: string, token: string, devSub: string) {
+function useApi(baseUrl: string, devSub: string) {
   const normalized = normalizeApiBase(baseUrl);
   return useMemo(() => {
     async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
       const resp = await apiFetch(
         normalized,
         path,
-        token || undefined,
         devSub || undefined,
         init,
       );
@@ -121,13 +119,12 @@ function useApi(baseUrl: string, token: string, devSub: string) {
       return apiFetch(
         normalized,
         path,
-        token || undefined,
         devSub || undefined,
         init,
       );
     }
     return { request, requestRaw };
-  }, [normalized, token, devSub]);
+  }, [normalized, devSub]);
 }
 
 function citationKey(c: ChatCitation): string {
@@ -138,48 +135,11 @@ function citationKey(c: ChatCitation): string {
   );
 }
 
-function useAuthToken(prefill?: string) {
-  const [token, setToken] = useState(prefill ?? "");
-
-  useEffect(() => {
-    if (prefill) {
-      setToken(prefill);
-    }
-    if (typeof window === "undefined") {
-      return;
-    }
-    const readToken = () => {
-      if (prefill) {
-        setToken(prefill);
-        return;
-      }
-      const stored = getToken();
-      setToken(stored ?? "");
-    };
-    readToken();
-    const handler = () => readToken();
-    window.addEventListener("ragqa-token-change", handler);
-    window.addEventListener("storage", handler);
-    return () => {
-      window.removeEventListener("ragqa-token-change", handler);
-      window.removeEventListener("storage", handler);
-    };
-  }, [prefill]);
-
-  return token;
-}
-
-type HomeClientProps = {
-  demoToken?: string;
-};
-
-export default function HomeClient({ demoToken }: HomeClientProps = {}) {
+export default function HomeClient() {
   const baseUrl = DEFAULT_API_BASE;
   const devSub = "";
   const apiBaseLabel = normalizeApiBase(baseUrl);
-  const authToken = useAuthToken(demoToken);
-  const authStatusLabel = authToken ? "present" : "absent";
-  const api = useApi(baseUrl, authToken, devSub);
+  const api = useApi(baseUrl, devSub);
   const { glossary, setGlossary } = useGlossary();
 
   const [documents, setDocuments] = useState<DocumentListItem[]>([]);
@@ -419,7 +379,7 @@ export default function HomeClient({ demoToken }: HomeClientProps = {}) {
           /* ignore */
         }
         if (resp.status === 401) {
-          detail = `${detail} — check Bearer token and x-dev-sub.`;
+          detail = `${detail} — verify server credentials or x-dev-sub.`;
         }
         throw new Error(detail);
       }
@@ -504,19 +464,15 @@ export default function HomeClient({ demoToken }: HomeClientProps = {}) {
   }
 
   function handlePreviewTrigger() {
+    const sourceCitation = selectedCitation ?? null;
     const docId =
-      selectedCitation?.document_id || matchingSource?.document_id || null;
+      sourceCitation?.document_id || matchingSource?.document_id || null;
     const pageNumber =
-      selectedCitation?.page != null
-        ? selectedCitation.page
+      sourceCitation?.page != null
+        ? sourceCitation.page
         : matchingSource?.page ?? null;
     if (!docId) {
       setPreviewMessage("This citation does not include an evidence file.");
-      setPreviewOpen(false);
-      return;
-    }
-    if (!authToken) {
-      setPreviewMessage("Provide a demo token to preview evidence.");
       setPreviewOpen(false);
       return;
     }
@@ -566,7 +522,7 @@ export default function HomeClient({ demoToken }: HomeClientProps = {}) {
     >
       <h1 style={{ marginBottom: "0.5rem", fontSize: "1.5rem" }}>Document Q&A</h1>
       <p style={{ marginBottom: "1rem", color: "#94a3b8", fontSize: "0.75rem" }}>
-        API: {apiBaseLabel} • Auth: {authStatusLabel}
+        API: {apiBaseLabel} • Auth: server managed
       </p>
       <div style={containerStyle}>
         <section style={paneStyle}>
@@ -874,7 +830,9 @@ export default function HomeClient({ demoToken }: HomeClientProps = {}) {
                       return (
                         <button
                           key={key}
-                          onClick={() => setSelectedCitationKey(key)}
+                          onClick={() => {
+                            setSelectedCitationKey(key);
+                          }}
                           style={{
                             borderRadius: "8px",
                             padding: "0.4rem 0.6rem",
@@ -1121,8 +1079,6 @@ export default function HomeClient({ demoToken }: HomeClientProps = {}) {
       open={previewOpen}
       onClose={() => setPreviewOpen(false)}
       target={previewTarget}
-      token={authToken || null}
-      devSub={devSub || undefined}
     />
     </>
   );

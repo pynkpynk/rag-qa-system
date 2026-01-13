@@ -16,8 +16,6 @@ type CitationPreviewModalProps = {
   open: boolean;
   onClose: () => void;
   target: PreviewTarget | null;
-  token?: string | null;
-  devSub?: string;
   title?: string;
 };
 
@@ -25,14 +23,15 @@ export default function CitationPreviewModal({
   open,
   onClose,
   target,
-  token,
-  devSub,
   title,
 }: CitationPreviewModalProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [pageRendered, setPageRendered] = useState<number | null>(null);
+  const fallbackHref = target
+    ? `/api/docs/${target.documentId}/content${target.page ? `#page=${target.page}` : ""}`
+    : null;
 
   useEffect(() => {
     if (!open) {
@@ -47,25 +46,25 @@ export default function CitationPreviewModal({
       if (!open || !target) {
         return;
       }
-      if (!token) {
-        setError("Provide a demo token to preview evidence.");
-        return;
-      }
       setLoading(true);
       setError(null);
       try {
         const resp = await apiFetch(
           DEFAULT_API_BASE,
           `/docs/${target.documentId}/content`,
-          token || undefined,
-          devSub || undefined,
         );
         if (!resp.ok) {
           const message = (await resp.text()) || resp.statusText;
           throw new Error(message || "Unable to load evidence.");
         }
         const buffer = await resp.arrayBuffer();
-        const pdf = await getDocument({ data: buffer }).promise;
+        const pdf = await getDocument({
+          data: buffer,
+          cMapUrl: "/pdfjs/cmaps/",
+          cMapPacked: true,
+          standardFontDataUrl: "/pdfjs/standard_fonts/",
+          useSystemFonts: true,
+        }).promise;
         if (cancelled) return;
         const safePage = target.page && target.page >= 1
           ? Math.min(target.page, pdf.numPages)
@@ -73,13 +72,16 @@ export default function CitationPreviewModal({
         const page = await pdf.getPage(safePage);
         if (cancelled) return;
         const viewport = page.getViewport({ scale: 1.25 });
+        await new Promise<void>((resolve) =>
+          requestAnimationFrame(() => resolve()),
+        );
         const canvas = canvasRef.current;
         if (!canvas) {
-          throw new Error("Unable to render preview.");
+          throw new Error("Preview canvas not available.");
         }
         const context = canvas.getContext("2d");
         if (!context) {
-          throw new Error("Unable to render preview.");
+          throw new Error("Preview canvas context not available.");
         }
         canvas.height = viewport.height;
         canvas.width = viewport.width;
@@ -89,7 +91,14 @@ export default function CitationPreviewModal({
         }
       } catch (err) {
         if (!cancelled) {
-          setError((err as Error).message || "Unable to load evidence.");
+          const message = (err as Error).message || "Unable to load evidence.";
+          const needsAssets =
+            message.includes("CMap") || message.includes("fonts");
+          setError(
+            needsAssets
+              ? "PDF fonts/CMap assets are missing. Run npm install to regenerate pdfjs assets."
+              : message,
+          );
         }
       } finally {
         if (!cancelled) {
@@ -101,7 +110,7 @@ export default function CitationPreviewModal({
     return () => {
       cancelled = true;
     };
-  }, [open, target, token, devSub]);
+  }, [open, target]);
 
   if (!open) {
     return null;
@@ -168,19 +177,45 @@ export default function CitationPreviewModal({
         </div>
         {!target ? (
           <p style={{ color: "#f87171" }}>No citation details available.</p>
-        ) : !token ? (
-          <p style={{ color: "#fbbf24" }}>
-            Provide a demo token to preview evidence.
-          </p>
-        ) : loading ? (
-          <p>Loading evidence…</p>
-        ) : error ? (
-          <p style={{ color: "#f87171" }}>{error}</p>
         ) : (
-          <canvas
-            ref={canvasRef}
-            style={{ width: "100%", height: "auto", borderRadius: "8px" }}
-          />
+          <>
+            <div style={{ borderRadius: "8px", overflow: "hidden" }}>
+              <canvas
+                ref={canvasRef}
+                style={{ width: "100%", height: "auto", display: "block" }}
+              />
+            </div>
+            {loading ? (
+              <p>Loading evidence…</p>
+            ) : error ? (
+              <>
+                <p style={{ color: "#f87171" }}>{error}</p>
+                {fallbackHref ? (
+                  <p>
+                    <a
+                      href={fallbackHref}
+                      target="_blank"
+                      rel="noreferrer"
+                      style={{ color: "#60a5fa" }}
+                    >
+                      Open original PDF
+                    </a>
+                  </p>
+                ) : null}
+              </>
+            ) : fallbackHref ? (
+              <p style={{ marginTop: "0.5rem" }}>
+                <a
+                  href={fallbackHref}
+                  target="_blank"
+                  rel="noreferrer"
+                  style={{ color: "#60a5fa" }}
+                >
+                  Open original PDF
+                </a>
+              </p>
+            ) : null}
+          </>
         )}
       </div>
     </div>

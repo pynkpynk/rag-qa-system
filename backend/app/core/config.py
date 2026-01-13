@@ -38,7 +38,7 @@ _ENV_FILE = _resolve_env_file()
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=_ENV_FILE, extra="ignore")
 
-    openai_api_key: SecretStr = Field(...)
+    openai_api_key: SecretStr | None = Field(default=None)
     openai_offline: bool = Field(False, alias="OPENAI_OFFLINE")
     database_url: str = Field(...)
     cors_origin: str = Field(...)
