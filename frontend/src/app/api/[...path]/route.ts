@@ -50,11 +50,10 @@ function buildUpstreamUrl(path: string[], search: string): string {
 
 function collectRequestHeaders(request: NextRequest): Headers {
   const headers = new Headers();
+
   for (const name of REQUEST_HEADER_ALLOWLIST) {
     const value = request.headers.get(name);
-    if (value) {
-      headers.set(name, value);
-    }
+    if (value) headers.set(name, value);
   }
 
   // Optional: inject demo token if caller didn't provide Authorization.
@@ -110,6 +109,7 @@ async function handleProxy(
   }
 
   const headers = collectRequestHeaders(request);
+
   const init: RequestInit = {
     method: request.method,
     headers,
