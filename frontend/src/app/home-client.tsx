@@ -32,11 +32,35 @@ type ChatSource = {
   text?: string | null;
 };
 
+type AnswerUnitEvidenceRef = {
+  source_id?: string | null;
+  page?: number | null;
+  line_start?: number | null;
+  line_end?: number | null;
+  filename?: string | null;
+  document_id?: string | null;
+  chunk_id?: string | null;
+};
+
+type AnswerUnit = {
+  text: string;
+  citations?: AnswerUnitEvidenceRef[] | null;
+};
+
+type Answerability = {
+  answerable: boolean;
+  reason_code?: string | null;
+  reason_message?: string | null;
+  suggested_followups?: string[];
+};
+
 type ChatResponse = {
   answer?: string;
   citations?: ChatCitation[];
   sources?: ChatSource[];
   request_id?: string;
+  answerability?: Answerability | null;
+  answer_units?: AnswerUnit[] | null;
 };
 
 type ChatMessage = {
@@ -47,6 +71,8 @@ type ChatMessage = {
   citations?: ChatCitation[];
   sources?: ChatSource[];
   requestId?: string;
+  answerability?: Answerability | null;
+  answerUnits?: AnswerUnit[] | null;
 };
 
 const STORAGE_GLOSSARY = "ragqa.ui.glossary";
@@ -167,6 +193,7 @@ export default function HomeClient() {
   const [previewOpen, setPreviewOpen] = useState(false);
   const [previewTarget, setPreviewTarget] = useState<PreviewTarget | null>(null);
   const [previewMessage, setPreviewMessage] = useState<string | null>(null);
+  const [previewTitle, setPreviewTitle] = useState<string | null>(null);
 
   const refreshDocuments = useCallback(async () => {
     setDocsLoading(true);
@@ -242,6 +269,8 @@ export default function HomeClient() {
     () => latestAssistant?.sources ?? [],
     [latestAssistant],
   );
+  const answerability = latestAssistant?.answerability ?? null;
+  const answerUnits = latestAssistant?.answerUnits ?? [];
 
   useEffect(() => {
     if (!citations.length) {
@@ -391,6 +420,8 @@ export default function HomeClient() {
         citations: payloadJson.citations || [],
         sources: payloadJson.sources || [],
         requestId: payloadJson.request_id,
+        answerability: payloadJson.answerability || null,
+        answerUnits: payloadJson.answer_units || null,
         createdAt: Date.now(),
       };
       setMessages((prev) => [...prev, assistantMessage]);
@@ -463,6 +494,22 @@ export default function HomeClient() {
     }
   }
 
+  function triggerPreview(
+    docId: string | null,
+    pageNumber: number | null,
+    title?: string | null,
+  ) {
+    if (!docId) {
+      setPreviewMessage("This citation does not include an evidence file.");
+      setPreviewOpen(false);
+      return;
+    }
+    setPreviewMessage(null);
+    setPreviewTarget({ documentId: docId, page: pageNumber });
+    setPreviewTitle(title || null);
+    setPreviewOpen(true);
+  }
+
   function handlePreviewTrigger() {
     const sourceCitation = selectedCitation ?? null;
     const docId =
@@ -471,14 +518,33 @@ export default function HomeClient() {
       sourceCitation?.page != null
         ? sourceCitation.page
         : matchingSource?.page ?? null;
-    if (!docId) {
-      setPreviewMessage("This citation does not include an evidence file.");
-      setPreviewOpen(false);
-      return;
+    triggerPreview(docId, pageNumber);
+  }
+
+  function formatEvidenceLabel(
+    ref: AnswerUnitEvidenceRef,
+    fallbackIndex: number,
+  ): string {
+    const sid = ref.source_id || `Evidence ${fallbackIndex + 1}`;
+    const page = ref.page != null ? ` p.${ref.page}` : "";
+    let lines = "";
+    const start = ref.line_start;
+    const end = ref.line_end;
+    if (
+      typeof start === "number" &&
+      typeof end === "number" &&
+      start > 0 &&
+      end > 0
+    ) {
+      lines = ` L${start}–${end}`;
     }
-    setPreviewMessage(null);
-    setPreviewTarget({ documentId: docId, page: pageNumber });
-    setPreviewOpen(true);
+    return `${sid}${page}${lines}`;
+  }
+
+  function handleAnswerUnitPreview(ref: AnswerUnitEvidenceRef, label?: string) {
+    const docId = ref.document_id || null;
+    const page = ref.page ?? null;
+    triggerPreview(docId, page, label || ref.source_id || "Evidence preview");
   }
 
   function renderSnippet(text?: string | null): ReactNode {
@@ -817,6 +883,76 @@ export default function HomeClient() {
             <p style={{ color: "#94a3b8" }}>Your citations will appear here.</p>
           ) : (
             <div style={{ display: "flex", flexDirection: "column", gap: "0.75rem" }}>
+              {answerability && (
+                <div
+                  style={{
+                    border: "1px solid #1e293b",
+                    borderRadius: "8px",
+                    padding: "0.6rem",
+                    background: "rgba(15,23,42,0.6)",
+                  }}
+                >
+                  <div
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: "0.5rem",
+                      marginBottom: "0.35rem",
+                      flexWrap: "wrap",
+                    }}
+                  >
+                    <span
+                      style={{
+                        borderRadius: "999px",
+                        padding: "0.1rem 0.6rem",
+                        fontSize: "0.75rem",
+                        fontWeight: 600,
+                        background: answerability.answerable
+                          ? "rgba(34,197,94,0.15)"
+                          : "rgba(248,113,113,0.15)",
+                        color: answerability.answerable ? "#4ade80" : "#f87171",
+                      }}
+                    >
+                      {answerability.answerable ? "Answerable" : "Needs follow-up"}
+                    </span>
+                    <small style={{ color: "#94a3b8" }}>
+                      {answerability.reason_message ||
+                        (answerability.answerable
+                          ? "Answer is supported by cited sources."
+                          : "Evidence is insufficient for this question.")}
+                    </small>
+                  </div>
+                  {!answerability.answerable &&
+                    (answerability.suggested_followups || []).length > 0 && (
+                      <div
+                        style={{
+                          display: "flex",
+                          gap: "0.4rem",
+                          flexWrap: "wrap",
+                        }}
+                      >
+                        {answerability.suggested_followups!.map((item, idx) => (
+                          <button
+                            key={`${item}-${idx}`}
+                            type="button"
+                            onClick={() => setQuestion(item)}
+                            style={{
+                              borderRadius: "999px",
+                              border: "1px solid #334155",
+                              background: "transparent",
+                              color: "#e2e8f0",
+                              fontSize: "0.75rem",
+                              padding: "0.2rem 0.65rem",
+                              cursor: "pointer",
+                            }}
+                          >
+                            {item}
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                </div>
+              )}
               <div>
                 <h3 style={{ fontSize: "1rem", marginBottom: "0.25rem" }}>Citations</h3>
                 <div style={{ display: "flex", flexDirection: "column", gap: "0.35rem" }}>
@@ -853,6 +989,65 @@ export default function HomeClient() {
                   )}
                 </div>
               </div>
+
+              {answerUnits.length > 0 && (
+                <div>
+                  <h3 style={{ fontSize: "1rem", marginBottom: "0.25rem" }}>Answer units</h3>
+                  <div style={{ display: "flex", flexDirection: "column", gap: "0.5rem" }}>
+                    {answerUnits.map((unit, idx) => (
+                      <div
+                        key={`${unit.text}-${idx}`}
+                        style={{
+                          border: "1px solid #1e293b",
+                          borderRadius: "8px",
+                          padding: "0.5rem 0.6rem",
+                          background: "rgba(15,23,42,0.6)",
+                        }}
+                      >
+                        <p style={{ margin: 0, color: "#e2e8f0" }}>{unit.text}</p>
+                        <div
+                          style={{
+                            marginTop: "0.35rem",
+                            display: "flex",
+                            flexWrap: "wrap",
+                            gap: "0.35rem",
+                          }}
+                        >
+                          {unit.citations && unit.citations.length > 0 ? (
+                            unit.citations.map((ref, refIdx) => (
+                              <button
+                                key={`${idx}-${ref.source_id || refIdx}`}
+                                type="button"
+                                onClick={() =>
+                                  handleAnswerUnitPreview(
+                                    ref,
+                                    formatEvidenceLabel(ref, refIdx),
+                                  )
+                                }
+                                style={{
+                                  borderRadius: "999px",
+                                  border: "1px solid #334155",
+                                  background: "transparent",
+                                  color: "#38bdf8",
+                                  fontSize: "0.75rem",
+                                  padding: "0.15rem 0.55rem",
+                                  cursor: "pointer",
+                                }}
+                              >
+                                {formatEvidenceLabel(ref, refIdx)}
+                              </button>
+                            ))
+                          ) : (
+                            <span style={{ color: "#94a3b8", fontSize: "0.8rem" }}>
+                              No supporting evidence
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
 
               <div>
                 <h3 style={{ fontSize: "1rem", marginBottom: "0.25rem" }}>Snippet</h3>
@@ -1077,8 +1272,12 @@ export default function HomeClient() {
     </main>
     <CitationPreviewModal
       open={previewOpen}
-      onClose={() => setPreviewOpen(false)}
+      onClose={() => {
+        setPreviewOpen(false);
+        setPreviewTitle(null);
+      }}
       target={previewTarget}
+      title={previewTitle || undefined}
     />
     </>
   );
