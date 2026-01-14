@@ -229,6 +229,86 @@ def test_missing_info_without_cannot_signal_does_not_flip():
     assert updated.answerable is True
 
 
+def test_sentence_splitting_assigns_evidence_en():
+    evidence = [
+        {
+            "source_id": "S10",
+            "page": 3,
+            "line_start": 5,
+            "line_end": 12,
+            "filename": "alpha.pdf",
+            "document_id": "doc-10",
+            "chunk_id": "chunk-10",
+            "text": "Sentence one explains policy controls in detail.",
+        },
+        {
+            "source_id": "S11",
+            "page": 4,
+            "line_start": 8,
+            "line_end": 18,
+            "filename": "beta.pdf",
+            "document_id": "doc-11",
+            "chunk_id": "chunk-11",
+            "text": "Sentence two describes the audit requirements.",
+        },
+    ]
+    answer = "Sentence one explains policy controls in detail. Sentence two describes the audit requirements."
+    units = build_answer_units_for_response(answer, evidence)
+    assert len(units) == 2
+    assert units[0].citations and units[0].citations[0].source_id == "S10"
+    assert units[1].citations and units[1].citations[0].source_id == "S11"
+
+
+def test_sentence_splitting_assigns_evidence_ja():
+    evidence = [
+        {
+            "source_id": "S12",
+            "page": 1,
+            "line_start": 1,
+            "line_end": 5,
+            "filename": "gamma.pdf",
+            "document_id": "doc-12",
+            "chunk_id": "chunk-12",
+            "text": "一文目です。ガバナンスを説明します。",
+        },
+        {
+            "source_id": "S13",
+            "page": 2,
+            "line_start": 10,
+            "line_end": 18,
+            "filename": "delta.pdf",
+            "document_id": "doc-13",
+            "chunk_id": "chunk-13",
+            "text": "二文目です。手順を示します。",
+        },
+    ]
+    answer = "一文目です。二文目です。"
+    units = build_answer_units_for_response(answer, evidence)
+    assert len(units) == 2
+    assert units[0].citations and units[0].citations[0].source_id == "S12"
+    assert units[1].citations and units[1].citations[0].source_id == "S13"
+
+
+def test_bullet_multi_sentence_inherits_citation_when_needed():
+    evidence = [
+        {
+            "source_id": "S14",
+            "page": 6,
+            "line_start": 2,
+            "line_end": 9,
+            "filename": "epsilon.pdf",
+            "document_id": "doc-14",
+            "chunk_id": "chunk-14",
+            "text": "First sentence cites a specific control.",
+        }
+    ]
+    answer = "- First sentence cites a specific control. Second sentence adds context."
+    units = build_answer_units_for_response(answer, evidence)
+    assert len(units) == 2
+    assert units[0].citations and units[0].citations[0].source_id == "S14"
+    assert units[1].citations and units[1].citations[0].source_id == "S14"
+
+
 def test_localized_units_preserve_citations(monkeypatch):
     evidence = [
         {

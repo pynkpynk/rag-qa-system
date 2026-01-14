@@ -172,6 +172,8 @@ _SUMMARY_HEADER_HINTS = (
     "まとめ:",
 )
 _BULLET_PREFIXES = ("- ", "* ", "• ", "・")
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?。！？])\s*")
+_BULLET_PREFIX_RE = re.compile(r"^\s*(?:[-*•・]|[\d]+[.)])\s+")
 _SPACE_RE = re.compile(r"\s+")
 
 # ============================================================
@@ -284,10 +286,39 @@ def _split_answer_units_for_attribution(text: str) -> list[str]:
     text_for_sentences = " ".join(fallback_lines) if fallback_lines else t
     sentences = [
         s.strip()
-        for s in re.split(r"(?<=[.!?。！？])\s+", text_for_sentences)
+        for s in re.split(r"(?<=[.!?。！？])\s*", text_for_sentences)
         if s.strip()
     ]
     return sentences or [text_for_sentences.strip()]
+
+
+def _strip_bullet_prefix(text: str) -> str:
+    stripped = text.strip()
+    if not stripped:
+        return stripped
+    return _BULLET_PREFIX_RE.sub("", stripped, count=1)
+
+
+def _split_segment_into_sentences(text: str) -> list[str]:
+    cleaned = _strip_bullet_prefix(text)
+    target = cleaned.strip()
+    if not target:
+        return []
+    parts = _SENTENCE_SPLIT_RE.split(target)
+    sentences = [p.strip() for p in parts if p.strip()]
+    return sentences or [target]
+
+
+def _sentence_units_for_answer(answer_text: str) -> list[tuple[int, str]]:
+    segments = _split_answer_units_for_attribution(answer_text)
+    all_units: list[tuple[int, str]] = []
+    for idx, segment in enumerate(segments):
+        for sentence in _split_segment_into_sentences(segment):
+            if sentence:
+                all_units.append((idx, sentence))
+    if not all_units and answer_text.strip():
+        all_units.append((0, answer_text.strip()))
+    return all_units
 
 
 def _normalize_for_match(text: str | None) -> str:
@@ -321,8 +352,8 @@ def _match_source_by_text(
 def build_answer_units_for_response(
     answer_text: str, source_evidence: list[dict[str, Any]]
 ) -> list[AnswerUnit]:
-    units_text = _split_answer_units_for_attribution(answer_text)
-    if not units_text:
+    sentence_units = _sentence_units_for_answer(answer_text)
+    if not sentence_units:
         return []
     evidence_map = {
         str(item.get("source_id")): item
@@ -336,6 +367,7 @@ def build_answer_units_for_response(
     units: list[AnswerUnit] = []
     prior_sids: list[str] = []
     fallback_sid = next(iter(evidence_map.keys()), None)
+    last_segment: int | None = None
 
     def _refs_from_sids(ids: list[str]) -> list[AnswerUnitEvidenceRef]:
         refs_local: list[AnswerUnitEvidenceRef] = []
@@ -360,10 +392,16 @@ def build_answer_units_for_response(
             )
         return refs_local
 
-    for raw in units_text:
-        extracted = [f"S{match}" for match in SOURCE_ID_RE.findall(raw)]
+    for segment_idx, raw in sentence_units:
+        normalized_raw = raw.strip()
+        if not normalized_raw:
+            continue
+        if segment_idx != last_segment:
+            prior_sids = []
+            last_segment = segment_idx
+        extracted = [f"S{match}" for match in SOURCE_ID_RE.findall(normalized_raw)]
         if not extracted:
-            matched = _match_source_by_text(raw, normalized_sources)
+            matched = _match_source_by_text(normalized_raw, normalized_sources)
             if matched:
                 extracted = [matched]
         if not extracted and prior_sids:
@@ -373,7 +411,7 @@ def build_answer_units_for_response(
         refs = _refs_from_sids(extracted)
         if refs:
             prior_sids = [ref.source_id for ref in refs]
-        units.append(AnswerUnit(text=raw, citations=refs))
+        units.append(AnswerUnit(text=normalized_raw, citations=refs))
     return units
 
 
