@@ -173,8 +173,64 @@ _SUMMARY_HEADER_HINTS = (
 )
 _BULLET_PREFIXES = ("- ", "* ", "• ", "・")
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?。！？])\s*")
+_EMAIL_SENTENCE_GUARD = "__EMAIL_DOT__"
+_EMAIL_IN_SENTENCE_RE = re.compile(
+    r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"
+)
+_SPLIT_EMAIL_RE = re.compile(
+    r"([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+)\.\s+([A-Za-z0-9-]+)"
+)
 _BULLET_PREFIX_RE = re.compile(r"^\s*(?:[-*•・]|[\d]+[.)])\s+")
 _SPACE_RE = re.compile(r"\s+")
+_KEY_FACTS_PREFIX_RE = re.compile(r"^\s*key facts?:\s*", re.IGNORECASE)
+_NO_BULLET_COLON_RE = re.compile(r":\s*[-*•・]+\s*")
+_INLINE_LIST_MARKER_RE = re.compile(r"(^|\s)[-*•・]+\s+")
+_BULLET_REQUEST_HINTS = (
+    "bullet",
+    "bullets",
+    "list",
+    "bullet list",
+    "箇条書き",
+    "リスト",
+)
+_BULLET_NEGATION_HINTS = (
+    "no bullet",
+    "no bullet points",
+    "not bullet",
+    "not bullet points",
+    "without bullet",
+    "箇条書き禁止",
+    "箇条書きではなく",
+    "箇条書きにせず",
+)
+_ASCII_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9./_-]*")
+_CJK_TOKEN_RE = re.compile(r"[ぁ-んァ-ン一-龯]{2,}")
+_GENERIC_ASCII_TOKENS = {
+    "csf",
+    "framework",
+    "frameworks",
+    "nist",
+    "informative",
+    "reference",
+    "references",
+    "mapping",
+    "mappings",
+    "version",
+    "versions",
+    "annex",
+    "appendix",
+    "section",
+}
+_GENERIC_CJK_TOKENS = {
+    "について",
+    "あります",
+    "ありますか",
+    "ありません",
+    "ください",
+    "ください。",
+}
+_OVERLAP_RATIO_THRESHOLD = 0.1
+_OVERLAP_RATIO_THRESHOLD = 0.1
 
 # ============================================================
 # Safety/quality gates
@@ -259,6 +315,32 @@ def _unknown_answer_text(question: str) -> str:
     )
 
 
+_REASON_FALLBACK_MESSAGES = {
+    "NO_SOURCES": {
+        "ja": "参照できる資料が見つかりませんでした。",
+        "en": "No supporting sources were retrieved for this answer.",
+    },
+    "INSUFFICIENT_EVIDENCE": {
+        "ja": "提示された資料からは確認できません。",
+        "en": "I can't confirm from the provided sources.",
+    },
+}
+_DEFAULT_FALLBACK_MESSAGES = {
+    "ja": "提示された資料からは確認できません。",
+    "en": "I can't confirm from the provided sources.",
+}
+
+
+def _fallback_unknown_message(question: str, reason_code: str | None) -> str:
+    lang = "ja" if _is_japanese_text(question) else "en"
+    code = (reason_code or "").upper()
+    if code in _REASON_FALLBACK_MESSAGES:
+        mapped = _REASON_FALLBACK_MESSAGES[code].get(lang)
+        if mapped:
+            return mapped
+    return _DEFAULT_FALLBACK_MESSAGES[lang]
+
+
 def _split_answer_units_for_attribution(text: str) -> list[str]:
     t = (text or "").strip()
     if not t:
@@ -304,9 +386,46 @@ def _split_segment_into_sentences(text: str) -> list[str]:
     target = cleaned.strip()
     if not target:
         return []
-    parts = _SENTENCE_SPLIT_RE.split(target)
-    sentences = [p.strip() for p in parts if p.strip()]
+    protected = _EMAIL_IN_SENTENCE_RE.sub(
+        lambda match: match.group(0).replace(".", _EMAIL_SENTENCE_GUARD),
+        target,
+    )
+    protected = _SPLIT_EMAIL_RE.sub(
+        lambda match: f"{match.group(1)}{_EMAIL_SENTENCE_GUARD}{match.group(2)}",
+        protected,
+    )
+    parts = _SENTENCE_SPLIT_RE.split(protected)
+    sentences = []
+    for part in parts:
+        restored = part.replace(_EMAIL_SENTENCE_GUARD, ".").strip()
+        if restored:
+            sentences.append(restored)
     return sentences or [target]
+
+
+def _repair_split_email_tokens(text: str) -> str:
+    if not text:
+        return ""
+    return _SPLIT_EMAIL_RE.sub(
+        lambda match: f"{match.group(1)}.{match.group(2)}",
+        text,
+    )
+
+
+def _strip_key_facts_prefix(text: str) -> str:
+    if not text:
+        return ""
+    return _KEY_FACTS_PREFIX_RE.sub("", text, count=1).strip()
+
+
+def _clean_no_bullet_sentence(text: str) -> str:
+    if not text:
+        return ""
+    trimmed = _strip_key_facts_prefix(text)
+    trimmed = trimmed.lstrip("-*•・ ").strip()
+    trimmed = _NO_BULLET_COLON_RE.sub(": ", trimmed)
+    trimmed = _INLINE_LIST_MARKER_RE.sub(r"\1", trimmed)
+    return trimmed.strip()
 
 
 def _sentence_units_for_answer(answer_text: str) -> list[tuple[int, str]]:
@@ -319,6 +438,264 @@ def _sentence_units_for_answer(answer_text: str) -> list[tuple[int, str]]:
     if not all_units and answer_text.strip():
         all_units.append((0, answer_text.strip()))
     return all_units
+
+
+_INLINE_CITATION_RE = re.compile(r"\[[A-Za-z]\d+\]")
+_INLINE_PAGE_RE = re.compile(r"\(\s*p\d+[^)]*\)", re.IGNORECASE)
+
+
+def _clean_text_for_display(text: str) -> str:
+    stripped = _strip_bullet_prefix(text)
+    cleaned = _INLINE_CITATION_RE.sub("", stripped)
+    cleaned = _INLINE_PAGE_RE.sub("", cleaned)
+    cleaned = _SPACE_RE.sub(" ", cleaned)
+    return cleaned.strip()
+
+
+def _should_use_bullets(question: str) -> bool:
+    q = (question or "").lower()
+    if not q:
+        return False
+    if any(neg in q for neg in _BULLET_NEGATION_HINTS):
+        return False
+    for hint in _BULLET_REQUEST_HINTS:
+        if hint == "list":
+            if re.search(r"\blist\b", q):
+                return True
+            continue
+        if hint in q:
+            return True
+    return False
+
+
+def _is_cjk_char(ch: str) -> bool:
+    if not ch:
+        return False
+    code = ord(ch)
+    return (
+        0x4E00 <= code <= 0x9FFF
+        or 0x3040 <= code <= 0x309F
+        or 0x30A0 <= code <= 0x30FF
+        or 0xAC00 <= code <= 0xD7AF
+    )
+
+
+def _join_sentences_for_display(sentences: list[str]) -> str:
+    if not sentences:
+        return ""
+    output = sentences[0]
+    for next_sentence in sentences[1:]:
+        prev_char = output[-1] if output else ""
+        next_char = next_sentence[0] if next_sentence else ""
+        separator = "" if (_is_cjk_char(prev_char) and _is_cjk_char(next_char)) else " "
+        output = f"{output}{separator}{next_sentence}"
+    return _repair_split_email_tokens(output)
+
+
+_SENTENCE_LIMIT_RE = re.compile(r"(\d+)\s*(?:sentences?|文)")
+
+
+def _sentence_limit_from_question(question: str) -> int | None:
+    match = _SENTENCE_LIMIT_RE.search(question or "")
+    if not match:
+        return None
+    try:
+        value = int(match.group(1))
+        return value if value > 0 else None
+    except Exception:
+        return None
+
+
+_INSUFFICIENT_TEMPLATES = {
+    "ja": [
+        "提示された資料からはご質問の内容を確認できませんでした。",
+        "追加の資料があれば共有してください。",
+    ],
+    "en": [
+        "I don't know based on the provided sources.",
+        "Please provide additional sources if available.",
+    ],
+}
+
+
+def _fallback_answer_units_for_insufficient_evidence(
+    question: str,
+) -> list[AnswerUnit]:
+    lang = "ja" if _is_japanese_text(question) else "en"
+    templates = _INSUFFICIENT_TEMPLATES[lang]
+    limit_raw = _sentence_limit_from_question(question) or 1
+    limit = max(1, limit_raw)
+    units: list[AnswerUnit] = []
+    for idx in range(limit):
+        template_idx = min(idx, len(templates) - 1)
+        units.append(AnswerUnit(text=templates[template_idx], citations=[]))
+    return units
+
+
+def _extract_query_tokens(question: str, limit: int = 12) -> list[str]:
+    if not question:
+        return []
+    tokens: list[str] = []
+    seen: set[str] = set()
+
+    def _add_token(token: str) -> None:
+        if token in seen or len(tokens) >= limit:
+            return
+        tokens.append(token)
+        seen.add(token)
+
+    for raw in _ASCII_TOKEN_RE.findall(question):
+        token = raw.strip("._-/").lower()
+        if len(token) < 2:
+            continue
+        if _is_generic_ascii_token(token):
+            continue
+        _add_token(token)
+        if len(tokens) >= limit:
+            return tokens
+    for raw in _CJK_TOKEN_RE.findall(question):
+        token = raw.strip()
+        if len(token) < 2:
+            continue
+        if _is_generic_cjk_token(token):
+            continue
+        _add_token(token)
+        if len(tokens) >= limit:
+            break
+    return tokens
+
+
+def _is_generic_ascii_token(token: str) -> bool:
+    if token in _GENERIC_ASCII_TOKENS:
+        return True
+    if token.replace(".", "", 1).isdigit():
+        return True
+    return False
+
+
+def _is_generic_cjk_token(token: str) -> bool:
+    if token in _GENERIC_CJK_TOKENS:
+        return True
+    is_kana_only = all(
+        0x3040 <= ord(ch) <= 0x309F or 0x30A0 <= ord(ch) <= 0x30FF for ch in token
+    )
+    if is_kana_only and len(token) <= 3:
+        return True
+    return False
+
+
+def _count_token_hits(tokens: list[str], text: str) -> tuple[int, float]:
+    if not tokens or not text:
+        return 0, 0.0
+    lowered = text.lower()
+    hits = 0
+    for token in tokens:
+        if not token:
+            continue
+        if token.isascii():
+            if token in lowered:
+                hits += 1
+        else:
+            if token in text:
+                hits += 1
+    ratio = hits / len(tokens)
+    return hits, ratio
+
+
+def _trim_units_for_sentence_request(
+    question: str, units: list[AnswerUnit]
+) -> list[AnswerUnit]:
+    limit = _sentence_limit_from_question(question or "")
+    if limit is None or limit <= 0 or limit >= len(units):
+        return units
+    trimmed = units[:limit]
+    if trimmed:
+        return trimmed
+    return units[:1] if units else []
+
+
+def _apply_offline_overlap_guard(
+    question: str,
+    units: list[AnswerUnit],
+    source_evidence: list[dict[str, Any]],
+    answerability: Answerability,
+    *,
+    offline_guard_enabled: bool,
+) -> Answerability:
+    if not offline_guard_enabled or not answerability.answerable:
+        return answerability
+    tokens = _extract_query_tokens(question)
+    if not tokens:
+        return answerability
+    combined_parts: list[str] = []
+    for unit in units or []:
+        if unit and unit.text:
+            combined_parts.append(unit.text)
+    if not combined_parts:
+        for evidence in source_evidence or []:
+            text = evidence.get("text")
+            if text:
+                combined_parts.append(text)
+    else:
+        for evidence in source_evidence or []:
+            text = evidence.get("text")
+            if text:
+                combined_parts.append(text)
+    if not combined_parts:
+        return answerability
+    combined_text = " ".join(combined_parts)
+    hits, ratio = _count_token_hits(tokens, combined_text)
+    if hits == 0 or ratio < _OVERLAP_RATIO_THRESHOLD:
+        return Answerability(
+            answerable=False,
+            reason_code="INSUFFICIENT_EVIDENCE",
+            reason_message="Question terms were not grounded in the offline evidence.",
+        )
+    return answerability
+
+
+def _build_display_answer(
+    question: str,
+    units: list[AnswerUnit],
+    fallback: str,
+    reason_code: str | None = None,
+) -> str:
+    if not units:
+        base = _clean_text_for_display(fallback or "")
+        if base:
+            return _repair_split_email_tokens(base)
+        return _fallback_unknown_message(question, reason_code)
+    cleaned_sentences = [
+        _clean_text_for_display(unit.text or "")
+        for unit in units
+        if unit and (unit.text or "").strip()
+    ]
+    cleaned_sentences = [sentence for sentence in cleaned_sentences if sentence]
+    cleaned_sentences = [_strip_key_facts_prefix(sentence) for sentence in cleaned_sentences]
+    cleaned_sentences = [sentence for sentence in cleaned_sentences if sentence]
+    if not cleaned_sentences:
+        base = _clean_text_for_display(fallback or "")
+        if base:
+            return _repair_split_email_tokens(base)
+        return _fallback_unknown_message(question, reason_code)
+    use_bullets = _should_use_bullets(question)
+    if not use_bullets:
+        cleaned_sentences = [
+            _clean_no_bullet_sentence(sentence) for sentence in cleaned_sentences
+        ]
+        cleaned_sentences = [sentence for sentence in cleaned_sentences if sentence]
+        if not cleaned_sentences:
+            base = _clean_text_for_display(fallback or "")
+            if base:
+                return _repair_split_email_tokens(base)
+            return _fallback_unknown_message(question, reason_code)
+    if use_bullets:
+        return "\n".join(f"- {sentence}" for sentence in cleaned_sentences)
+    joined = _join_sentences_for_display(cleaned_sentences)
+    if not use_bullets:
+        joined = _NO_BULLET_COLON_RE.sub(": ", joined)
+        joined = _INLINE_LIST_MARKER_RE.sub(r"\1", joined)
+    return joined
 
 
 def _normalize_for_match(text: str | None) -> str:
@@ -625,6 +1002,21 @@ def _apply_cannot_answer_override(
             reason_code="INSUFFICIENT_EVIDENCE",
             reason_message="Answer text indicated the evidence was insufficient.",
         )
+    return answerability
+
+
+def _apply_cannot_answer_override_from_units(
+    units: list[AnswerUnit], answerability: Answerability
+) -> Answerability:
+    if not answerability.answerable:
+        return answerability
+    for unit in units or []:
+        if unit and _is_cannot_answer_message(unit.text or ""):
+            return Answerability(
+                answerable=False,
+                reason_code="INSUFFICIENT_EVIDENCE",
+                reason_message="Answer text indicated the evidence was insufficient.",
+            )
     return answerability
 
 
@@ -3437,14 +3829,23 @@ def ask(
                     reason_code="INSUFFICIENT_EVIDENCE",
                     reason_message="Top retrieval results were below the relevance threshold.",
                 )
+                fallback_units = _fallback_answer_units_for_insufficient_evidence(
+                    payload.question or ""
+                )
+                fallback_answer = _build_display_answer(
+                    payload.question or "",
+                    fallback_units,
+                    "",
+                    reason_code="INSUFFICIENT_EVIDENCE",
+                )
                 resp = {
-                    "answer": _unknown_answer_text(payload.question or ""),
+                    "answer": fallback_answer,
                     "citations": citations_out,
                     "sources": source_evidence,
                     "run_id": effective_run_id,
                     "request_id": req_id,
                     "answerability": answerability,
-                    "answer_units": [],
+                    "answer_units": fallback_units,
                 }
                 included_retrieval_debug = include_debug
                 included_debug_meta = include_debug and debug_meta is not None
@@ -3675,15 +4076,41 @@ def ask(
             model=rewrite_model,
             gen=rewrite_gen,
         )
+        answer_units = _trim_units_for_sentence_request(
+            payload.question or "", answer_units
+        )
         answerability = determine_answerability(
             payload.question or "", source_evidence, answer_units
         )
+        answer = _build_display_answer(
+            payload.question or "",
+            answer_units,
+            answer,
+            reason_code=answerability.reason_code,
+        )
         answerability = _apply_cannot_answer_override(answer, answerability)
+        answerability = _apply_cannot_answer_override_from_units(
+            answer_units, answerability
+        )
+        answerability = _apply_offline_overlap_guard(
+            payload.question or "",
+            answer_units,
+            source_evidence,
+            answerability,
+            offline_guard_enabled=offline_mode or is_openai_offline(),
+        )
         citation_sources = used_sources
         preserve_answer_text = answer.strip().startswith("[NO_SOURCES]")
         if not answerability.answerable and not preserve_answer_text:
-            answer = _unknown_answer_text(payload.question or "")
-            answer_units = []
+            answer_units = _fallback_answer_units_for_insufficient_evidence(
+                payload.question or ""
+            )
+            answer = _build_display_answer(
+                payload.question or "",
+                answer_units,
+                "",
+                reason_code=answerability.reason_code,
+            )
             citation_sources = used_sources[:1] if used_sources else []
 
         citations_out = (

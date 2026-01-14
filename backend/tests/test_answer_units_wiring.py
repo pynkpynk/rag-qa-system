@@ -3,7 +3,12 @@ import json
 from app.api.routes import chat as chat_module
 from app.api.routes.chat import (
     _apply_cannot_answer_override,
+    _apply_cannot_answer_override_from_units,
+    _apply_offline_overlap_guard,
+    _build_display_answer,
+    _fallback_answer_units_for_insufficient_evidence,
     _maybe_localize_summary_answer,
+    _trim_units_for_sentence_request,
     build_answer_units_for_response,
     determine_answerability,
     inline_annotation_from_refs,
@@ -227,6 +232,229 @@ def test_missing_info_without_cannot_signal_does_not_flip():
         "資料には記述が含まれていませんが、他の情報を確認してください。", answerability
     )
     assert updated.answerable is True
+
+
+def test_unit_level_override_triggers_for_cannot_answer_message():
+    units = [
+        AnswerUnit(
+            text="提供された資料にはTLSの最小バージョンに関する記載がないため、ここからはわかりません。",
+            citations=[
+                AnswerUnitEvidenceRef(
+                    source_id="S1",
+                    page=1,
+                    line_start=5,
+                    line_end=10,
+                    filename="alpha.pdf",
+                    document_id="doc-1",
+                )
+            ],
+        )
+    ]
+    answerability = determine_answerability("question", _sample_evidence(), units)
+    assert answerability.answerable is True
+    updated = _apply_cannot_answer_override_from_units(units, answerability)
+    assert updated.answerable is False
+    assert updated.reason_code == "INSUFFICIENT_EVIDENCE"
+
+
+def test_unit_level_override_does_not_flip_for_missing_only():
+    units = [
+        AnswerUnit(
+            text="資料にはTLSの最小バージョンは記載されていません。",
+            citations=[
+                AnswerUnitEvidenceRef(
+                    source_id="S1",
+                    page=1,
+                    line_start=5,
+                    line_end=10,
+                    filename="alpha.pdf",
+                    document_id="doc-1",
+                )
+            ],
+        )
+    ]
+    answerability = determine_answerability("question", _sample_evidence(), units)
+    assert answerability.answerable is True
+    updated = _apply_cannot_answer_override_from_units(units, answerability)
+    assert updated.answerable is True
+
+
+def test_offline_lexical_guard_marks_insufficient_when_no_overlap():
+    question = "TLS minimum version and audit log retention"
+    units = [
+        AnswerUnit(
+            text="Completely unrelated control summary.",
+            citations=[
+                AnswerUnitEvidenceRef(
+                    source_id="S1",
+                    page=1,
+                    line_start=5,
+                    line_end=10,
+                    filename="alpha.pdf",
+                    document_id="doc-1",
+                )
+            ],
+        )
+    ]
+    answerability = determine_answerability(question, _sample_evidence(), units)
+    assert answerability.answerable is True
+    updated = _apply_offline_overlap_guard(
+        question,
+        units,
+        _sample_evidence(),
+        answerability,
+        offline_guard_enabled=True,
+    )
+    assert updated.answerable is False
+    assert updated.reason_code == "INSUFFICIENT_EVIDENCE"
+
+
+def test_no_bullet_display_removes_key_facts_and_inline_bullets():
+    question = "2文で教えて。箇条書き禁止。"
+    units = [
+        AnswerUnit(text="Key facts: - Foo detail.", citations=[]),
+        AnswerUnit(text="- Bar insight.", citations=[]),
+    ]
+    display = _build_display_answer(question, units, "")
+    assert "Key facts" not in display
+    assert "- Foo" not in display
+    assert "- Bar" not in display
+
+
+def test_insufficient_fallback_units_follow_sentence_limit_no_bullets():
+    question = "TLS最小バージョンと監査ログ保持を2文で。箇条書き禁止。"
+    units = [
+        AnswerUnit(
+            text="Informative references for the CSF are listed.",
+            citations=[
+                AnswerUnitEvidenceRef(
+                    source_id="S1",
+                    page=1,
+                    line_start=5,
+                    line_end=8,
+                    filename="alpha.pdf",
+                    document_id="doc-1",
+                )
+            ],
+        )
+    ]
+    answerability = determine_answerability(question, _sample_evidence(), units)
+    display = _build_display_answer(question, units, "")
+    assert display
+    guarded = _apply_offline_overlap_guard(
+        question,
+        units,
+        _sample_evidence(),
+        answerability,
+        offline_guard_enabled=True,
+    )
+    assert guarded.answerable is False
+    fallback_units = _fallback_answer_units_for_insufficient_evidence(question)
+    assert len(fallback_units) == 2
+    assert all(not unit.citations for unit in fallback_units)
+    fallback_answer = _build_display_answer(
+        question, fallback_units, "", reason_code=guarded.reason_code
+    )
+    assert fallback_answer != "不明"
+    assert not fallback_answer.strip().startswith("-")
+
+
+def test_offline_guard_filters_generic_tokens_with_no_overlap():
+    question = "CSFを一律適用する必要はありますか？箇条書き禁止。1文で。"
+    units = [
+        AnswerUnit(
+            text="Informative references for the CSF are listed.",
+            citations=[
+                AnswerUnitEvidenceRef(
+                    source_id="S1",
+                    page=1,
+                    line_start=5,
+                    line_end=8,
+                    filename="alpha.pdf",
+                    document_id="doc-1",
+                )
+            ],
+        )
+    ]
+    answerability = determine_answerability(question, _sample_evidence(), units)
+    guarded = _apply_offline_overlap_guard(
+        question,
+        units,
+        _sample_evidence(),
+        answerability,
+        offline_guard_enabled=True,
+    )
+    assert guarded.answerable is False
+
+
+def test_display_answer_strips_bullets_and_markers():
+    units = [
+        AnswerUnit(text="- First point [S1] (p2)", citations=[]),
+        AnswerUnit(text="- Second point [S2]", citations=[]),
+    ]
+    result = _build_display_answer("question", units, "- fallback [S1]")
+    assert result == "First point Second point"
+
+
+def test_sentence_limit_request_trims_units_and_answer():
+    units = [
+        AnswerUnit(text="Sentence one.", citations=[]),
+        AnswerUnit(text="Sentence two.", citations=[]),
+        AnswerUnit(text="Sentence three.", citations=[]),
+    ]
+    trimmed = _trim_units_for_sentence_request("Please answer in 2 sentences", units)
+    assert len(trimmed) == 2
+    display = _build_display_answer("Please answer in 2 sentences", trimmed, "")
+    assert "Sentence three" not in display
+
+
+def test_bullet_request_keeps_bullet_formatting():
+    units = [
+        AnswerUnit(text="Alpha insight.", citations=[]),
+        AnswerUnit(text="Beta insight.", citations=[]),
+    ]
+    display = _build_display_answer("Provide bullet list", units, "")
+    assert display.startswith("- ")
+    assert "\n" in display
+
+
+def test_no_bullet_request_with_sentence_limit_keeps_units():
+    question = "Please answer in 2 sentences, no bullet points."
+    answer = "- TLS minimum [S1]\n- Audit logging retention [S2]"
+    evidence = _sample_evidence()
+    units = build_answer_units_for_response(answer, evidence)
+    trimmed = _trim_units_for_sentence_request(question, units)
+    assert len(trimmed) >= 1
+    answerability = determine_answerability(question, evidence, trimmed)
+    display = _build_display_answer(
+        question, trimmed, answer, reason_code=answerability.reason_code
+    )
+    assert not display.startswith("-")
+    assert len(trimmed) == 2
+
+
+def test_trim_units_never_returns_empty_when_limit_positive(monkeypatch):
+    monkeypatch.setattr(
+        chat_module, "_sentence_limit_from_question", lambda _q: 1
+    )
+    units = [
+        AnswerUnit(text="Sentence one.", citations=[]),
+        AnswerUnit(text="Sentence two.", citations=[]),
+    ]
+    trimmed = _trim_units_for_sentence_request("ignored", units)
+    assert len(trimmed) == 1
+
+
+def test_display_answer_uses_cleaned_fallback_when_units_missing():
+    display = _build_display_answer("question", [], "- Fallback [S1]")
+    assert display == "Fallback"
+
+
+def test_display_answer_returns_reason_message_when_empty():
+    message = _build_display_answer(
+        "提供された資料からは？", [], "", reason_code="INSUFFICIENT_EVIDENCE"
+    )
+    assert message == "提示された資料からは確認できません。"
 
 
 def test_sentence_splitting_assigns_evidence_en():
