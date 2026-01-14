@@ -549,76 +549,166 @@ export default function HomeClient() {
     if (typeof page !== "number" || page <= 0) return null;
     const start = ref.line_start;
     const end = ref.line_end;
+    const prefix = ref.source_id ? `${ref.source_id} ` : "";
     if (
       typeof start === "number" &&
       typeof end === "number" &&
       start > 0 &&
       end >= start
     ) {
-      return `p${page} L${start}–${end}`;
+      return `${prefix}p${page} L${start}–${end}`;
     }
-    return `p${page}`;
+    return `${prefix}p${page}`;
+  }
+
+  function resolveDocumentId(ref: AnswerUnitEvidenceRef): string | null {
+    if (ref.document_id) return ref.document_id;
+    const sources = latestAssistant?.sources || [];
+    if (ref.source_id) {
+      const match = sources.find((src) => src.source_id === ref.source_id);
+      if (match?.document_id) return match.document_id || null;
+    }
+    if (ref.chunk_id) {
+      const match = sources.find((src) => src.chunk_id === ref.chunk_id);
+      if (match?.document_id) return match.document_id || null;
+    }
+    return null;
   }
 
   function handleAnswerUnitPreview(ref: AnswerUnitEvidenceRef, label?: string) {
-    const docId = ref.document_id || null;
+    const docId = resolveDocumentId(ref);
     const page = ref.page ?? null;
+    if (!docId) return;
     triggerPreview(docId, page, label || ref.source_id || "Evidence preview");
   }
 
-  function renderAssistantContent(msg: ChatMessage): ReactNode {
+  function looksLikeBulletList(text: string): boolean {
+    return /^\s*([-*•]|[\d]+[.)])\s+/m.test(text);
+  }
+
+  function stripInlineCitations(text: string): string {
+    return text
+      .replace(/\[[A-Za-z]\d+\]/g, "")
+      .replace(/\(\s*p\d+[^)]*\)/gi, "")
+      .trim();
+  }
+
+  function cleanUnitText(raw: string): string {
+    const withoutBullet = raw.replace(/^\s*(?:[-*•]|[\d]+[.)])\s+/, "");
+    return stripInlineCitations(withoutBullet);
+  }
+
+  function isCJK(char: string): boolean {
+    if (!char) return false;
+    const code = char.charCodeAt(0);
+    return (
+      (code >= 0x4e00 && code <= 0x9fff) ||
+      (code >= 0x3040 && code <= 0x309f) ||
+      (code >= 0x30a0 && code <= 0x30ff) ||
+      (code >= 0xac00 && code <= 0xd7af)
+    );
+  }
+
+  function joinSentences(sentences: string[]): string {
+    if (sentences.length === 0) return "";
+    let result = sentences[0];
+    for (let i = 1; i < sentences.length; i++) {
+      const prev = result[result.length - 1] || "";
+      const next = sentences[i][0] || "";
+      const separator = isCJK(prev) && isCJK(next) ? "" : " ";
+      result = `${result}${separator}${sentences[i]}`;
+    }
+    return result;
+  }
+
+  function buildDisplayAnswer(msg: ChatMessage): string {
+    const content = (msg.content || "").trim();
     const units = msg.answerUnits || [];
-    if (units.length === 0) {
-      return msg.content;
+    if (content && !looksLikeBulletList(content)) {
+      return content;
+    }
+    if ((units || []).length > 0) {
+      const sentences = units
+        .map((unit) => cleanUnitText(unit.text || ""))
+        .filter((text) => text);
+      const combined = sentences.length ? joinSentences(sentences) : "";
+      if (combined) return combined;
+    }
+    return content;
+  }
+
+  function renderEvidenceList(units: AnswerUnit[] | null | undefined): ReactNode {
+    if (!units || units.length === 0) {
+      return (
+        <p style={{ color: "#94a3b8", fontSize: "0.85rem" }}>
+          No supporting sentences available.
+        </p>
+      );
     }
     return (
       <ul
         style={{
-          listStyle: "disc",
-          paddingLeft: "1.25rem",
+          listStyle: "none",
+          paddingLeft: 0,
           margin: 0,
           display: "flex",
           flexDirection: "column",
-          gap: "0.45rem",
+          gap: "0.6rem",
         }}
       >
-        {units.map((unit, idx) => {
-          const primaryRef = unit.citations?.[0] || null;
-          const chipLabel = formatAnnotationChip(primaryRef);
-          return (
-            <li key={`${msg.id}-unit-${idx}`}>
-              <div
-                style={{
-                  display: "flex",
-                  flexDirection: "column",
-                  gap: "0.3rem",
-                }}
-              >
-                <span style={{ color: "#e2e8f0" }}>{unit.text}</span>
-                {chipLabel && primaryRef && (
-                  <button
-                    type="button"
-                    onClick={() =>
-                      handleAnswerUnitPreview(primaryRef, unit.text)
-                    }
-                    style={{
-                      borderRadius: "999px",
-                      border: "1px solid #334155",
-                      background: "rgba(56,189,248,0.15)",
-                      color: "#38bdf8",
-                      fontSize: "0.75rem",
-                      padding: "0.1rem 0.5rem",
-                      alignSelf: "flex-start",
-                      cursor: "pointer",
-                    }}
-                  >
-                    {chipLabel}
-                  </button>
-                )}
-              </div>
-            </li>
-          );
-        })}
+        {units.map((unit, idx) => (
+          <li
+            key={`${unit.text}-${idx}`}
+            style={{ display: "flex", flexDirection: "column", gap: "0.35rem" }}
+          >
+            <span style={{ color: "#e2e8f0" }}>{unit.text}</span>
+            <div
+              style={{
+                display: "flex",
+                gap: "0.35rem",
+                flexWrap: "wrap",
+              }}
+            >
+              {(unit.citations || []).length === 0 ? (
+                <span style={{ color: "#94a3b8", fontSize: "0.75rem" }}>
+                  No supporting citation
+                </span>
+              ) : (
+                unit.citations!.map((ref, refIdx) => {
+                  const label = formatAnnotationChip(ref);
+                  const docId = ref ? resolveDocumentId(ref) : null;
+                  return (
+                    <button
+                      key={`${idx}-${refIdx}`}
+                      type="button"
+                      aria-label={
+                        label ? `View cited evidence ${label}` : "Evidence preview unavailable"
+                      }
+                      disabled={!ref || !label || !docId}
+                      onClick={() =>
+                        ref && label && docId
+                          ? handleAnswerUnitPreview(ref, unit.text)
+                          : undefined
+                      }
+                      style={{
+                        borderRadius: "999px",
+                        border: "1px solid #334155",
+                        background:
+                          label && docId ? "rgba(56,189,248,0.15)" : "transparent",
+                        color: label && docId ? "#38bdf8" : "#475569",
+                        fontSize: "0.75rem",
+                        padding: "0.1rem 0.5rem",
+                        cursor: label && docId ? "pointer" : "not-allowed",
+                      }}
+                    >
+                      {label || "No page info"}
+                    </button>
+                  );
+                })
+              )}
+            </div>
+          </li>
+        ))}
       </ul>
     );
   }
@@ -874,11 +964,31 @@ export default function HomeClient() {
                         borderRadius: "8px",
                         marginTop: "0.25rem",
                         whiteSpace: "pre-wrap",
+                        display: "flex",
+                        flexDirection: "column",
+                        gap: "0.6rem",
                       }}
                     >
-                      {msg.role === "assistant"
-                        ? renderAssistantContent(msg)
-                        : msg.content}
+                      {msg.role === "assistant" ? (
+                        <>
+                          <div>
+                            <strong style={{ display: "block", marginBottom: "0.35rem" }}>
+                              Answer
+                            </strong>
+                            <p style={{ margin: 0, color: "#e2e8f0" }}>
+                              {buildDisplayAnswer(msg)}
+                            </p>
+                          </div>
+                          <div>
+                            <strong style={{ display: "block", marginBottom: "0.35rem" }}>
+                              Evidence
+                            </strong>
+                            {renderEvidenceList(msg.answerUnits || [])}
+                          </div>
+                        </>
+                      ) : (
+                        msg.content
+                      )}
                     </div>
                   </div>
                 ))}
@@ -997,12 +1107,16 @@ export default function HomeClient() {
                       {answerability.reason_message ||
                         (answerability.answerable
                           ? "Answer is supported by cited sources."
-                          : "Evidence is insufficient for this question.")}
-                    </small>
-                  </div>
-                  {!answerability.answerable &&
-                    (answerability.suggested_followups || []).length > 0 && (
-                      <div
+                          : answerability.reason_code === "NO_SOURCES"
+                          ? "No supporting sources were found for this answer."
+                          : answerability.reason_code === "INSUFFICIENT_EVIDENCE"
+                          ? "The provided sources don’t contain enough information."
+                          : "This answer may need clarification or additional sources.")}
+                  </small>
+                </div>
+                {!answerability.answerable &&
+                  (answerability.suggested_followups || []).length > 0 && (
+                    <div
                         style={{
                           display: "flex",
                           gap: "0.4rem",
@@ -1027,8 +1141,8 @@ export default function HomeClient() {
                             {item}
                           </button>
                         ))}
-                      </div>
-                    )}
+                    </div>
+                  )}
                 </div>
               )}
               <div>
