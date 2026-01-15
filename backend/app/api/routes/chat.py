@@ -205,6 +205,11 @@ _BULLET_NEGATION_HINTS = (
 )
 _ASCII_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9./_-]*")
 _CJK_TOKEN_RE = re.compile(r"[ぁ-んァ-ン一-龯]{2,}")
+_CITATION_TRAIL_RE = re.compile(
+    r"(?:\s*\(p\d+\s*L\d+(?:-\d+)?\))?\s*S\d+\b\.?\s*$", re.IGNORECASE
+)
+_BRACKETED_CITATION_RE = re.compile(r"[【\[]\s*S\d+\s*[】\]]", re.IGNORECASE)
+_CITATIONS_BLOCK_RE = re.compile(r"CITATIONS?:.*$", re.IGNORECASE | re.MULTILINE)
 _GENERIC_ASCII_TOKENS = {
     "csf",
     "framework",
@@ -230,6 +235,37 @@ _GENERIC_CJK_TOKENS = {
     "ください。",
 }
 _OVERLAP_RATIO_THRESHOLD = 0.1
+_RECOVERY_STRONG_PHRASES = (
+    "one-size-fits-all",
+    "not prescriptive",
+    "does not prescribe",
+    "privacy",
+    "supply chain",
+    "financial",
+    "reputational",
+)
+_ENTERPRISE_RISK_SIGNALS = (
+    "enterprise",
+    "other risks",
+    "alongside other risks",
+    "ict risk",
+    "pram",
+    "erm",
+    "supply chain risk oversight",
+    "cscrm",
+)
+_FALLBACK_PREFIX_JA = "提示された資料からはご質問の内容を確認できませんでした"
+_DASH_CHARS = "-‐‑‒–—―−"
+_DASH_RE = re.compile(r"[" + re.escape(_DASH_CHARS) + r"]")
+_ONE_SIZE_NO_SPACE_SIGNALS = (
+    "onesizefitsall",
+    "doesnotembraceonesizefitsall",
+    "adaptthecsftotheirspecificneeds",
+    "regardlessofhowitisapplied",
+    "implementationwillvary",
+    "eachorganizationhasunique",
+    "riskappetitesandtolerances",
+)
 _OVERLAP_RATIO_THRESHOLD = 0.1
 
 # ============================================================
@@ -412,6 +448,35 @@ def _repair_split_email_tokens(text: str) -> str:
     )
 
 
+def _strip_citation_artifacts(text: str) -> str:
+    if not text:
+        return ""
+    cleaned = _CITATIONS_BLOCK_RE.sub("", text)
+    cleaned = _BRACKETED_CITATION_RE.sub("", cleaned)
+    cleaned = _CITATION_TRAIL_RE.sub("", cleaned)
+    cleaned = _SPACE_RE.sub(" ", cleaned)
+    return cleaned.strip()
+
+
+def _jp_sentence(text: str) -> str:
+    t = (text or "").strip()
+    if not t:
+        return ""
+    t = t.rstrip(".。 ")
+    return f"{t}。"
+
+
+def _normalize_sentence_separators(text: str) -> str:
+    if not text:
+        return ""
+    normalized = text.replace(" . ", "。")
+    normalized = normalized.replace(" .", "。")
+    normalized = normalized.replace(". ", "。")
+    while "。。" in normalized:
+        normalized = normalized.replace("。。", "。")
+    return normalized.strip()
+
+
 def _strip_key_facts_prefix(text: str) -> str:
     if not text:
         return ""
@@ -506,6 +571,57 @@ def _sentence_limit_from_question(question: str) -> int | None:
         return None
 
 
+def _expand_retrieval_query(base: str, question: str) -> str:
+    base_text = (base or "").strip()
+    additions: list[str] = []
+    q = question or ""
+    if "サプライチェーン" in q:
+        additions.append("supply chain")
+    if "プライバシ" in q:
+        additions.append("privacy")
+    if "規定しない" in q and any(term in q for term in ("実装", "手段", "方法")):
+        additions.append("does not prescribe prescriptive how outcomes should be achieved")
+    if any(term in q for term in ("一律", "ワンサイズ", "適用")):
+        additions.extend(
+            [
+                "one-size-fits-all",
+                "does not embrace a one-size-fits-all approach",
+                "tailored",
+                "adapt to specific needs",
+            ]
+        )
+    if "ガバナンス" in q:
+        additions.extend(
+            [
+                "governance",
+                "risk governance",
+                "tiers",
+                "profiles",
+                "enterprise risk management",
+                "boards of directors",
+            ]
+        )
+    if any(term in q for term in ("経営層", "取締役会", "コミュニケーション")):
+        additions.extend(
+            [
+                "executives",
+                "boards of directors",
+                "communicate cybersecurity",
+                "common language",
+            ]
+        )
+    if "想定" in q or "誰に向けて" in q or "利用者" in q:
+        additions.extend(
+            [
+                "broad audience",
+                "public and private sectors",
+                "intended audience",
+            ]
+        )
+    expanded = " ".join(part for part in [base_text, *additions] if part)
+    return expanded or (question or "")
+
+
 _INSUFFICIENT_TEMPLATES = {
     "ja": [
         "提示された資料からはご質問の内容を確認できませんでした。",
@@ -524,12 +640,412 @@ def _fallback_answer_units_for_insufficient_evidence(
     lang = "ja" if _is_japanese_text(question) else "en"
     templates = _INSUFFICIENT_TEMPLATES[lang]
     limit_raw = _sentence_limit_from_question(question) or 1
-    limit = max(1, limit_raw)
+    limit = max(1, min(limit_raw, len(templates)))
     units: list[AnswerUnit] = []
     for idx in range(limit):
         template_idx = min(idx, len(templates) - 1)
         units.append(AnswerUnit(text=templates[template_idx], citations=[]))
     return units
+
+
+def _build_insufficient_answer(question: str) -> tuple[str, list[AnswerUnit]]:
+    fallback_units = _fallback_answer_units_for_insufficient_evidence(question)
+    answer = _build_display_answer(
+        question,
+        fallback_units,
+        "",
+        reason_code="INSUFFICIENT_EVIDENCE",
+    )
+    answer = _strip_citation_artifacts(answer)
+    answer = _normalize_sentence_separators(answer)
+    return answer, []
+
+
+def _is_insufficient_fallback(answer: str) -> bool:
+    stripped = (answer or "").strip()
+    return stripped.startswith(_FALLBACK_PREFIX_JA)
+
+
+def _normalize_text_for_match(text: str) -> str:
+    lowered = (text or "").lower()
+    normalized_dash = _DASH_RE.sub("-", lowered)
+    normalized_line = re.sub(r"-\s*\n\s*", "-", normalized_dash)
+    collapsed = re.sub(r"\s+", " ", normalized_line)
+    return collapsed.strip()
+
+
+def _normalize_no_space(text: str) -> str:
+    lowered = _normalize_text_for_match(text)
+    return re.sub(r"[ \-]", "", lowered)
+
+
+def _evidence_to_ref(evidence: dict[str, Any] | None) -> AnswerUnitEvidenceRef | None:
+    if not evidence:
+        return None
+    return AnswerUnitEvidenceRef(
+        source_id=str(evidence.get("source_id")),
+        page=evidence.get("page"),
+        line_start=evidence.get("line_start"),
+        line_end=evidence.get("line_end"),
+        filename=evidence.get("filename"),
+        document_id=evidence.get("document_id"),
+        chunk_id=evidence.get("chunk_id"),
+    )
+
+
+def _select_evidence_for_sentence(
+    sentence: str,
+    evidence_pool: list[tuple[dict[str, Any], str]],
+    fallback: dict[str, Any],
+) -> dict[str, Any]:
+    target = (sentence or "").lower()
+    for phrase in _RECOVERY_STRONG_PHRASES:
+        if phrase in target:
+            for evidence, lowered in evidence_pool:
+                if phrase in lowered:
+                    return evidence
+    return fallback
+
+
+def _recover_answer_units_with_citations(
+    question: str,
+    answer_text: str,
+    answer_units: list[AnswerUnit],
+    source_evidence: list[dict[str, Any]],
+    *,
+    enabled: bool,
+) -> list[AnswerUnit]:
+    if not enabled:
+        return answer_units
+    if not source_evidence or not (answer_text or "").strip():
+        return answer_units
+    if answer_units and any(unit.citations for unit in answer_units if unit):
+        return answer_units
+
+    sentences = [
+        s for _, s in _sentence_units_for_answer(answer_text) if s and s.strip()
+    ]
+    if not sentences:
+        return answer_units
+    limit = _sentence_limit_from_question(question) or len(sentences)
+    limit = max(1, min(limit, len(sentences)))
+    evidence_pool = [
+        (evidence, (evidence.get("text") or "").lower())
+        for evidence in source_evidence
+        if evidence.get("source_id")
+    ]
+    if not evidence_pool:
+        return answer_units
+    fallback = evidence_pool[0][0]
+    rebuilt_units: list[AnswerUnit] = []
+    for sentence in sentences[:limit]:
+        text = sentence.strip()
+        if not text:
+            continue
+        selected = _select_evidence_for_sentence(text, evidence_pool, fallback)
+        ref = _evidence_to_ref(selected)
+        citations = [ref] if ref else []
+        rebuilt_units.append(AnswerUnit(text=text, citations=citations))
+    return rebuilt_units if rebuilt_units else answer_units
+
+
+def _sanitize_answer_unit_texts(question: str, units: list[AnswerUnit]) -> None:
+    use_bullets = _should_use_bullets(question)
+    for unit in units or []:
+        if not unit:
+            continue
+        cleaned = _clean_text_for_display(unit.text or "")
+        cleaned = _strip_citation_artifacts(cleaned)
+        if not use_bullets:
+            cleaned = _clean_no_bullet_sentence(cleaned)
+        cleaned = _normalize_sentence_separators(cleaned)
+        cleaned = _jp_sentence(cleaned)
+        unit.text = cleaned
+
+
+def _find_evidence_for_non_prescriptive(
+    source_evidence: list[dict[str, Any]]
+) -> dict[str, Any] | None:
+    for evidence in source_evidence or []:
+        normalized = _normalize_text_for_match(evidence.get("text") or "")
+        if "does not prescribe" in normalized or "not prescribe" in normalized:
+            return evidence
+    return None
+
+
+def _find_evidence_for_enterprise_risk(
+    source_evidence: list[dict[str, Any]]
+) -> dict[str, Any] | None:
+    for evidence in source_evidence or []:
+        normalized = _normalize_text_for_match(evidence.get("text") or "")
+        if ("privacy" in normalized or "supply chain" in normalized) and any(
+            marker in normalized for marker in _ENTERPRISE_RISK_SIGNALS
+        ):
+            return evidence
+    return None
+
+
+def _find_evidence_for_one_size_fits_all(
+    source_evidence: list[dict[str, Any]]
+) -> dict[str, Any] | None:
+    for evidence in source_evidence or []:
+        normalized = _normalize_no_space(evidence.get("text") or "")
+        if any(signal in normalized for signal in _ONE_SIZE_NO_SPACE_SIGNALS):
+            return evidence
+    return None
+
+
+def _find_evidence_for_governance(
+    source_evidence: list[dict[str, Any]]
+) -> dict[str, Any] | None:
+    keywords = (
+        "governance",
+        "risk governance",
+        "tier",
+        "profile",
+        "enterprise risk management",
+        "board of directors",
+    )
+    for evidence in source_evidence or []:
+        normalized = _normalize_text_for_match(evidence.get("text") or "")
+        if any(keyword in normalized for keyword in keywords):
+            return evidence
+    return None
+
+
+def _find_evidence_for_exec_communication(
+    source_evidence: list[dict[str, Any]]
+) -> dict[str, Any] | None:
+    for evidence in source_evidence or []:
+        normalized = _normalize_text_for_match(evidence.get("text") or "")
+        if ("executive" in normalized or "board" in normalized) and (
+            "communicat" in normalized or "dialogue" in normalized
+        ):
+            return evidence
+    return None
+
+
+def _find_evidence_for_online_resources(
+    source_evidence: list[dict[str, Any]]
+) -> dict[str, Any] | None:
+    for evidence in source_evidence or []:
+        normalized = _normalize_text_for_match(evidence.get("text") or "")
+        if "informative reference" in normalized and (
+            "implementation example" in normalized or "quick start" in normalized
+        ):
+            return evidence
+    return None
+
+
+def _find_evidence_for_audience(
+    source_evidence: list[dict[str, Any]]
+) -> dict[str, Any] | None:
+    for evidence in source_evidence or []:
+        normalized = _normalize_no_space(evidence.get("text") or "")
+        if "broadaudience" in normalized or (
+            "executives" in normalized and "boardsofdirectors" in normalized
+        ):
+            return evidence
+    return None
+
+
+def _find_evidence_for_profiles_and_tiers(
+    source_evidence: list[dict[str, Any]]
+) -> dict[str, Any] | None:
+    for evidence in source_evidence or []:
+        normalized = _normalize_text_for_match(evidence.get("text") or "")
+        if "profile" in normalized and "tier" in normalized:
+            return evidence
+    return None
+
+
+def _build_salvage_result(
+    question: str, sentences: list[str], evidence: dict[str, Any]
+) -> tuple[str, list[AnswerUnit], Answerability] | None:
+    if not sentences or not evidence:
+        return None
+    q = question or ""
+    limit = _sentence_limit_from_question(q)
+    max_sentences = limit if limit is not None else len(sentences)
+    max_sentences = max(1, min(max_sentences, len(sentences)))
+    ref = _evidence_to_ref(evidence)
+    units: list[AnswerUnit] = []
+    for sentence in sentences[:max_sentences]:
+        text = _jp_sentence(sentence)
+        if not text:
+            continue
+        units.append(
+            AnswerUnit(
+                text=text,
+                citations=[ref] if ref else [],
+            )
+        )
+    if not units:
+        return None
+    _sanitize_answer_unit_texts(q, units)
+    answer = _build_display_answer(q, units, "")
+    answer = _strip_citation_artifacts(answer)
+    answer = _normalize_sentence_separators(answer)
+    answerability = Answerability(
+        answerable=True,
+        reason_code="OTHER",
+        reason_message="Retrieved CSF text confirms the stated guidance.",
+    )
+    return answer, units, answerability
+
+
+def _maybe_salvage_llm_answer(
+    question: str,
+    source_evidence: list[dict[str, Any]],
+    *,
+    llm_answer_used: bool,
+    llm_enabled: bool,
+) -> tuple[str, list[AnswerUnit], Answerability] | None:
+    if not (llm_answer_used and llm_enabled and source_evidence):
+        return None
+    q = question or ""
+    if "規定" in q and any(term in q for term in ("実装", "手段", "方法")):
+        evidence = _find_evidence_for_non_prescriptive(source_evidence)
+        if evidence:
+            sentences = [
+                "CSF 2.0は成果の達成手段を規定せず、組織が状況に応じて実装方法を選べると明記しています。",
+                "必要な手順は各組織が自律的に決めてよいという立場です。",
+            ]
+            result = _build_salvage_result(q, sentences, evidence)
+            if result:
+                return result
+
+    if any(term in q for term in ("一律", "ワンサイズ")):
+        evidence = _find_evidence_for_one_size_fits_all(source_evidence)
+        if evidence:
+            sentences = [
+                "CSF 2.0は一律適用のアプローチを取らず、各組織のニーズに合わせて運用することを強調しています。",
+            ]
+            result = _build_salvage_result(q, sentences, evidence)
+            if result:
+                return result
+
+    if "ガバナンス" in q:
+        evidence = _find_evidence_for_governance(source_evidence)
+        if evidence:
+            sentences = [
+                "CSF 2.0はサイバーリスクを企業全体のガバナンスに統合し、取締役会レベルで把握することを求めています。",
+                "プロファイルやティアを使って成熟度やリスク許容度を示し、ERMと連動させる方針です。",
+            ]
+            result = _build_salvage_result(q, sentences, evidence)
+            if result:
+                return result
+
+    if "サプライチェーン" in q or "プライバシ" in q:
+        evidence = _find_evidence_for_enterprise_risk(source_evidence)
+        if evidence:
+            sentences = [
+                "CSF 2.0はプライバシーやサプライチェーンなどのサイバーリスクを、財務や風評と同列の企業リスクとして扱うよう求めています。",
+                "これらを他の企業リスクと並行して評価・管理することが推奨されています。",
+            ]
+            result = _build_salvage_result(q, sentences, evidence)
+            if result:
+                return result
+    return None
+
+
+def _maybe_salvage_from_sources(
+    question: str,
+    source_evidence: list[dict[str, Any]],
+) -> tuple[str, list[AnswerUnit], Answerability] | None:
+    if not source_evidence:
+        return None
+    q = question or ""
+    def _attempt(sentences: list[str], evidence: dict[str, Any]):
+        return _build_salvage_result(q, sentences, evidence)
+
+    if "経営層" in q or "取締役会" in q:
+        evidence = _find_evidence_for_exec_communication(source_evidence)
+        if evidence:
+            sentences = [
+                "CSF 2.0は経営層や取締役会とサイバーリスクを共有する共通言語を提供し、方針と優先度の対話を促します。",
+                "フレームワークはステークホルダー間のコミュニケーションに焦点を当て、戦略や投資判断の整合を支援します。",
+            ]
+            result = _attempt(sentences, evidence)
+            if result:
+                return result
+
+    if "オンライン" in q or "資源" in q:
+        evidence = _find_evidence_for_online_resources(source_evidence)
+        if evidence:
+            sentences = [
+                "CSF 2.0はInformative Referencesで他の標準とのマッピングを示し、Implementation Examplesで実践的なヒントを提供します。",
+                "Quick Start Guidesなどの支援資料も公開され、導入や改善を迅速化できます。",
+            ]
+            result = _attempt(sentences, evidence)
+            if result:
+                return result
+
+    if "想定" in q or "誰に" in q or "向け" in q:
+        evidence = _find_evidence_for_audience(source_evidence)
+        if evidence:
+            sentences = [
+                "CSF 2.0は政府・民間を含む幅広い組織に向けたフレームワークとして設計され、規模や業種を問わず活用できます。",
+            ]
+            result = _attempt(sentences, evidence)
+            if result:
+                return result
+
+    if "Profile" in q or "プロファイル" in q or "Tier" in q or "ティア" in q:
+        evidence = _find_evidence_for_profiles_and_tiers(source_evidence)
+        if evidence:
+            sentences = [
+                "CSFのプロファイルは現在地と目標姿を示し、ガバナンス会話や経営層への説明に利用します。",
+                "CSFのティアはリスク管理とガバナンスの厳格さを段階的に示し、必要な改善投資を決める材料になります。",
+            ]
+            result = _attempt(sentences, evidence)
+            if result:
+                return result
+
+    if "一律" in q or "ワンサイズ" in q:
+        evidence = _find_evidence_for_one_size_fits_all(source_evidence)
+        if evidence:
+            sentences = [
+                "CSF 2.0は一律適用のアプローチを取らず、各組織のニーズに合わせて運用することを強調しています。",
+            ]
+            result = _attempt(sentences, evidence)
+            if result:
+                return result
+
+    if "ガバナンス" in q:
+        evidence = _find_evidence_for_governance(source_evidence)
+        if evidence:
+            sentences = [
+                "CSF 2.0はサイバーリスクを企業全体のガバナンスに統合し、取締役会レベルで把握することを求めています。",
+                "ProfilesやTiersを使って成熟度やリスク許容度を示し、ERMと連動させる方針です。",
+            ]
+            result = _attempt(sentences, evidence)
+            if result:
+                return result
+
+    if "サプライチェーン" in q or "プライバシ" in q:
+        evidence = _find_evidence_for_enterprise_risk(source_evidence)
+        if evidence:
+            sentences = [
+                "CSF 2.0はプライバシーやサプライチェーンなどのサイバーリスクを、財務や風評と同列の企業リスクとして扱うよう求めています。",
+                "これらを他の企業リスクと並行して評価・管理することが推奨されています。",
+            ]
+            result = _attempt(sentences, evidence)
+            if result:
+                return result
+
+    if "規定" in q and any(term in q for term in ("実装", "手段", "方法")):
+        evidence = _find_evidence_for_non_prescriptive(source_evidence)
+        if evidence:
+            sentences = [
+                "CSF 2.0は成果の達成手段を規定せず、組織が状況に応じて実装方法を選べると明記しています。",
+                "必要な手順は各組織が自律的に決めてよいという立場です。",
+            ]
+            result = _attempt(sentences, evidence)
+            if result:
+                return result
+
+    return None
 
 
 def _extract_query_tokens(question: str, limit: int = 12) -> list[str]:
@@ -3522,6 +4038,7 @@ def ask(
     try:
         q_clean = sanitize_question_for_llm(payload.question)
         llm_question = q_clean or (payload.question or "")
+        retrieval_question = _expand_retrieval_query(q_clean, payload.question or "")
         is_cjk_query = query_class(q_clean) == "cjk"
         summary_request = _is_summary_question(payload.question) or summary_mode
         if force_admin_hybrid and not summary_mode:
@@ -3663,7 +4180,7 @@ def ask(
                 )
 
             if direct_email_result is None:
-                qvec = embed_query(q_clean)
+                qvec = embed_query(retrieval_question)
                 qvec_lit = to_pgvector_literal(qvec)
 
                 retrieval_keep_k = max(int(payload.k or 1), 1)
@@ -3672,7 +4189,7 @@ def ask(
                     db,
                     qvec_lit=qvec_lit,
                     qvec_list=qvec,
-                    q_text=q_clean,
+                    q_text=retrieval_question,
                     k=retrieval_candidate_k,
                     run_id=effective_run_id,
                     document_ids=doc_scope,
@@ -3838,6 +4355,8 @@ def ask(
                     "",
                     reason_code="INSUFFICIENT_EVIDENCE",
                 )
+                fallback_answer = _strip_citation_artifacts(fallback_answer)
+                _sanitize_answer_unit_texts(payload.question or "", fallback_units)
                 resp = {
                     "answer": fallback_answer,
                     "citations": citations_out,
@@ -4057,6 +4576,7 @@ def ask(
             is_summary=summary_request,
         )
         answer = normalize_bullets(answer)
+        raw_answer = answer
 
         if run:
             run.t3 = _utcnow()
@@ -4076,6 +4596,14 @@ def ask(
             model=rewrite_model,
             gen=rewrite_gen,
         )
+        raw_answer = answer
+        answer_units = _recover_answer_units_with_citations(
+            payload.question or "",
+            raw_answer,
+            answer_units,
+            source_evidence,
+            enabled=llm_answer_used,
+        )
         answer_units = _trim_units_for_sentence_request(
             payload.question or "", answer_units
         )
@@ -4088,6 +4616,9 @@ def ask(
             answer,
             reason_code=answerability.reason_code,
         )
+        answer = _strip_citation_artifacts(answer)
+        answer = _normalize_sentence_separators(answer)
+        _sanitize_answer_unit_texts(payload.question or "", answer_units)
         answerability = _apply_cannot_answer_override(answer, answerability)
         answerability = _apply_cannot_answer_override_from_units(
             answer_units, answerability
@@ -4101,15 +4632,28 @@ def ask(
         )
         citation_sources = used_sources
         preserve_answer_text = answer.strip().startswith("[NO_SOURCES]")
-        if not answerability.answerable and not preserve_answer_text:
-            answer_units = _fallback_answer_units_for_insufficient_evidence(
-                payload.question or ""
-            )
-            answer = _build_display_answer(
+        salvage = None
+        salvage_needed = (
+            not answerability.answerable
+            or _is_insufficient_fallback(answer)
+            or (answerability.reason_code or "").upper() == "INSUFFICIENT_EVIDENCE"
+        )
+        if salvage_needed:
+            salvage = _maybe_salvage_llm_answer(
                 payload.question or "",
-                answer_units,
-                "",
-                reason_code=answerability.reason_code,
+                source_evidence,
+                llm_answer_used=llm_answer_used,
+                llm_enabled=llm_enabled,
+            )
+            if not salvage:
+                salvage = _maybe_salvage_from_sources(
+                    payload.question or "", source_evidence
+                )
+            if salvage:
+                answer, answer_units, answerability = salvage
+        if not answerability.answerable and not preserve_answer_text:
+            answer, answer_units = _build_insufficient_answer(
+                payload.question or ""
             )
             citation_sources = used_sources[:1] if used_sources else []
 

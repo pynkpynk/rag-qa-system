@@ -1,4 +1,5 @@
 import json
+from typing import Any
 
 from app.api.routes import chat as chat_module
 from app.api.routes.chat import (
@@ -6,7 +7,14 @@ from app.api.routes.chat import (
     _apply_cannot_answer_override_from_units,
     _apply_offline_overlap_guard,
     _build_display_answer,
+    _build_insufficient_answer,
+    _recover_answer_units_with_citations,
+    _sanitize_answer_unit_texts,
+    _maybe_salvage_llm_answer,
+    _maybe_salvage_from_sources,
+    _strip_citation_artifacts,
     _fallback_answer_units_for_insufficient_evidence,
+    _is_insufficient_fallback,
     _maybe_localize_summary_answer,
     _trim_units_for_sentence_request,
     build_answer_units_for_response,
@@ -38,6 +46,26 @@ def _sample_evidence():
             "chunk_id": "chunk-2",
             "text": "Beta chunk",
         },
+    ]
+
+
+def _single_source_evidence(
+    text: str,
+    *,
+    source_id: str = "SX",
+    page: int = 1,
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "source_id": source_id,
+            "page": page,
+            "line_start": 1,
+            "line_end": 10,
+            "filename": "csf.pdf",
+            "document_id": f"doc-{source_id.lower()}",
+            "chunk_id": f"chunk-{source_id.lower()}",
+            "text": text,
+        }
     ]
 
 
@@ -385,6 +413,357 @@ def test_offline_guard_filters_generic_tokens_with_no_overlap():
         offline_guard_enabled=True,
     )
     assert guarded.answerable is False
+
+
+def test_bracket_artifacts_removed_and_fallback_not_duplicated():
+    question = "オンライン資源について2文で。"
+    units = [
+        AnswerUnit(
+            text="Online resources [ S1 ] can extend guidance 【S2】 and include annexes [S3].",
+            citations=[
+                AnswerUnitEvidenceRef(
+                    source_id="S1",
+                    page=1,
+                    line_start=1,
+                    line_end=5,
+                    filename="alpha.pdf",
+                    document_id="doc-1",
+                )
+            ],
+        )
+    ]
+    display = _build_display_answer(question, units, "")
+    display = _strip_citation_artifacts(display)
+    assert "[" not in display and "【" not in display
+    _sanitize_answer_unit_texts(question, units)
+    assert "[" not in units[0].text and "【" not in units[0].text
+    fallback_answer, fallback_units = _build_insufficient_answer(
+        "情報不足です。3文で説明してください。"
+    )
+    assert "追加の資料があれば共有してください。" in fallback_answer
+    assert fallback_answer.count("追加の資料があれば共有してください。") <= 1
+    assert fallback_units == []
+
+
+def test_insufficient_answer_returns_empty_units():
+    answer, units = _build_insufficient_answer("情報不足のときは？")
+    assert answer
+    assert units == []
+    assert _is_insufficient_fallback(answer)
+
+
+def test_sentence_separator_normalization():
+    question = "説明して。"
+    units = [
+        AnswerUnit(text="Key fact . Additional detail .", citations=[]),
+    ]
+    display = _build_display_answer(question, units, "")
+    display = _strip_citation_artifacts(display)
+    _sanitize_answer_unit_texts(question, units)
+    assert " . " not in units[0].text
+
+
+def test_salvage_after_insufficient_fallback():
+    question = "CSF 2.0 は一律適用のアプローチを採らない、という趣旨の記述はありますか？1文で（箇条書き禁止）。"
+    fallback_answer, fallback_units = _build_insufficient_answer(question)
+    assert fallback_units == []
+    assert _is_insufficient_fallback(fallback_answer)
+    evidence = _single_source_evidence(
+        "CSF 2.0 does not embrace a one-size-fits-all approach and should be tailored to specific needs.",
+        source_id="S40",
+    )
+    result = _maybe_salvage_from_sources(question, evidence)
+    assert result is not None
+    answer, units, answerability = result
+    assert answerability.answerable is True
+    assert units and all(unit.citations for unit in units)
+    assert " . " not in answer
+
+
+def test_citation_artifacts_removed_from_answer_and_units():
+    question = "Explain without bullets."
+    refs = [
+        AnswerUnitEvidenceRef(
+            source_id="S3",
+            page=7,
+            line_start=1,
+            line_end=17,
+            filename="gamma.pdf",
+            document_id="doc-3",
+        )
+    ]
+    units = [
+        AnswerUnit(text="Key facts: Control guidance (p7 L1-17) S3", citations=refs)
+    ]
+    display = _build_display_answer(question, units, "")
+    display = _strip_citation_artifacts(display)
+    _sanitize_answer_unit_texts(question, units)
+    assert "S3" not in display
+    assert "(p7" not in display
+    assert "S3" not in units[0].text
+    assert "(p7" not in units[0].text
+
+
+def test_citation_recovery_attaches_sources_when_missing():
+    question = "1 sentence please, no bullet points."
+    answer_text = "The framework is not prescriptive and supports privacy protection."
+    evidence = [
+        {
+            "source_id": "S10",
+            "page": 4,
+            "line_start": 12,
+            "line_end": 20,
+            "filename": "privacy.pdf",
+            "document_id": "doc-10",
+            "chunk_id": "chunk-10",
+            "text": "This section notes the framework is not prescriptive and highlights privacy considerations.",
+        },
+        {
+            "source_id": "S11",
+            "page": 5,
+            "line_start": 1,
+            "line_end": 8,
+            "filename": "supply.pdf",
+            "document_id": "doc-11",
+            "chunk_id": "chunk-11",
+            "text": "Supply chain requirements are also discussed.",
+        },
+    ]
+    recovered = _recover_answer_units_with_citations(
+        question, answer_text, [], evidence, enabled=True
+    )
+    assert recovered
+    assert recovered[0].citations
+    _sanitize_answer_unit_texts(question, recovered)
+    display = _build_display_answer(question, recovered, answer_text)
+    display = _strip_citation_artifacts(display)
+    assert not display.startswith("-")
+    answerability = determine_answerability(question, evidence, recovered)
+    assert answerability.answerable is True
+
+
+def test_salvage_non_prescriptive_question():
+    question = "CSFは具体的な実装手段を規定しないことを1文で（箇条書き禁止）教えて。"
+    evidence = [
+        {
+            "source_id": "S20",
+            "page": 2,
+            "line_start": 5,
+            "line_end": 12,
+            "filename": "csf.pdf",
+            "document_id": "doc-20",
+            "chunk_id": "chunk-20",
+            "text": "The CSF does not prescribe how outcomes should be achieved; organizations choose their own implementations.",
+        }
+    ]
+    result = _maybe_salvage_llm_answer(
+        question,
+        evidence,
+        llm_answer_used=True,
+        llm_enabled=True,
+    )
+    assert result is not None
+    answer, units, answerability = result
+    assert answerability.answerable is True
+    assert len(units) == 1
+    assert units[0].citations
+    assert not answer.startswith("-")
+    assert "CSF" in answer
+
+
+def test_salvage_enterprise_risk_question():
+    question = "サプライチェーンやプライバシー等も含めて企業リスクとして扱う必要がありますか？2文で。箇条書き禁止。"
+    evidence = [
+        {
+            "source_id": "S21",
+            "page": 3,
+            "line_start": 1,
+            "line_end": 15,
+            "filename": "csf.pdf",
+            "document_id": "doc-21",
+            "chunk_id": "chunk-21",
+            "text": "Use cybersecurity risks alongside other enterprise risks including privacy, supply chain, financial, and reputational considerations.",
+        }
+    ]
+    result = _maybe_salvage_llm_answer(
+        question,
+        evidence,
+        llm_answer_used=True,
+        llm_enabled=True,
+    )
+    assert result is not None
+    answer, units, answerability = result
+    assert answerability.answerable is True
+    assert len(units) == 2
+    assert all(unit.citations for unit in units)
+    assert "サプライチェーン" in answer
+    assert not answer.startswith("-")
+
+
+def test_salvage_one_size_fits_all_question():
+    question = "CSF 2.0 は一律適用のアプローチを採らないと聞きました。箇条書き禁止で1文で教えて。"
+    evidence = [
+        {
+            "source_id": "S22",
+            "page": 4,
+            "line_start": 10,
+            "line_end": 18,
+            "filename": "csf.pdf",
+            "document_id": "doc-22",
+            "chunk_id": "chunk-22",
+            "text": "Regardless of how it is applied, the CSF prompts its users to consider their cybersecurity posture in context and then adapt the CSF to their specific needs.",
+        }
+    ]
+    result = _maybe_salvage_llm_answer(
+        question,
+        evidence,
+        llm_answer_used=True,
+        llm_enabled=True,
+    )
+    assert result is not None
+    answer, units, answerability = result
+    assert answerability.answerable is True
+    assert answerability.reason_code != "INSUFFICIENT_EVIDENCE"
+    assert len(units) == 1
+    assert units[0].citations
+    assert "一律" in answer
+    assert "[S" not in answer
+    assert " . " not in answer
+    assert answer.count("。") == 1
+
+
+def test_salvage_governance_question():
+    question = "ガバナンスにおける注意点を箇条書き禁止で2文で示して。"
+    evidence = [
+        {
+            "source_id": "S23",
+            "page": 5,
+            "line_start": 1,
+            "line_end": 16,
+            "filename": "csf.pdf",
+            "document_id": "doc-23",
+            "chunk_id": "chunk-23",
+            "text": "Boards of directors should integrate cybersecurity into governance, using Profiles and Tiers to align with enterprise risk management.",
+        }
+    ]
+    result = _maybe_salvage_llm_answer(
+        question,
+        evidence,
+        llm_answer_used=True,
+        llm_enabled=True,
+    )
+    assert result is not None
+    answer, units, answerability = result
+    assert answerability.answerable is True
+    assert len(units) == 2
+    assert all(unit.citations for unit in units)
+    assert "ガバナンス" in answer
+    assert not answer.startswith("-")
+
+
+def test_source_salvage_one_size_question():
+    question = "CSF 2.0 は一律適用のアプローチを採らない、という趣旨の記述はありますか？1文で（箇条書き禁止）。"
+    evidence = _single_source_evidence(
+        "Regardless of how it is applied, the CSF prompts its users to consider their cybersecurity posture in context and then adapt the CSF to their specific needs.",
+        source_id="S30",
+    )
+    result = _maybe_salvage_from_sources(question, evidence)
+    assert result is not None
+    answer, units, answerability = result
+    assert answerability.answerable is True
+    assert answerability.reason_code != "INSUFFICIENT_EVIDENCE"
+    assert len(units) == 1
+    assert units[0].citations
+    assert "一律" in answer
+    assert "[S" not in answer
+    assert " . " not in answer
+    assert answer.count("。") == 1
+
+
+def test_source_salvage_exec_board_question():
+    question = "経営層・取締役会とのコミュニケーションで意図している点は？2文で。"
+    evidence = _single_source_evidence(
+        "The CSF provides a common language for executives and boards of directors to communicate about cybersecurity outcomes and priorities.",
+        source_id="S31",
+    )
+    result = _maybe_salvage_from_sources(question, evidence)
+    assert result is not None
+    answer, units, answerability = result
+    assert answerability.answerable is True
+    assert len(units) == 2
+    assert all(unit.citations for unit in units)
+    assert answer.count("。") == 2
+    assert not answer.startswith("-")
+    assert " . " not in answer
+
+
+def test_source_salvage_online_resources_question():
+    question = "オンライン資源（Informative References等）の扱いは？2文で。"
+    evidence = _single_source_evidence(
+        "Informative References map CSF outcomes to other standards, Implementation Examples offer illustrative actions, and Quick Start Guides help organizations adopt the CSF.",
+        source_id="S32",
+    )
+    result = _maybe_salvage_from_sources(question, evidence)
+    assert result is not None
+    answer, units, answerability = result
+    assert answerability.answerable is True
+    assert len(units) == 2
+    assert all(unit.citations for unit in units)
+    assert "[S" not in answer
+    assert answer.count("。") == 2
+    assert " . " not in answer
+
+
+def test_source_salvage_audience_question():
+    question = "CSF 2.0 の想定利用者（誰に向けて書かれているか）を1文で。"
+    evidence = _single_source_evidence(
+        "The CSF is intended for a broad audience across public and private sectors, including organizations of all sizes.",
+        source_id="S33",
+    )
+    result = _maybe_salvage_from_sources(question, evidence)
+    assert result is not None
+    answer, units, answerability = result
+    assert answerability.answerable is True
+    assert len(units) == 1
+    assert units[0].citations
+    assert "組織" in answer
+    assert not answer.startswith("-")
+    assert answer.count("。") == 1
+    assert " . " not in answer
+
+
+def test_source_salvage_profiles_tiers_question():
+    question = "CSFのProfileとTierはガバナンス上どう使う？2文で。"
+    evidence = _single_source_evidence(
+        "CSF Organizational Profiles describe current and target states, while CSF Tiers characterize the rigor of risk management and governance practices.",
+        source_id="S34",
+    )
+    result = _maybe_salvage_from_sources(question, evidence)
+    assert result is not None
+    answer, units, answerability = result
+    assert answerability.answerable is True
+    assert len(units) == 2
+    assert all(unit.citations for unit in units)
+    assert answer.count("。") == 2
+    assert "Profile" not in answer
+    assert " . " not in answer
+
+
+def test_source_salvage_supply_chain_privacy_question():
+    question = "サプライチェーンやプライバシー等、サイバー以外のリスクとの関係はどう述べている？2文で。"
+    evidence = _single_source_evidence(
+        "Every organization faces numerous types of ICT risk, including privacy, supply chain, and artificial intelligence considerations, and should integrate CSF use with ERM while some risks may be managed separately. Supply chain risk oversight and communications plus PRAM and C-SCRM practices provide a systematic process for addressing these risks.",
+        source_id="S35",
+    )
+    result = _maybe_salvage_from_sources(question, evidence)
+    assert result is not None
+    answer, units, answerability = result
+    assert answerability.answerable is True
+    assert answerability.reason_code != "INSUFFICIENT_EVIDENCE"
+    assert len(units) == 2
+    assert all(unit.citations for unit in units)
+    assert answer.count("。") == 2
+    assert " . " not in answer
 
 
 def test_display_answer_strips_bullets_and_markers():
