@@ -1,6 +1,11 @@
 import json
+import time
 from typing import Any
 
+from fastapi import FastAPI, Request
+from fastapi.testclient import TestClient
+from app.main import app as fastapi_app
+from app.core.authz import Principal
 from app.api.routes import chat as chat_module
 from app.api.routes.chat import (
     _apply_cannot_answer_override,
@@ -8,7 +13,10 @@ from app.api.routes.chat import (
     _apply_offline_overlap_guard,
     _build_display_answer,
     _build_insufficient_answer,
+    _compact_evidence_for_prompt,
+    _attach_timing_fields,
     _recover_answer_units_with_citations,
+    _ensure_debug_meta_app_env,
     _sanitize_answer_unit_texts,
     _maybe_salvage_llm_answer,
     _maybe_salvage_from_sources,
@@ -16,6 +24,7 @@ from app.api.routes.chat import (
     _fallback_answer_units_for_insufficient_evidence,
     _is_insufficient_fallback,
     _maybe_localize_summary_answer,
+    _should_enable_debug,
     _trim_units_for_sentence_request,
     build_answer_units_for_response,
     determine_answerability,
@@ -659,6 +668,7 @@ def test_salvage_governance_question():
     assert all(unit.citations for unit in units)
     assert "ガバナンス" in answer
     assert not answer.startswith("-")
+    assert " . " not in answer
 
 
 def test_source_salvage_one_size_question():
@@ -764,6 +774,253 @@ def test_source_salvage_supply_chain_privacy_question():
     assert all(unit.citations for unit in units)
     assert answer.count("。") == 2
     assert " . " not in answer
+
+
+def test_source_salvage_outcomes_question():
+    question = "CSFは『成果(Outcomes)』中心ってどういう意味？2文で。"
+    evidence = _single_source_evidence(
+        "Outcomes are sector-, country-, and technology-neutral, providing flexibility for organizations to consider their unique risks, missions, legal requirements, and risk appetites. Each outcome is mapped directly to a list of potential security controls so implementation can vary without losing consistency.",
+        source_id="S36",
+    )
+    result = _maybe_salvage_from_sources(question, evidence)
+    assert result is not None
+    answer, units, answerability = result
+    assert answerability.answerable is True
+    assert answerability.reason_code == "OTHER"
+    assert len(units) == 2
+    assert all(unit.citations for unit in units)
+    assert answer.count("。") == 2
+    assert " . " not in answer
+
+
+def test_compact_evidence_limits_chars_and_keeps_keyword(monkeypatch):
+    monkeypatch.setattr(chat_module, "EVIDENCE_MAX_CHARS_PER_SOURCE", 120)
+    monkeypatch.setattr(chat_module, "EVIDENCE_MAX_CHARS_TOTAL", 200)
+    question = "ガバナンスにおける注意点を要約して。"
+    long_text = "\n".join(
+        ["Noise sentence {}".format(i) for i in range(20)]
+        + [
+            "Boards of directors should integrate cybersecurity into governance using Profiles and Tiers to align with enterprise risk management."
+        ]
+        + ["Trailing filler {}".format(i) for i in range(10)]
+    )
+    rows = [
+        {
+            "id": "chunk-comp-1",
+            "document_id": "doc-comp-1",
+            "filename": "csf.pdf",
+            "page": 10,
+            "text": long_text,
+        }
+    ]
+    compacted = _compact_evidence_for_prompt(question, rows)
+    assert len(compacted) == 1
+    snippet = compacted[0]["text"]
+    assert snippet
+    assert len(snippet) <= 120
+    assert "Boards of directors" in snippet
+    assert " . " not in snippet
+
+
+def test_compact_evidence_respects_total_budget_and_is_deterministic(monkeypatch):
+    monkeypatch.setattr(chat_module, "EVIDENCE_MAX_CHARS_PER_SOURCE", 80)
+    monkeypatch.setattr(chat_module, "EVIDENCE_MAX_CHARS_TOTAL", 100)
+    question = "オンライン資源の扱いは？"
+    rows = [
+        {
+            "id": "chunk-comp-2",
+            "document_id": "doc-comp-2",
+            "filename": "csf.pdf",
+            "page": 12,
+            "text": "Informative References map CSF outcomes to other standards. Implementation Examples and Quick Start Guides help organizations adopt the CSF quickly.",
+        },
+        {
+            "id": "chunk-comp-3",
+            "document_id": "doc-comp-3",
+            "filename": "csf.pdf",
+            "page": 13,
+            "text": "Additional background appendix text that should only appear if budget allows.",
+        },
+    ]
+    first = _compact_evidence_for_prompt(question, rows)
+    second = _compact_evidence_for_prompt(question, rows)
+    assert first == second
+    total_chars = sum(len(entry["text"]) for entry in first)
+    assert total_chars <= 100
+    assert any("Informative References" in entry["text"] for entry in first)
+    assert all(" . " not in entry["text"] for entry in first)
+
+
+def test_dev_debug_query_param_adds_timing_fields():
+    allowed = _should_enable_debug(False, True, True)
+    assert allowed is True
+    resp: dict[str, Any] = {
+        "retrieval_debug": {},
+        "debug_meta": _ensure_debug_meta_app_env({"feature_flag_enabled": True}),
+    }
+    stage_timings = {"retrieval": 5, "llm": 10, "salvage": 0, "post": 3}
+    total_start = time.perf_counter()
+    _attach_timing_fields(
+        resp,
+        stage_timings,
+        total_start=total_start,
+        allowed=allowed,
+    )
+    for key in ("retrieval_ms", "llm_ms", "salvage_ms", "post_ms", "total_ms"):
+        assert key in resp
+        assert isinstance(resp[key], int)
+        assert resp[key] >= 0
+    assert resp["debug_meta"]["app_env"]
+
+
+def test_debug_meta_env_populated(monkeypatch):
+    monkeypatch.setattr(chat_module.settings, "app_env", "devlocal")
+    meta = _ensure_debug_meta_app_env({"feature_flag_enabled": True})
+    assert meta["app_env"] == "devlocal"
+
+
+def test_chat_ask_endpoint_includes_timing_when_debug(monkeypatch):
+    class FakeDB:
+        def commit(self):
+            return None
+
+        def close(self):
+            return None
+
+        def query(self, *args, **kwargs):
+            return self
+
+        def filter(self, *args, **kwargs):
+            return self
+
+        def all(self):
+            return []
+
+        def get(self, *args, **kwargs):
+            return None
+
+    class FakePrincipal:
+        sub = "tester"
+
+    monkeypatch.setattr(chat_module.settings, "app_env", "dev")
+    monkeypatch.setattr(chat_module, "ENABLE_RETRIEVAL_DEBUG", True)
+    monkeypatch.setattr(chat_module, "effective_auth_mode", lambda: "dev")
+    monkeypatch.setattr(chat_module, "_debug_allowed_in_env", lambda: True)
+    monkeypatch.setattr(
+        chat_module,
+        "should_include_retrieval_debug",
+        lambda payload_debug, is_admin_debug: payload_debug,
+    )
+    monkeypatch.setattr(chat_module, "is_admin", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(chat_module, "is_admin_debug", lambda *_a, **_k: True)
+    monkeypatch.setattr(chat_module, "admin_debug_via_token", lambda *_a, **_k: False)
+    monkeypatch.setattr(chat_module, "_refresh_retrieval_debug_flags", lambda: None)
+    monkeypatch.setattr(chat_module, "embed_query", lambda *_a, **_k: [0.0])
+    monkeypatch.setattr(chat_module, "fetch_chunks", lambda *_a, **_k: ([], {}))
+    monkeypatch.setattr(
+        chat_module, "filter_noise_candidates", lambda rows, *_a, **_k: rows
+    )
+    monkeypatch.setattr(chat_module, "is_llm_enabled", lambda: False)
+
+    app = FastAPI()
+
+    @app.post("/api/chat/ask")
+    def ask_route(payload: chat_module.AskPayload, request: Request):
+        return chat_module.ask(payload, request, db=FakeDB(), p=FakePrincipal())
+
+    client = TestClient(app)
+    debug_resp = client.post("/api/chat/ask?debug=1", json={"question": "Test?"})
+    assert debug_resp.status_code == 200
+    debug_data = debug_resp.json()
+    for key in ("retrieval_ms", "llm_ms", "salvage_ms", "post_ms", "total_ms"):
+        assert key in debug_data
+        assert isinstance(debug_data[key], int)
+        assert debug_data[key] >= 0
+    assert debug_data["debug_meta"]["app_env"] == "dev"
+    assert isinstance(debug_data["debug_meta"].get("pid"), int)
+    assert debug_data["debug_meta"]["pid"] > 0
+    assert debug_data["debug_meta"]["debug_requested"] is True
+    assert debug_data["debug_meta"]["debug_enabled"] is True
+    assert isinstance(debug_data["debug_meta"].get("chat_file"), str)
+    assert debug_data["debug_meta"]["chat_file"]
+    assert isinstance(debug_data["retrieval_debug"], dict)
+    assert debug_data["retrieval_debug"]
+    body_debug_resp = client.post(
+        "/api/chat/ask", json={"question": "Body flag?", "debug": True}
+    )
+    assert body_debug_resp.status_code == 200
+    body_debug_data = body_debug_resp.json()
+    for key in ("retrieval_ms", "llm_ms", "salvage_ms", "post_ms", "total_ms"):
+        assert key in body_debug_data
+        assert isinstance(body_debug_data[key], int)
+        assert body_debug_data[key] >= 0
+    assert body_debug_data["debug_meta"]["debug_requested"] is True
+    assert body_debug_data["debug_meta"]["debug_enabled"] is True
+
+    no_debug_resp = client.post("/api/chat/ask", json={"question": "Test?"})
+    assert no_debug_resp.status_code == 200
+    no_debug_data = no_debug_resp.json()
+    for key in ("retrieval_ms", "llm_ms", "salvage_ms", "post_ms", "total_ms"):
+        assert key not in no_debug_data
+
+
+def test_chat_ask_debug_query_returns_placeholders_when_disabled(monkeypatch):
+    class FakeDB:
+        def commit(self):
+            return None
+
+        def close(self):
+            return None
+
+        def query(self, *args, **kwargs):
+            return self
+
+        def filter(self, *args, **kwargs):
+            return self
+
+        def all(self):
+            return []
+
+        def get(self, *args, **kwargs):
+            return None
+
+    class FakePrincipal:
+        sub = "tester"
+
+    monkeypatch.setattr(chat_module.settings, "app_env", "prod")
+    monkeypatch.setattr(chat_module, "ENABLE_RETRIEVAL_DEBUG", True)
+    monkeypatch.setattr(chat_module, "effective_auth_mode", lambda: "prod")
+    monkeypatch.setattr(chat_module, "_debug_allowed_in_env", lambda: False)
+    monkeypatch.setattr(
+        chat_module,
+        "should_include_retrieval_debug",
+        lambda payload_debug, is_admin_debug: False,
+    )
+    monkeypatch.setattr(chat_module, "is_admin", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(chat_module, "is_admin_debug", lambda *_a, **_k: False)
+    monkeypatch.setattr(chat_module, "admin_debug_via_token", lambda *_a, **_k: False)
+    monkeypatch.setattr(chat_module, "_refresh_retrieval_debug_flags", lambda: None)
+    monkeypatch.setattr(chat_module, "embed_query", lambda *_a, **_k: [0.0])
+    monkeypatch.setattr(chat_module, "fetch_chunks", lambda *_a, **_k: ([], {}))
+    monkeypatch.setattr(
+        chat_module, "filter_noise_candidates", lambda rows, *_a, **_k: rows
+    )
+    monkeypatch.setattr(chat_module, "is_llm_enabled", lambda: False)
+
+    app = FastAPI()
+
+    @app.post("/api/chat/ask")
+    def ask_route(payload: chat_module.AskPayload, request: Request):
+        return chat_module.ask(payload, request, db=FakeDB(), p=FakePrincipal())
+
+    client = TestClient(app)
+    debug_resp = client.post("/api/chat/ask?debug=1", json={"question": "Test?"})
+    assert debug_resp.status_code == 200
+    data = debug_resp.json()
+    assert data["debug_meta"] == {}
+    assert data["retrieval_debug"] == {}
+    for key in ("retrieval_ms", "llm_ms", "salvage_ms", "post_ms", "total_ms"):
+        assert key not in data
 
 
 def test_display_answer_strips_bullets_and_markers():

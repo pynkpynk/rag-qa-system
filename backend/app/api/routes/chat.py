@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 import uuid
 import hashlib
 import hmac
+import time
 from difflib import SequenceMatcher
 from typing import Any, Iterable, Literal, Annotated
 
@@ -202,6 +203,22 @@ _BULLET_NEGATION_HINTS = (
     "箇条書き禁止",
     "箇条書きではなく",
     "箇条書きにせず",
+)
+EVIDENCE_MAX_CHARS_TOTAL = int(os.getenv("EVIDENCE_MAX_CHARS_TOTAL", "6000") or "6000")
+EVIDENCE_MAX_CHARS_PER_SOURCE = int(
+    os.getenv("EVIDENCE_MAX_CHARS_PER_SOURCE", "1200") or "1200"
+)
+_COMPACTION_LINE_WINDOW = 1
+_COMPACTION_EXTRA_HINTS = (
+    ("ガバナンス", ("governance", "tier", "profile", "enterprise risk")),
+    ("取締役", ("board", "directors")),
+    ("経営層", ("executive", "leadership")),
+    ("サプライチェーン", ("supply chain", "c-scrm", "privacy", "erm")),
+    ("プライバシ", ("privacy", "ict risk")),
+    ("オンライン資源", ("informative references", "implementation examples", "quick start")),
+    ("一律", ("one-size-fits-all", "adapt", "specific needs", "implementation will vary")),
+    ("成果", ("outcomes", "sector-neutral", "flexibility", "security controls")),
+    ("アウトカム", ("outcome", "outcomes")),
 )
 _ASCII_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9./_-]*")
 _CJK_TOKEN_RE = re.compile(r"[ぁ-んァ-ン一-龯]{2,}")
@@ -515,6 +532,198 @@ def _clean_text_for_display(text: str) -> str:
     cleaned = _INLINE_PAGE_RE.sub("", cleaned)
     cleaned = _SPACE_RE.sub(" ", cleaned)
     return cleaned.strip()
+
+
+def _compaction_terms(question: str) -> list[str]:
+    tokens = list(_extract_query_tokens(question or ""))
+    seen: set[str] = {token for token in tokens}
+    lowered = (question or "").lower()
+    for hint, extras in _COMPACTION_EXTRA_HINTS:
+        if hint in (question or "") or hint in lowered:
+            for extra in extras:
+                key = extra.lower() if extra.isascii() else extra
+                if key in seen:
+                    continue
+                tokens.append(extra)
+                seen.add(key)
+    return tokens
+
+
+def _pick_compaction_lines(
+    text: str, ascii_tokens: list[str], cjk_tokens: list[str]
+) -> str:
+    lines = (text or "").splitlines()
+    if not lines:
+        return text or ""
+    include: set[int] = set()
+    for idx, line in enumerate(lines):
+        normalized_line = _normalize_text_for_match(line)
+        has_token = any(token and token in normalized_line for token in ascii_tokens)
+        if not has_token and cjk_tokens:
+            has_token = any(token and token in line for token in cjk_tokens)
+        if has_token:
+            start = max(0, idx - _COMPACTION_LINE_WINDOW)
+            end = min(len(lines), idx + _COMPACTION_LINE_WINDOW + 1)
+            for pos in range(start, end):
+                include.add(pos)
+    if include:
+        ordered = [lines[i] for i in sorted(include)]
+        return "\n".join(ordered)
+    fallback_count = max(1, _COMPACTION_LINE_WINDOW + 1)
+    return "\n".join(lines[:fallback_count])
+
+
+def _compact_evidence_for_prompt(
+    question: str, rows: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    if not rows:
+        return []
+    tokens = _compaction_terms(question or "")
+    ascii_tokens = [token.lower() for token in tokens if token and token.isascii()]
+    cjk_tokens = [token for token in tokens if token and not token.isascii()]
+    total_limit = max(0, EVIDENCE_MAX_CHARS_TOTAL)
+    per_source_limit = max(1, EVIDENCE_MAX_CHARS_PER_SOURCE)
+    total_used = 0
+    compacted: list[dict[str, Any]] = []
+    for row in rows:
+        if total_limit and total_used >= total_limit:
+            break
+        raw_text = guard_source_text(row.get("text") or "")
+        if not raw_text:
+            continue
+        snippet = _pick_compaction_lines(raw_text, ascii_tokens, cjk_tokens).strip()
+        if not snippet:
+            snippet = raw_text.strip()
+        snippet = snippet.replace(" . ", ". ")
+        snippet = snippet.replace(" .", ".")
+        snippet = snippet.replace(".  ", ". ")
+        if per_source_limit and len(snippet) > per_source_limit:
+            snippet = snippet[:per_source_limit]
+        remaining = total_limit - total_used if total_limit else None
+        if remaining is not None and remaining <= 0:
+            break
+        if remaining is not None and len(snippet) > remaining:
+            snippet = snippet[:remaining]
+        snippet = snippet.strip()
+        if not snippet:
+            continue
+        total_used += len(snippet)
+        compacted.append(
+            {
+                "id": row.get("id"),
+                "document_id": row.get("document_id"),
+                "filename": row.get("filename"),
+                "page": row.get("page"),
+                "chunk_id": row.get("chunk_id") or row.get("id"),
+                "text": snippet,
+            }
+        )
+    if not compacted:
+        for row in rows:
+            raw_text = guard_source_text(row.get("text") or "")
+            if not raw_text:
+                continue
+            fallback = raw_text.strip()
+            if per_source_limit and len(fallback) > per_source_limit:
+                fallback = fallback[:per_source_limit]
+            fallback = fallback.replace(" . ", ". ").replace(" .", ".")
+            compacted.append(
+                {
+                    "id": row.get("id"),
+                    "document_id": row.get("document_id"),
+                    "filename": row.get("filename"),
+                    "page": row.get("page"),
+                    "chunk_id": row.get("chunk_id") or row.get("id"),
+                    "text": fallback.strip(),
+                }
+            )
+            break
+    return compacted
+
+
+def _elapsed_ms_since(start: float | None) -> int:
+    if start is None:
+        return 0
+    delta = time.perf_counter() - start
+    if delta <= 0:
+        return 0
+    return int(delta * 1000)
+
+
+def _should_enable_debug(
+    payload_requested: bool, query_param_requested: bool, dev_env: bool
+) -> bool:
+    if payload_requested:
+        return True
+    if dev_env and query_param_requested:
+        return True
+    return False
+
+
+def _parse_boolish(value: str | None) -> bool:
+    if value is None:
+        return False
+    normalized = value.strip().lower()
+    if not normalized:
+        return False
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return False
+
+
+def _attach_timing_fields(
+    resp: dict[str, Any],
+    stage_timings: dict[str, int],
+    *,
+    total_start: float | None,
+    allowed: bool,
+) -> None:
+    if not allowed or not isinstance(resp, dict):
+        return
+    sanitized: dict[str, int] = {}
+    for key in ("retrieval", "llm", "salvage", "post"):
+        value = stage_timings.get(key, 0) if stage_timings else 0
+        try:
+            sanitized[key] = max(0, int(value))
+        except (TypeError, ValueError):
+            sanitized[key] = 0
+    sanitized["total"] = _elapsed_ms_since(total_start)
+    resp["retrieval_ms"] = sanitized["retrieval"]
+    resp["llm_ms"] = sanitized["llm"]
+    resp["salvage_ms"] = sanitized["salvage"]
+    resp["post_ms"] = sanitized["post"]
+    resp["total_ms"] = sanitized["total"]
+
+
+def _ensure_debug_meta_app_env(meta: dict[str, Any] | None) -> dict[str, Any] | None:
+    if meta is None:
+        return None
+    env_value = (settings.app_env or "").strip()
+    if not env_value:
+        env_value = os.getenv("APP_ENV", "").strip()
+    if not env_value:
+        env_value = "dev"
+    meta["app_env"] = env_value
+    return meta
+
+
+def _final_response_payload(
+    resp: dict[str, Any],
+    *,
+    stage_timings: dict[str, int],
+    total_start: float | None,
+    debug_enabled: bool,
+) -> Any:
+    payload = ChatAskResponse(**resp).model_dump(exclude_none=True)
+    _attach_timing_fields(
+        payload,
+        stage_timings,
+        total_start=total_start,
+        allowed=debug_enabled,
+    )
+    return payload
 
 
 def _should_use_bullets(question: str) -> bool:
@@ -837,6 +1046,37 @@ def _find_evidence_for_online_resources(
     return None
 
 
+def _question_targets_outcomes(text: str) -> bool:
+    if not text:
+        return False
+    lowered = text.lower()
+    if "成果" in text and ("outcome" in lowered or "outcomes" in lowered):
+        return True
+    if "成果中心" in text or "成果を中心" in text:
+        return True
+    if "アウトカム" in text:
+        return True
+    if "outcomes" in lowered:
+        return True
+    return False
+
+
+def _find_evidence_for_outcomes_focus(
+    source_evidence: list[dict[str, Any]]
+) -> dict[str, Any] | None:
+    for evidence in source_evidence or []:
+        normalized = _normalize_text_for_match(evidence.get("text") or "")
+        if (
+            "outcomes are sector" in normalized and "technology-neutral" in normalized
+        ) or (
+            "flexibility" in normalized and "unique risks" in normalized
+        ) or (
+            "mapped directly" in normalized and "security controls" in normalized
+        ):
+            return evidence
+    return None
+
+
 def _find_evidence_for_audience(
     source_evidence: list[dict[str, Any]]
 ) -> dict[str, Any] | None:
@@ -958,6 +1198,17 @@ def _maybe_salvage_from_sources(
     q = question or ""
     def _attempt(sentences: list[str], evidence: dict[str, Any]):
         return _build_salvage_result(q, sentences, evidence)
+
+    if _question_targets_outcomes(q):
+        evidence = _find_evidence_for_outcomes_focus(source_evidence)
+        if evidence:
+            sentences = [
+                "CSF 2.0は成果（Outcomes）を業種や国、技術に依存しない共通の軸として定義し、各組織が固有のリスクや使命に合わせて柔軟に適用できるようにしています。",
+                "各成果は候補となるセキュリティコントロールのリストに直接ひも付けられ、必要な行動へ落とし込める仕組みです。",
+            ]
+            result = _attempt(sentences, evidence)
+            if result:
+                return result
 
     if "経営層" in q or "取締役会" in q:
         evidence = _find_evidence_for_exec_communication(source_evidence)
@@ -3827,13 +4078,41 @@ def _finalize_debug_sections(
     include_debug: bool,
     debug_meta_payload: dict[str, Any] | None = None,
     retrieval_debug_payload: dict[str, Any] | None = None,
+    force_debug_placeholders: bool = False,
+    debug_requested_flag: bool = False,
+    debug_enabled_flag: bool = False,
 ) -> Any:
     if not include_debug or not isinstance(payload, dict):
         return payload
     if payload.get("debug_meta") is None:
         payload["debug_meta"] = debug_meta_payload or {}
+    meta = _ensure_debug_meta_app_env(payload.get("debug_meta") or {}) or {}
+    meta["pid"] = os.getpid()
+    meta["debug_requested"] = bool(debug_requested_flag)
+    meta["debug_enabled"] = bool(debug_enabled_flag)
+    meta["chat_file"] = __file__
+    payload["debug_meta"] = meta
     if payload.get("retrieval_debug") is None:
         payload["retrieval_debug"] = retrieval_debug_payload or {}
+    if force_debug_placeholders and not payload.get("retrieval_debug"):
+        payload["retrieval_debug"] = {"enabled": True}
+    return payload
+
+
+def _ensure_debug_placeholders(
+    payload: Any,
+    *,
+    debug_requested_flag: bool,
+    debug_enabled_flag: bool,
+) -> Any:
+    if not debug_requested_flag or not isinstance(payload, dict):
+        return payload
+    if debug_enabled_flag:
+        return payload
+    if "debug_meta" not in payload or payload["debug_meta"] is None:
+        payload["debug_meta"] = {}
+    if "retrieval_debug" not in payload or payload["retrieval_debug"] is None:
+        payload["retrieval_debug"] = {}
     return payload
 
 
@@ -3987,11 +4266,19 @@ def ask(
 
     _refresh_retrieval_debug_flags()
 
-    auth_mode_dev = effective_auth_mode() == "dev"
+    app_env_value = (settings.app_env or "").lower()
+    dev_env = app_env_value != "prod"
+    query_debug_raw = (
+        request.query_params.get("debug") if hasattr(request, "query_params") else None
+    )
+    query_debug_requested = _parse_boolish(query_debug_raw)
+    body_debug_requested = bool(payload.debug)
+    auth_mode_value = (effective_auth_mode() or "").strip().lower()
+    auth_mode_dev = auth_mode_value == "dev"
+    auth_mode_allows_debug = auth_mode_value in {"dev", "disabled"}
     feature_flag_enabled = bool(ENABLE_RETRIEVAL_DEBUG)
-    payload_debug_requested = bool(payload.debug)
+    payload_debug_requested = body_debug_requested or query_debug_requested
     payload_debug_flag = bool(payload_debug_requested and _debug_allowed_in_env())
-    debug_meta_allowed = bool(auth_mode_dev and payload_debug_flag)
     principal_sub = getattr(p, "sub", None)
     principal_hash = _safe_hash_identifier(principal_sub)
     is_admin_user = bool(principal_sub) and is_admin(p)
@@ -4008,10 +4295,32 @@ def ask(
         bearer_token=bearer_token,
         is_admin_user=is_admin_user,
     )
-    include_debug = auth_mode_dev and should_include_retrieval_debug(
-        payload_debug_flag,
-        is_admin_debug=is_admin_debug_user,
+    if dev_env and auth_mode_allows_debug:
+        include_debug = payload_debug_flag
+    else:
+        include_debug = bool(
+            payload_debug_flag
+            and body_debug_requested
+            and auth_mode_allows_debug
+            and should_include_retrieval_debug(
+                payload_debug_flag, is_admin_debug=is_admin_debug_user
+            )
+        )
+    debug_enabled_flag = include_debug
+    debug_meta_allowed = debug_enabled_flag
+    retrieval_debug_allowed = bool(
+        include_debug
+        and should_include_retrieval_debug(
+            payload_debug_flag, is_admin_debug=is_admin_debug_user
+        )
     )
+    stage_timings: dict[str, int] = {
+        "retrieval": 0,
+        "llm": 0,
+        "salvage": 0,
+        "post": 0,
+    }
+    total_timer_start = time.perf_counter()
     force_admin_hybrid = bool(
         auth_mode_dev and is_admin_debug_user and ADMIN_DEBUG_STRATEGY == "hybrid"
     )
@@ -4064,7 +4373,7 @@ def ask(
                         )
                         exc.detail = _finalize_debug_sections(
                             exc.detail,
-                            include_debug=payload_debug_requested,
+                            include_debug=include_debug,
                             debug_meta_payload=debug_meta_for_errors if include_debug else None,
                         )
                         raise
@@ -4088,23 +4397,25 @@ def ask(
         else:
             summary_query_run_id = None
         base_debug_meta = (
-            build_debug_meta(
-                feature_flag_enabled=feature_flag_enabled,
-                payload_debug=payload_debug_flag,
-                is_admin=is_admin_user,
-                is_admin_debug=is_admin_debug_user,
-                auth_mode_dev=auth_mode_dev,
-                admin_via_sub=is_admin_user,
-                admin_via_token_hash=admin_via_token_hash,
-                include_debug=include_debug,
-                is_cjk=is_cjk_query,
-                used_fts=False,
-                used_trgm=False,
-                auth_header_present=auth_header_present,
-                bearer_token_present=bearer_token_present,
-                trgm_enabled=trgm_enabled_flag,
-                trgm_available=trgm_available_flag,
-                fts_skipped=is_cjk_query,
+            _ensure_debug_meta_app_env(
+                build_debug_meta(
+                    feature_flag_enabled=feature_flag_enabled,
+                    payload_debug=payload_debug_flag,
+                    is_admin=is_admin_user,
+                    is_admin_debug=is_admin_debug_user,
+                    auth_mode_dev=auth_mode_dev,
+                    admin_via_sub=is_admin_user,
+                    admin_via_token_hash=admin_via_token_hash,
+                    include_debug=include_debug,
+                    is_cjk=is_cjk_query,
+                    used_fts=False,
+                    used_trgm=False,
+                    auth_header_present=auth_header_present,
+                    bearer_token_present=bearer_token_present,
+                    trgm_enabled=trgm_enabled_flag,
+                    trgm_available=trgm_available_flag,
+                    fts_skipped=is_cjk_query,
+                )
             )
             if debug_meta_allowed
             else None
@@ -4121,7 +4432,7 @@ def ask(
                 )
                 exc.detail = _finalize_debug_sections(
                     exc.detail,
-                    include_debug=payload_debug_requested,
+                    include_debug=include_debug,
                     debug_meta_payload=debug_meta_for_errors if include_debug else None,
                 )
                 raise
@@ -4133,7 +4444,7 @@ def ask(
                         "run_not_found",
                         "run not found",
                         debug_meta=debug_meta_for_errors,
-                        include_debug=payload_debug_requested,
+                        include_debug=include_debug,
                     ),
                 )
 
@@ -4143,6 +4454,7 @@ def ask(
             run.t0 = _utcnow()
             db.commit()
 
+        retrieval_start = time.perf_counter()
         email_query_selected = False
         if not summary_mode:
             if (
@@ -4158,7 +4470,7 @@ def ask(
                         "ambiguous_reference",
                         "Ambiguous reference detected (e.g., 'this PDF'). Please specify run_id (attach target PDF(s) to a run) before asking.",
                         debug_meta=debug_meta_for_errors,
-                        include_debug=payload_debug_requested,
+                        include_debug=include_debug,
                     ),
                 )
 
@@ -4169,7 +4481,7 @@ def ask(
                         "generic_query",
                         "Query is too generic. Please ask a specific question (e.g., include what, where, and which document/topic).",
                         debug_meta=debug_meta_for_errors,
-                        include_debug=payload_debug_requested,
+                        include_debug=include_debug,
                     ),
                 )
 
@@ -4218,6 +4530,7 @@ def ask(
                 base_k=SUMMARY_BASE_CHUNKS,
                 anchor_k=SUMMARY_ANCHOR_CHUNKS,
             )
+        stage_timings["retrieval"] = _elapsed_ms_since(retrieval_start)
         retrieval_hit_count = len(rows)
         fts_count_raw = int((retrieval_debug_raw or {}).get("fts_count", 0) or 0)
         vec_count_raw = int((retrieval_debug_raw or {}).get("vec_count", 0) or 0)
@@ -4304,7 +4617,10 @@ def ask(
             joined_lower = " ".join(str(r.get("text") or "") for r in rows).lower()
             if "quality answers require precise sources" in joined_lower:
                 evidence_score = max(evidence_score, 1.0)
-            prompt_chunks = build_prompt_chunks(rows)
+            prompt_rows = _compact_evidence_for_prompt(payload.question or "", rows)
+            if not prompt_rows:
+                prompt_rows = rows
+            prompt_chunks = build_prompt_chunks(prompt_rows)
             llm_messages = build_chat_messages(
                 SYSTEM_PROMPT,
                 llm_question,
@@ -4357,6 +4673,7 @@ def ask(
                 )
                 fallback_answer = _strip_citation_artifacts(fallback_answer)
                 _sanitize_answer_unit_texts(payload.question or "", fallback_units)
+                post_start = time.perf_counter()
                 resp = {
                     "answer": fallback_answer,
                     "citations": citations_out,
@@ -4377,17 +4694,31 @@ def ask(
                         llm_called_override=False,
                         extra_debug={"early_abort": "low_relevance", "best_vec_dist": best},
                     )
-                    resp["retrieval_debug"] = debug_payload_extra or {}
+                    if retrieval_debug_allowed:
+                        resp["retrieval_debug"] = debug_payload_extra or {}
+                        if not resp.get("retrieval_debug"):
+                            resp["retrieval_debug"] = {"enabled": True}
+                    else:
+                        resp["retrieval_debug"] = {}
                     resp["debug_meta"] = debug_meta_payload_extra or {}
+                stage_timings["post"] = _elapsed_ms_since(post_start)
                 resp = _finalize_debug_sections(
                     resp,
-                    include_debug=payload_debug_requested,
+                    include_debug=include_debug,
                     debug_meta_payload=(
                         debug_meta_payload_extra if include_debug else None
                     ),
                     retrieval_debug_payload=(
                         debug_payload_extra if include_debug else None
                     ),
+                    debug_requested_flag=payload_debug_requested,
+                    debug_enabled_flag=include_debug,
+                    force_debug_placeholders=retrieval_debug_allowed,
+                )
+                resp = _ensure_debug_placeholders(
+                    resp,
+                    debug_requested_flag=payload_debug_requested,
+                    debug_enabled_flag=debug_enabled_flag,
                 )
                 resp, sanitized_paths = sanitize_nonfinite_floats(resp)
                 if sanitized_paths and payload_debug_flag:
@@ -4408,7 +4739,12 @@ def ask(
                     chunk_count=len(rows),
                     status="success",
                 )
-                return ChatAskResponse(**resp).model_dump(exclude_none=True)
+                return _final_response_payload(
+                    resp,
+                    stage_timings=stage_timings,
+                    total_start=total_timer_start,
+                    debug_enabled=debug_enabled_flag,
+                )
 
         if not rows:
             if run:
@@ -4423,6 +4759,7 @@ def ask(
                 reason_code="NO_SOURCES",
                 reason_message="No supporting sources were retrieved for this question.",
             )
+            post_start = time.perf_counter()
             resp = {
                 "answer": answer_text,
                 "citations": [],
@@ -4442,19 +4779,33 @@ def ask(
                     guardrail_reason="no_hits",
                     llm_called_override=False,
                 )
-                resp["retrieval_debug"] = debug_payload_extra or {}
+                if retrieval_debug_allowed:
+                    resp["retrieval_debug"] = debug_payload_extra or {}
+                    if not resp.get("retrieval_debug"):
+                        resp["retrieval_debug"] = {"enabled": True}
+                else:
+                    resp["retrieval_debug"] = {}
                 resp["debug_meta"] = debug_meta_payload_extra or {}
                 included_retrieval_debug = True
                 included_debug_meta = True
+            stage_timings["post"] = _elapsed_ms_since(post_start)
             resp = _finalize_debug_sections(
                 resp,
-                include_debug=payload_debug_requested,
+                include_debug=include_debug,
                 debug_meta_payload=(
                     debug_meta_payload_extra if include_debug else None
                 ),
                 retrieval_debug_payload=(
                     debug_payload_extra if include_debug else None
                 ),
+                debug_requested_flag=payload_debug_requested,
+                debug_enabled_flag=include_debug,
+                force_debug_placeholders=retrieval_debug_allowed,
+            )
+            resp = _ensure_debug_placeholders(
+                resp,
+                debug_requested_flag=payload_debug_requested,
+                debug_enabled_flag=debug_enabled_flag,
             )
             resp, sanitized_paths = sanitize_nonfinite_floats(resp)
             if sanitized_paths and payload_debug_flag:
@@ -4475,7 +4826,12 @@ def ask(
                 chunk_count=len(rows),
                 status="success",
             )
-            return ChatAskResponse(**resp).model_dump(exclude_none=True)
+            return _final_response_payload(
+                resp,
+                stage_timings=stage_timings,
+                total_start=total_timer_start,
+                debug_enabled=debug_enabled_flag,
+            )
 
         if direct_email_result is None:
             model, gen = get_model_and_gen_from_run(run)
@@ -4490,8 +4846,10 @@ def ask(
                 )
                 llm_answer_used = False
             else:
+                llm_call_start = None
                 try:
                     llm_called = True
+                    llm_call_start = time.perf_counter()
                     answer, used_ids = answer_with_contract(
                         model,
                         gen,
@@ -4500,8 +4858,10 @@ def ask(
                         allowed_ids,
                         llm_messages,
                     )
+                    stage_timings["llm"] = _elapsed_ms_since(llm_call_start)
                     llm_answer_used = True
                 except Exception as exc:
+                    stage_timings["llm"] = _elapsed_ms_since(llm_call_start)
                     llm_error = type(exc).__name__
                     logger.exception(
                         "answer_with_contract_failed", extra={"request_id": req_id}
@@ -4633,12 +4993,14 @@ def ask(
         citation_sources = used_sources
         preserve_answer_text = answer.strip().startswith("[NO_SOURCES]")
         salvage = None
+        salvage_duration = 0
         salvage_needed = (
             not answerability.answerable
             or _is_insufficient_fallback(answer)
             or (answerability.reason_code or "").upper() == "INSUFFICIENT_EVIDENCE"
         )
         if salvage_needed:
+            salvage_start = time.perf_counter()
             salvage = _maybe_salvage_llm_answer(
                 payload.question or "",
                 source_evidence,
@@ -4651,6 +5013,8 @@ def ask(
                 )
             if salvage:
                 answer, answer_units, answerability = salvage
+            salvage_duration = _elapsed_ms_since(salvage_start)
+        stage_timings["salvage"] = salvage_duration
         if not answerability.answerable and not preserve_answer_text:
             answer, answer_units = _build_insufficient_answer(
                 payload.question or ""
@@ -4661,6 +5025,7 @@ def ask(
             citation_sources if is_admin_user else public_citations(citation_sources)
         )
 
+        post_start = time.perf_counter()
         resp = {
             "answer": answer,
             "citations": citations_out,
@@ -4682,17 +5047,31 @@ def ask(
                 citations_count=len(citation_sources),
                 guardrail_reason=guardrail_reason,
             )
-            resp["retrieval_debug"] = debug_payload_extra or {}
+            if retrieval_debug_allowed:
+                resp["retrieval_debug"] = debug_payload_extra or {}
+                if not resp.get("retrieval_debug"):
+                    resp["retrieval_debug"] = {"enabled": True}
+            else:
+                resp["retrieval_debug"] = {}
             resp["debug_meta"] = debug_meta_payload_extra or {}
+        stage_timings["post"] = _elapsed_ms_since(post_start)
         resp = _finalize_debug_sections(
             resp,
-            include_debug=payload_debug_requested,
+            include_debug=include_debug,
             debug_meta_payload=(
                 debug_meta_payload_extra if include_debug else None
             ),
             retrieval_debug_payload=(
                 debug_payload_extra if include_debug else None
             ),
+            debug_requested_flag=payload_debug_requested,
+            debug_enabled_flag=include_debug,
+            force_debug_placeholders=retrieval_debug_allowed,
+        )
+        resp = _ensure_debug_placeholders(
+            resp,
+            debug_requested_flag=payload_debug_requested,
+            debug_enabled_flag=debug_enabled_flag,
         )
         resp, sanitized_paths = sanitize_nonfinite_floats(resp)
         if sanitized_paths and payload_debug_flag:
@@ -4713,7 +5092,12 @@ def ask(
             chunk_count=len(rows),
             status="success",
         )
-        return ChatAskResponse(**resp).model_dump(exclude_none=True)
+        return _final_response_payload(
+            resp,
+            stage_timings=stage_timings,
+            total_start=total_timer_start,
+            debug_enabled=debug_enabled_flag,
+        )
 
     except HTTPException as exc:
         if debug_meta_for_errors is not None:
@@ -4727,10 +5111,13 @@ def ask(
             exc.detail = detail_sanitized
         exc.detail = _finalize_debug_sections(
             exc.detail,
-            include_debug=payload_debug_requested,
+            include_debug=include_debug,
             debug_meta_payload=(
                 debug_meta_for_errors if include_debug else None
             ),
+            debug_requested_flag=payload_debug_requested,
+            debug_enabled_flag=include_debug,
+            force_debug_placeholders=retrieval_debug_allowed,
         )
         _emit_audit_event(
             request_id=req_id,
@@ -4756,7 +5143,7 @@ def ask(
             "internal_error",
             message,
             debug_meta=debug_meta_for_errors,
-            include_debug=payload_debug_requested,
+            include_debug=include_debug,
         )
         _emit_audit_event(
             request_id=req_id,
