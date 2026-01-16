@@ -56,24 +56,42 @@ function collectRequestHeaders(request: NextRequest): Headers {
     if (value) headers.set(name, value);
   }
 
-  // Optional: inject demo token if caller didn't provide Authorization.
-  const token = process.env.RAGQA_DEMO_TOKEN;
-  const auth = headers.get("authorization") || "";
-  if (token && !auth.trim()) {
-    headers.set("authorization", `Bearer ${token}`);
+  const authHeader = (headers.get("authorization") || "").trim();
+  if (!authHeader) {
+    const devSub = (request.headers.get("x-dev-sub") || "").trim();
+    const backendTarget = process.env.RAGQA_BACKEND_BASE_URL || "";
+    const nodeEnv = process.env.NODE_ENV || "";
+    const localBackend = /localhost|127\.0\.0\.1/i.test(backendTarget);
+    const localDevContext = nodeEnv !== "production" && localBackend;
+    if (devSub && localDevContext) {
+      const devToken = process.env.RAGQA_DEV_TOKEN || "dev-token";
+      headers.set("authorization", `Bearer ${devToken}`);
+    } else if (
+      process.env.RAGQA_INJECT_DEMO_TOKEN === "1" &&
+      process.env.RAGQA_DEMO_TOKEN
+    ) {
+      headers.set("authorization", `Bearer ${process.env.RAGQA_DEMO_TOKEN}`);
+    }
   }
 
   return headers;
 }
 
-function filterResponseHeaders(upstream: Headers): Headers {
+function filterResponseHeaders(
+  upstream: Headers,
+  opts?: { addContentTypeFallback?: boolean },
+): Headers {
   const headers = new Headers();
   upstream.forEach((value, name) => {
     if (!HOP_BY_HOP_HEADERS.has(name.toLowerCase())) {
       headers.set(name, value);
     }
   });
-  if (!headers.has("content-type")) {
+  const addFallback =
+    opts && "addContentTypeFallback" in opts
+      ? Boolean(opts.addContentTypeFallback)
+      : true;
+  if (addFallback && !headers.has("content-type")) {
     headers.set("content-type", "application/octet-stream");
   }
   return headers;
@@ -136,12 +154,19 @@ async function handleProxy(
     );
   }
 
-  const responseHeaders = filterResponseHeaders(upstreamResponse.headers);
+  const isNoContent = upstreamResponse.status === 204 || upstreamResponse.status === 205;
+  const responseHeaders = filterResponseHeaders(upstreamResponse.headers, {
+    addContentTypeFallback: !isNoContent,
+  });
 
   // Debug markers (remove later if you want)
   responseHeaders.set("x-ragqa-proxy", "1");
 
   if (request.method.toUpperCase() === "HEAD") {
+    return new Response(null, { status: upstreamResponse.status, headers: responseHeaders });
+  }
+
+  if (isNoContent) {
     return new Response(null, { status: upstreamResponse.status, headers: responseHeaders });
   }
 

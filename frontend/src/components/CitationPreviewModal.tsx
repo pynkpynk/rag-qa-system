@@ -17,6 +17,7 @@ type CitationPreviewModalProps = {
   onClose: () => void;
   target: PreviewTarget | null;
   title?: string;
+  devSub?: string;
 };
 
 export default function CitationPreviewModal({
@@ -24,6 +25,7 @@ export default function CitationPreviewModal({
   onClose,
   target,
   title,
+  devSub,
 }: CitationPreviewModalProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const [loading, setLoading] = useState(false);
@@ -52,6 +54,7 @@ export default function CitationPreviewModal({
         const resp = await apiFetch(
           DEFAULT_API_BASE,
           `/docs/${target.documentId}/content`,
+          devSub || undefined,
         );
         if (!resp.ok) {
           const message = (await resp.text()) || resp.statusText;
@@ -110,7 +113,7 @@ export default function CitationPreviewModal({
     return () => {
       cancelled = true;
     };
-  }, [open, target]);
+  }, [open, target, devSub]);
 
   if (!open) {
     return null;
