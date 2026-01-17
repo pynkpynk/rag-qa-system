@@ -76,7 +76,10 @@ type ChatMessage = {
 };
 
 const STORAGE_GLOSSARY = "ragqa.ui.glossary";
+const STORAGE_DEV_SUB = "ragqa.ui.devSub";
+const DEV_SUB_DEFAULT = "dev|user";
 const MAX_UPLOAD_BYTES = 4 * 1024 * 1024;
+const IS_PROD = process.env.NODE_ENV === "production";
 
 const SAMPLE_PROMPTS = [
   "Summarize the obligations in section 3 of the latest policy.",
@@ -118,6 +121,24 @@ function useGlossary() {
     window.localStorage.setItem(STORAGE_GLOSSARY, glossary);
   }, [glossary]);
   return { glossary, setGlossary };
+}
+
+function useDevSub() {
+  const [devSub, setDevSub] = useState(IS_PROD ? "" : DEV_SUB_DEFAULT);
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    if (IS_PROD) {
+      setDevSub("");
+      return;
+    }
+    const stored = (window.localStorage.getItem(STORAGE_DEV_SUB) || "").trim();
+    const next = stored || DEV_SUB_DEFAULT;
+    setDevSub(next);
+    if (!stored) {
+      window.localStorage.setItem(STORAGE_DEV_SUB, next);
+    }
+  }, []);
+  return devSub;
 }
 
 function useApi(baseUrl: string, devSub: string) {
@@ -163,7 +184,7 @@ function citationKey(c: ChatCitation): string {
 
 export default function HomeClient() {
   const baseUrl = DEFAULT_API_BASE;
-  const devSub = "";
+  const devSub = useDevSub();
   const apiBaseLabel = normalizeApiBase(baseUrl);
   const api = useApi(baseUrl, devSub);
   const { glossary, setGlossary } = useGlossary();
@@ -1476,6 +1497,7 @@ export default function HomeClient() {
       }}
       target={previewTarget}
       title={previewTitle || undefined}
+      devSub={devSub}
     />
     </>
   );
