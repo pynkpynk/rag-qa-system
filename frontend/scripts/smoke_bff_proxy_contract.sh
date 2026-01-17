@@ -138,7 +138,14 @@ with open(sys.argv[1], "r", encoding="utf-8") as handle:
 PY
 fi
 
-log "2) GET /api/docs with invalid Authorization should fail auth"
+log "2) GET /api/docs without Authorization should still succeed"
+perform_request GET "/api/docs" without-dev
+if [[ "$resp_status" != "200" ]]; then
+  fail "Expected 200 without auth header, got $resp_status with body: $(body_preview)"
+fi
+ensure_json_array || fail "Docs response without auth is not valid JSON array"
+
+log "3) GET /api/docs with invalid Authorization should fail auth"
 perform_request GET "/api/docs" without-dev -H "Authorization: Bearer invalid-token"
 if [[ "$resp_status" != "401" ]]; then
   fail "Expected 401 for invalid token, got $resp_status"
@@ -147,7 +154,7 @@ if [[ "$resp_body" != *"NOT_AUTHENTICATED"* && "$resp_body" != *"Missing bearer 
   fail "Expected NOT_AUTHENTICATED error, got: $(body_preview)"
 fi
 
-log "3) POST /api/docs/upload with extractable PDF"
+log "4) POST /api/docs/upload with extractable PDF"
 perform_request POST "/api/docs/upload" with-dev -F "file=@${PDF_TMP};type=application/pdf;filename=smoke.pdf"
 case "$resp_status" in
   200|201) ;;
@@ -174,7 +181,36 @@ if [[ -z "$doc_id" ]]; then
 fi
 log "Upload returned document_id=$doc_id"
 
-log "4) DELETE /api/docs/${doc_id} returns 204 with empty body"
+log "5) POST /api/chat/ask returns answerable response with citations"
+chat_payload=$(cat <<JSON
+{"question":"For document_id=${doc_id} (smoke.pdf; it contains the line 'RAG QA System smoke test PDF'), does this PDF have extractable text? Answer using citations.","k":6}
+JSON
+)
+perform_request POST "/api/chat/ask" with-dev \
+  -H "Content-Type: application/json" \
+  -d "$chat_payload"
+if [[ "$resp_status" != "200" ]]; then
+  fail "Expected 200 from /api/chat/ask, got $resp_status with body: $(body_preview)"
+fi
+if ! python3 - "$resp_body_file" "$doc_id" <<'PY'
+import json, sys
+path, doc_id = sys.argv[1], sys.argv[2]
+with open(path, "r", encoding="utf-8") as handle:
+    data = json.load(handle)
+ans = data.get("answerability") or {}
+if not ans.get("answerable"):
+    raise SystemExit("chat answerability.answerable is not true")
+citations = data.get("citations")
+if not isinstance(citations, list) or not citations:
+    raise SystemExit("chat citations missing or empty")
+if not any((isinstance(c, dict) and c.get("document_id") == doc_id) for c in citations):
+    raise SystemExit("chat citations do not reference uploaded document_id")
+PY
+then
+  fail "chat response invalid: $(body_preview)"
+fi
+
+log "6) DELETE /api/docs/${doc_id} returns 204 with empty body"
 perform_request DELETE "/api/docs/${doc_id}" with-dev
 if [[ "$resp_status" != "204" ]]; then
   fail "Expected 204 delete status, got $resp_status with body: $(body_preview)"
