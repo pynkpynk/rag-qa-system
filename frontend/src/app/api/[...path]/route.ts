@@ -39,8 +39,23 @@ const HOP_BY_HOP_HEADERS = new Set([
 
 const decoder = new TextDecoder("utf-8");
 
+function getBackendBase(): string {
+  return (process.env.RAGQA_BACKEND_BASE_URL || "").replace(/\/+$/, "");
+}
+
+function isLocalBackend(baseUrl: string): boolean {
+  if (!baseUrl) return false;
+  try {
+    const parsed = new URL(baseUrl);
+    const host = (parsed.hostname || "").toLowerCase();
+    return host === "localhost" || host === "127.0.0.1" || host === "::1";
+  } catch {
+    return false;
+  }
+}
+
 function buildUpstreamUrl(path: string[], search: string): string {
-  const backend = (process.env.RAGQA_BACKEND_BASE_URL || "").replace(/\/+$/, "");
+  const backend = getBackendBase();
   if (!backend) {
     throw new Error("RAGQA_BACKEND_BASE_URL is not configured");
   }
@@ -56,22 +71,28 @@ function collectRequestHeaders(request: NextRequest): Headers {
     if (value) headers.set(name, value);
   }
 
-  const authHeader = (headers.get("authorization") || "").trim();
-  if (!authHeader) {
+  if (!headers.has("accept-encoding")) {
+    headers.set("accept-encoding", "identity");
+  }
+
+  let auth = (headers.get("authorization") || "").trim();
+  if (!auth) {
+    const backendBase = getBackendBase();
     const devSub = (request.headers.get("x-dev-sub") || "").trim();
-    const backendTarget = process.env.RAGQA_BACKEND_BASE_URL || "";
-    const nodeEnv = process.env.NODE_ENV || "";
-    const localBackend = /localhost|127\.0\.0\.1/i.test(backendTarget);
-    const localDevContext = nodeEnv !== "production" && localBackend;
-    if (devSub && localDevContext) {
+    const nodeEnv = (process.env.NODE_ENV || "").toLowerCase();
+    const allowDevInjection =
+      isLocalBackend(backendBase) && (devSub || nodeEnv !== "production");
+    if (allowDevInjection) {
       const devToken = process.env.RAGQA_DEV_TOKEN || "dev-token";
       headers.set("authorization", `Bearer ${devToken}`);
-    } else if (
-      process.env.RAGQA_INJECT_DEMO_TOKEN === "1" &&
-      process.env.RAGQA_DEMO_TOKEN
-    ) {
-      headers.set("authorization", `Bearer ${process.env.RAGQA_DEMO_TOKEN}`);
+      auth = devToken;
     }
+  }
+
+  // Optional: inject demo token if caller didn't provide Authorization.
+  const token = process.env.RAGQA_DEMO_TOKEN;
+  if (token && !auth) {
+    headers.set("authorization", `Bearer ${token}`);
   }
 
   return headers;
@@ -94,6 +115,9 @@ function filterResponseHeaders(
   if (addFallback && !headers.has("content-type")) {
     headers.set("content-type", "application/octet-stream");
   }
+  headers.delete("content-encoding");
+  headers.delete("content-length");
+  headers.delete("transfer-encoding");
   return headers;
 }
 
@@ -154,7 +178,8 @@ async function handleProxy(
     );
   }
 
-  const isNoContent = upstreamResponse.status === 204 || upstreamResponse.status === 205;
+  const isNoContent =
+    upstreamResponse.status === 204 || upstreamResponse.status === 205;
   const responseHeaders = filterResponseHeaders(upstreamResponse.headers, {
     addContentTypeFallback: !isNoContent,
   });

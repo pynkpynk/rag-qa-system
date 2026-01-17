@@ -23,6 +23,10 @@ curl -H "x-dev-sub: dev|user" http://localhost:3000/api/docs
 ## 204/205 upstream handling
 - When the backend returns HTTP 204 or 205, the proxy must relay the status and filtered headers without buffering/parsing the body or inventing JSON/content-type values. These responses should never be wrapped in `UPSTREAM_INVALID_JSON`.
 
+## Encoding / decoding
+- The proxy forces `Accept-Encoding: identity` on upstream fetches to avoid compressed payloads the proxy would need to re-decode.
+- Whenever the proxy buffers or re-serializes a body (JSON, text, binary), it must remove `content-encoding`, `content-length`, and `transfer-encoding` headers before responding so browsers do not attempt double-decoding (e.g., `ERR_CONTENT_DECODING_FAILED`).
+
 ## Size limits / 413 propagation
 - The proxy must pass through backend size guards: requests exceeding `MAX_REQUEST_BYTES` must surface as HTTP 413 `Request body too large`, preserving the backend error payload so callers know the request needs trimming.
 

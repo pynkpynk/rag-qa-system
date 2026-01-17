@@ -3,13 +3,13 @@ set -euo pipefail
 
 WEB_BASE=${WEB_BASE:-http://127.0.0.1:3000}
 DEV_SUB=${DEV_SUB:-dev|user}
-PDF_TMP=$(mktemp "${TMPDIR:-/tmp}/ragqa_smoke_pdf.XXXXXX.pdf")
 TMP_FILES=()
+PDF_TMP=$(mktemp "${TMPDIR:-/tmp}/ragqa_smoke_pdf.XXXXXX.pdf")
+TMP_FILES+=("$PDF_TMP")
 
 cleanup() {
-  rm -f "$PDF_TMP"
-  for f in "${TMP_FILES[@]:-}"; do
-    rm -f "$f"
+  for file in "${TMP_FILES[@]}"; do
+    [[ -f "$file" ]] && rm -f "$file"
   done
 }
 trap cleanup EXIT
@@ -30,21 +30,30 @@ sys.stdout.buffer.write(base64.b64decode(data))
 PY
 
 if ! head -c 4 "$PDF_TMP" | grep -q "%PDF"; then
-  fail "Embedded PDF is corrupted or missing %PDF header"
+  fail "Embedded PDF missing %PDF header"
 fi
 
 resp_status=""
 resp_body=""
+resp_body_file=""
+resp_header_file=""
+
+make_tmp() {
+  local file
+  file=$(mktemp "${TMPDIR:-/tmp}/ragqa_smoke_tmp.XXXXXX")
+  TMP_FILES+=("$file")
+  printf '%s' "$file"
+}
 
 perform_request() {
   local method=$1
   local path=$2
   local header_mode=$3
   shift 3
-  local body_file
-  body_file=$(mktemp "${TMPDIR:-/tmp}/ragqa_smoke_body.XXXXXX")
-  TMP_FILES+=("$body_file")
-  local curl_cmd=(curl -sS -X "$method" -o "$body_file" -w '%{http_code}')
+  local body_file header_file
+  body_file=$(make_tmp)
+  header_file=$(make_tmp)
+  local curl_cmd=(curl -sS -X "$method" -D "$header_file" -o "$body_file" -w '%{http_code}')
   if [[ "$header_mode" == "with-dev" ]]; then
     curl_cmd+=(-H "x-dev-sub: ${DEV_SUB}")
   fi
@@ -52,20 +61,40 @@ perform_request() {
   curl_cmd+=("${WEB_BASE}${path}")
   resp_status=$("${curl_cmd[@]}")
   resp_body=$(cat "$body_file")
+  resp_body_file="$body_file"
+  resp_header_file="$header_file"
 }
 
 body_preview() {
   printf '%s' "$resp_body" | head -c 200
 }
 
-log "1) GET /api/docs with x-dev-sub"
-perform_request GET "/api/docs" with-dev
-if [[ "$resp_status" != "200" ]]; then
-  fail "Expected 200, got $resp_status with body: $(body_preview)"
-fi
-printf '%s' "$resp_body" | python3 -c '
+get_header_value() {
+  local key
+  key=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  [[ -n "$resp_header_file" ]] || return
+  awk -v target="$key" '
+    BEGIN { IGNORECASE = 1 }
+    /^$/ { next }
+    /^HTTP\// { next }
+    {
+      split($0, parts, ":")
+      name = tolower(parts[1])
+      if (name == target) {
+        sub(/^[^:]+:\s*/, "", $0)
+        print $0
+        exit
+      }
+    }
+  ' "$resp_header_file" | tr -d $'\r'
+}
+
+ensure_json_array() {
+  python3 - "$resp_body_file" <<'PY'
 import json, sys
-data = json.load(sys.stdin)
+path = sys.argv[1]
+with open(path, "r", encoding="utf-8") as handle:
+    data = json.load(handle)
 if not isinstance(data, list):
     raise SystemExit("docs payload is not a list")
 for i, doc in enumerate(data):
@@ -74,12 +103,45 @@ for i, doc in enumerate(data):
     for key in ("document_id", "filename", "status"):
         if key not in doc:
             raise SystemExit(f"docs[{i}] missing key {key!r}")
-'
+PY
+}
 
-log "2) GET /api/docs without x-dev-sub should fail auth"
-perform_request GET "/api/docs" without-dev
+log "1) GET /api/docs with x-dev-sub"
+perform_request GET "/api/docs" with-dev
+if [[ "$resp_status" != "200" ]]; then
+  fail "Expected 200, got $resp_status with body: $(body_preview)"
+fi
+ensure_json_array || fail "Docs response is not valid JSON array"
+
+log "1b) Encoding correctness with Accept-Encoding: br"
+perform_request GET "/api/docs" with-dev -H "Accept-Encoding: br"
+encoding=$(get_header_value "content-encoding")
+if [[ -n "$encoding" ]]; then
+  lower=${encoding,,}
+  if [[ "$lower" == "br" ]]; then
+    node - "$resp_body_file" <<'NODE' || fail "Brotli decoding failed"
+const fs = require("fs");
+const { brotliDecompressSync } = require("zlib");
+const path = process.argv[1];
+const raw = fs.readFileSync(path);
+const decoded = brotliDecompressSync(raw).toString("utf8");
+JSON.parse(decoded);
+NODE
+  else
+    fail "Unexpected content-encoding '${encoding}'"
+  fi
+else
+  python3 - "$resp_body_file" <<'PY' || fail "Encoding-free response is not JSON"
+import json, sys
+with open(sys.argv[1], "r", encoding="utf-8") as handle:
+    json.load(handle)
+PY
+fi
+
+log "2) GET /api/docs with invalid Authorization should fail auth"
+perform_request GET "/api/docs" without-dev -H "Authorization: Bearer invalid-token"
 if [[ "$resp_status" != "401" ]]; then
-  fail "Expected 401 without dev header, got $resp_status"
+  fail "Expected 401 for invalid token, got $resp_status"
 fi
 if [[ "$resp_body" != *"NOT_AUTHENTICATED"* && "$resp_body" != *"Missing bearer token"* ]]; then
   fail "Expected NOT_AUTHENTICATED error, got: $(body_preview)"
@@ -89,25 +151,23 @@ log "3) POST /api/docs/upload with extractable PDF"
 perform_request POST "/api/docs/upload" with-dev -F "file=@${PDF_TMP};type=application/pdf;filename=smoke.pdf"
 case "$resp_status" in
   200|201) ;;
-  *) fail "Upload expected 200 or 201, got $resp_status with body: $(body_preview)" ;;
+  *) fail "Upload expected 200/201, got $resp_status with body: $(body_preview)" ;;
 esac
 if [[ "$resp_body" == *"PDF_PARSE_FAILED"* || "$resp_body" == *"No extractable content"* ]]; then
   fail "Upload failed parse check: $(body_preview)"
 fi
 doc_id=$(
-  printf '%s' "$resp_body" | python3 -c '
+  python3 - "$resp_body_file" <<'PY' || true
 import json, sys
-try:
-    data = json.load(sys.stdin)
-except json.JSONDecodeError as exc:
-    raise SystemExit(f"upload response not JSON: {exc}")
+with open(sys.argv[1], "r", encoding="utf-8") as handle:
+    data = json.load(handle)
 if isinstance(data, dict) and data.get("error"):
     raise SystemExit(f"upload returned error: {data['error']}")
 doc_id = data.get("document_id") or data.get("document", {}).get("document_id")
 if not doc_id:
     raise SystemExit("document_id missing from upload response")
 print(doc_id, end="")
-' || true
+PY
 )
 if [[ -z "$doc_id" ]]; then
   fail "Could not determine uploaded document_id"
