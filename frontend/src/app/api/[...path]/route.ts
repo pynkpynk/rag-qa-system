@@ -39,8 +39,23 @@ const HOP_BY_HOP_HEADERS = new Set([
 
 const decoder = new TextDecoder("utf-8");
 
+function getBackendBase(): string {
+  return (process.env.RAGQA_BACKEND_BASE_URL || "").replace(/\/+$/, "");
+}
+
+function isLocalBackend(baseUrl: string): boolean {
+  if (!baseUrl) return false;
+  try {
+    const parsed = new URL(baseUrl);
+    const host = (parsed.hostname || "").toLowerCase();
+    return host === "localhost" || host === "127.0.0.1" || host === "::1";
+  } catch {
+    return false;
+  }
+}
+
 function buildUpstreamUrl(path: string[], search: string): string {
-  const backend = (process.env.RAGQA_BACKEND_BASE_URL || "").replace(/\/+$/, "");
+  const backend = getBackendBase();
   if (!backend) {
     throw new Error("RAGQA_BACKEND_BASE_URL is not configured");
   }
@@ -56,26 +71,53 @@ function collectRequestHeaders(request: NextRequest): Headers {
     if (value) headers.set(name, value);
   }
 
+  if (!headers.has("accept-encoding")) {
+    headers.set("accept-encoding", "identity");
+  }
+
+  let auth = (headers.get("authorization") || "").trim();
+  if (!auth) {
+    const backendBase = getBackendBase();
+    const devSub = (request.headers.get("x-dev-sub") || "").trim();
+    const nodeEnv = (process.env.NODE_ENV || "").toLowerCase();
+    const allowDevInjection =
+      isLocalBackend(backendBase) && (devSub || nodeEnv !== "production");
+    if (allowDevInjection) {
+      const devToken = process.env.RAGQA_DEV_TOKEN || "dev-token";
+      headers.set("authorization", `Bearer ${devToken}`);
+      auth = devToken;
+    }
+  }
+
   // Optional: inject demo token if caller didn't provide Authorization.
   const token = process.env.RAGQA_DEMO_TOKEN;
-  const auth = headers.get("authorization") || "";
-  if (token && !auth.trim()) {
+  if (token && !auth) {
     headers.set("authorization", `Bearer ${token}`);
   }
 
   return headers;
 }
 
-function filterResponseHeaders(upstream: Headers): Headers {
+function filterResponseHeaders(
+  upstream: Headers,
+  opts?: { addContentTypeFallback?: boolean },
+): Headers {
   const headers = new Headers();
   upstream.forEach((value, name) => {
     if (!HOP_BY_HOP_HEADERS.has(name.toLowerCase())) {
       headers.set(name, value);
     }
   });
-  if (!headers.has("content-type")) {
+  const addFallback =
+    opts && "addContentTypeFallback" in opts
+      ? Boolean(opts.addContentTypeFallback)
+      : true;
+  if (addFallback && !headers.has("content-type")) {
     headers.set("content-type", "application/octet-stream");
   }
+  headers.delete("content-encoding");
+  headers.delete("content-length");
+  headers.delete("transfer-encoding");
   return headers;
 }
 
@@ -136,12 +178,20 @@ async function handleProxy(
     );
   }
 
-  const responseHeaders = filterResponseHeaders(upstreamResponse.headers);
+  const isNoContent =
+    upstreamResponse.status === 204 || upstreamResponse.status === 205;
+  const responseHeaders = filterResponseHeaders(upstreamResponse.headers, {
+    addContentTypeFallback: !isNoContent,
+  });
 
   // Debug markers (remove later if you want)
   responseHeaders.set("x-ragqa-proxy", "1");
 
   if (request.method.toUpperCase() === "HEAD") {
+    return new Response(null, { status: upstreamResponse.status, headers: responseHeaders });
+  }
+
+  if (isNoContent) {
     return new Response(null, { status: upstreamResponse.status, headers: responseHeaders });
   }
 
