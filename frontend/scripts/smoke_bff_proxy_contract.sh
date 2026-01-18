@@ -117,12 +117,17 @@ log "1b) Encoding correctness with Accept-Encoding: br"
 perform_request GET "/api/docs" with-dev -H "Accept-Encoding: br"
 encoding=$(get_header_value "content-encoding")
 if [[ -n "$encoding" ]]; then
-  lower=${encoding,,}
-  if [[ "$lower" == "br" ]]; then
+  encoding_clean=$(printf '%s' "$encoding" | tr -d '[:space:]')
+  encoding_lower=$(printf '%s' "$encoding_clean" | tr '[:upper:]' '[:lower:]')
+  if [[ "$encoding_lower" == "br" ]]; then
     node - "$resp_body_file" <<'NODE' || fail "Brotli decoding failed"
 const fs = require("fs");
 const { brotliDecompressSync } = require("zlib");
-const path = process.argv[1];
+const path = process.argv[2];
+if (!path) {
+  console.error("missing body file path");
+  process.exit(1);
+}
 const raw = fs.readFileSync(path);
 const decoded = brotliDecompressSync(raw).toString("utf8");
 JSON.parse(decoded);
