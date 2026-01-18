@@ -25,7 +25,7 @@ export async function middleware(request: NextRequest) {
   const pathname = request.nextUrl.pathname || "";
   const inProduction = process.env.NODE_ENV === "production";
   const allowDevRoutes = process.env.ALLOW_DEV_ROUTES === "1";
-  const demoEnabled = process.env.DEMO_ENTRY_ENABLED === "1";
+  const demoEnabled = Boolean((process.env.RAGQA_DEMO_TOKEN || "").trim());
   const authConfigured = isAuthConfigured;
   const authFlag = authConfigured ? "1" : "0";
   const mw = (action: string, response: NextResponse) => {
@@ -42,14 +42,21 @@ export async function middleware(request: NextRequest) {
     return mw("rewrite:/404", NextResponse.rewrite(url));
   };
 
-  if (pathname === "/demo" || pathname.startsWith("/demo/")) {
-    if (demoEnabled) {
-      return mw("next", NextResponse.next());
+  if (pathname === "/_demo" || pathname.startsWith("/_demo/")) {
+    return rewriteTo404();
+  }
+
+  if (pathname === "/demo") {
+    if (!demoEnabled) {
+      return rewriteTo404();
     }
-    return mw(
-      "404:/demo",
-      new NextResponse("Not Found", { status: 404 }),
-    );
+    const url = request.nextUrl.clone();
+    url.pathname = "/_demo";
+    return mw("rewrite:/_demo", NextResponse.rewrite(url));
+  }
+
+  if (pathname.startsWith("/demo/")) {
+    return rewriteTo404();
   }
 
   const isAdminDevRoute =
@@ -140,5 +147,9 @@ export const config = {
     "/runs/:path*",
     "/console/:path*",
     "/dev/:path*",
+    "/demo",
+    "/demo/:path*",
+    "/_demo",
+    "/_demo/:path*",
   ],
 };

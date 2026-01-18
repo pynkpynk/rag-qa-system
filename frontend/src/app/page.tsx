@@ -4,7 +4,7 @@ import Link from "next/link";
 export const dynamic = "force-dynamic";
 
 export default function HomePage(): ReactElement {
-  const demoEnabled = process.env.DEMO_ENTRY_ENABLED === "1";
+  const demoEnabled = Boolean((process.env.RAGQA_DEMO_TOKEN || "").trim());
   return (
     <main
       style={{
