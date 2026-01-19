@@ -11,6 +11,7 @@ SECURITY RULES (must follow):
 CITATION CONTRACT:
 - Output MUST contain only citation markers like [S1], [S2] etc. (no URLs, no extra formatting).
 - If you cannot answer from sources, say you cannot with one citation marker to the closest source, e.g., [S1].
+- If sources contain relevant information, you MUST answer using them. Partial answers are allowed; do not refuse when any supporting text exists.
 
 LANGUAGE RULE:
 - Respond in the same language as the user's question.

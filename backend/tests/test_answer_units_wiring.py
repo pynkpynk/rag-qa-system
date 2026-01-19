@@ -4,8 +4,6 @@ from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
-from app.main import app as fastapi_app
-from app.core.authz import Principal
 from app.api.routes import chat as chat_module
 from app.api.routes.chat import (
     _apply_cannot_answer_override,
@@ -217,8 +215,9 @@ def test_unknown_answer_forces_answerability_false_en():
     evidence = _sample_evidence()
     answer = "- I don't know based on the provided sources."
     units = build_answer_units_for_response(answer, evidence)
-    answerability = determine_answerability("question", evidence, units)
-    assert answerability.answerable is True
+    answerability = determine_answerability("question", evidence, units, answer)
+    assert answerability.answerable is False
+    assert answerability.reason_code == "INSUFFICIENT_EVIDENCE"
     updated = _apply_cannot_answer_override(
         "I don't know based on the provided sources.", answerability
     )
@@ -230,8 +229,9 @@ def test_unknown_answer_forces_answerability_false_ja():
     evidence = _sample_evidence()
     answer = "- 提供された資料からは判断できません。"
     units = build_answer_units_for_response(answer, evidence)
-    answerability = determine_answerability("question", evidence, units)
-    assert answerability.answerable is True
+    answerability = determine_answerability("question", evidence, units, answer)
+    assert answerability.answerable is False
+    assert answerability.reason_code == "INSUFFICIENT_EVIDENCE"
     updated = _apply_cannot_answer_override(
         "提供された資料からは判断できません。", answerability
     )
@@ -255,7 +255,8 @@ def test_unknown_answer_forces_answerability_false_ja_variant():
     units = build_answer_units_for_response("- Valid [S1]", evidence)
     answerability = determine_answerability("question", evidence, units)
     updated = _apply_cannot_answer_override(
-        "提供された参照資料には具体的な手順が含まれていないため、要約できません。", answerability
+        "提供された参照資料には具体的な手順が含まれていないため、要約できません。",
+        answerability,
     )
     assert updated.answerable is False
     assert updated.reason_code == "INSUFFICIENT_EVIDENCE"
@@ -288,7 +289,8 @@ def test_unit_level_override_triggers_for_cannot_answer_message():
         )
     ]
     answerability = determine_answerability("question", _sample_evidence(), units)
-    assert answerability.answerable is True
+    assert answerability.answerable is False
+    assert answerability.reason_code == "INSUFFICIENT_EVIDENCE"
     updated = _apply_cannot_answer_override_from_units(units, answerability)
     assert updated.answerable is False
     assert updated.reason_code == "INSUFFICIENT_EVIDENCE"
@@ -1070,9 +1072,7 @@ def test_no_bullet_request_with_sentence_limit_keeps_units():
 
 
 def test_trim_units_never_returns_empty_when_limit_positive(monkeypatch):
-    monkeypatch.setattr(
-        chat_module, "_sentence_limit_from_question", lambda _q: 1
-    )
+    monkeypatch.setattr(chat_module, "_sentence_limit_from_question", lambda _q: 1)
     units = [
         AnswerUnit(text="Sentence one.", citations=[]),
         AnswerUnit(text="Sentence two.", citations=[]),
@@ -1206,7 +1206,9 @@ def test_localized_units_preserve_citations(monkeypatch):
             "text": "Gamma section covers escalation.",
         },
     ]
-    answer = "- Governance basics [S1]\n- Controls cadence [S2]\n- Escalation steps [S3]"
+    answer = (
+        "- Governance basics [S1]\n- Controls cadence [S2]\n- Escalation steps [S3]"
+    )
     units = build_answer_units_for_response(answer, evidence)
     localized_lines = [
         "- ガバナンスの基本 [S1]",
