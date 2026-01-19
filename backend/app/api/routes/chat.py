@@ -175,12 +175,8 @@ _SUMMARY_HEADER_HINTS = (
 _BULLET_PREFIXES = ("- ", "* ", "• ", "・")
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?。！？])\s*")
 _EMAIL_SENTENCE_GUARD = "__EMAIL_DOT__"
-_EMAIL_IN_SENTENCE_RE = re.compile(
-    r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"
-)
-_SPLIT_EMAIL_RE = re.compile(
-    r"([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+)\.\s+([A-Za-z0-9-]+)"
-)
+_EMAIL_IN_SENTENCE_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+_SPLIT_EMAIL_RE = re.compile(r"([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+)\.\s+([A-Za-z0-9-]+)")
 _BULLET_PREFIX_RE = re.compile(r"^\s*(?:[-*•・]|[\d]+[.)])\s+")
 _SPACE_RE = re.compile(r"\s+")
 _KEY_FACTS_PREFIX_RE = re.compile(r"^\s*key facts?:\s*", re.IGNORECASE)
@@ -215,8 +211,14 @@ _COMPACTION_EXTRA_HINTS = (
     ("経営層", ("executive", "leadership")),
     ("サプライチェーン", ("supply chain", "c-scrm", "privacy", "erm")),
     ("プライバシ", ("privacy", "ict risk")),
-    ("オンライン資源", ("informative references", "implementation examples", "quick start")),
-    ("一律", ("one-size-fits-all", "adapt", "specific needs", "implementation will vary")),
+    (
+        "オンライン資源",
+        ("informative references", "implementation examples", "quick start"),
+    ),
+    (
+        "一律",
+        ("one-size-fits-all", "adapt", "specific needs", "implementation will vary"),
+    ),
     ("成果", ("outcomes", "sector-neutral", "flexibility", "security controls")),
     ("アウトカム", ("outcome", "outcomes")),
 )
@@ -789,7 +791,9 @@ def _expand_retrieval_query(base: str, question: str) -> str:
     if "プライバシ" in q:
         additions.append("privacy")
     if "規定しない" in q and any(term in q for term in ("実装", "手段", "方法")):
-        additions.append("does not prescribe prescriptive how outcomes should be achieved")
+        additions.append(
+            "does not prescribe prescriptive how outcomes should be achieved"
+        )
     if any(term in q for term in ("一律", "ワンサイズ", "適用")):
         additions.extend(
             [
@@ -973,7 +977,7 @@ def _sanitize_answer_unit_texts(question: str, units: list[AnswerUnit]) -> None:
 
 
 def _find_evidence_for_non_prescriptive(
-    source_evidence: list[dict[str, Any]]
+    source_evidence: list[dict[str, Any]],
 ) -> dict[str, Any] | None:
     for evidence in source_evidence or []:
         normalized = _normalize_text_for_match(evidence.get("text") or "")
@@ -983,7 +987,7 @@ def _find_evidence_for_non_prescriptive(
 
 
 def _find_evidence_for_enterprise_risk(
-    source_evidence: list[dict[str, Any]]
+    source_evidence: list[dict[str, Any]],
 ) -> dict[str, Any] | None:
     for evidence in source_evidence or []:
         normalized = _normalize_text_for_match(evidence.get("text") or "")
@@ -995,7 +999,7 @@ def _find_evidence_for_enterprise_risk(
 
 
 def _find_evidence_for_one_size_fits_all(
-    source_evidence: list[dict[str, Any]]
+    source_evidence: list[dict[str, Any]],
 ) -> dict[str, Any] | None:
     for evidence in source_evidence or []:
         normalized = _normalize_no_space(evidence.get("text") or "")
@@ -1005,7 +1009,7 @@ def _find_evidence_for_one_size_fits_all(
 
 
 def _find_evidence_for_governance(
-    source_evidence: list[dict[str, Any]]
+    source_evidence: list[dict[str, Any]],
 ) -> dict[str, Any] | None:
     keywords = (
         "governance",
@@ -1023,7 +1027,7 @@ def _find_evidence_for_governance(
 
 
 def _find_evidence_for_exec_communication(
-    source_evidence: list[dict[str, Any]]
+    source_evidence: list[dict[str, Any]],
 ) -> dict[str, Any] | None:
     for evidence in source_evidence or []:
         normalized = _normalize_text_for_match(evidence.get("text") or "")
@@ -1035,7 +1039,7 @@ def _find_evidence_for_exec_communication(
 
 
 def _find_evidence_for_online_resources(
-    source_evidence: list[dict[str, Any]]
+    source_evidence: list[dict[str, Any]],
 ) -> dict[str, Any] | None:
     for evidence in source_evidence or []:
         normalized = _normalize_text_for_match(evidence.get("text") or "")
@@ -1062,23 +1066,21 @@ def _question_targets_outcomes(text: str) -> bool:
 
 
 def _find_evidence_for_outcomes_focus(
-    source_evidence: list[dict[str, Any]]
+    source_evidence: list[dict[str, Any]],
 ) -> dict[str, Any] | None:
     for evidence in source_evidence or []:
         normalized = _normalize_text_for_match(evidence.get("text") or "")
         if (
-            "outcomes are sector" in normalized and "technology-neutral" in normalized
-        ) or (
-            "flexibility" in normalized and "unique risks" in normalized
-        ) or (
-            "mapped directly" in normalized and "security controls" in normalized
+            ("outcomes are sector" in normalized and "technology-neutral" in normalized)
+            or ("flexibility" in normalized and "unique risks" in normalized)
+            or ("mapped directly" in normalized and "security controls" in normalized)
         ):
             return evidence
     return None
 
 
 def _find_evidence_for_audience(
-    source_evidence: list[dict[str, Any]]
+    source_evidence: list[dict[str, Any]],
 ) -> dict[str, Any] | None:
     for evidence in source_evidence or []:
         normalized = _normalize_no_space(evidence.get("text") or "")
@@ -1090,7 +1092,7 @@ def _find_evidence_for_audience(
 
 
 def _find_evidence_for_profiles_and_tiers(
-    source_evidence: list[dict[str, Any]]
+    source_evidence: list[dict[str, Any]],
 ) -> dict[str, Any] | None:
     for evidence in source_evidence or []:
         normalized = _normalize_text_for_match(evidence.get("text") or "")
@@ -1196,6 +1198,7 @@ def _maybe_salvage_from_sources(
     if not source_evidence:
         return None
     q = question or ""
+
     def _attempt(sentences: list[str], evidence: dict[str, Any]):
         return _build_salvage_result(q, sentences, evidence)
 
@@ -1438,7 +1441,9 @@ def _build_display_answer(
         if unit and (unit.text or "").strip()
     ]
     cleaned_sentences = [sentence for sentence in cleaned_sentences if sentence]
-    cleaned_sentences = [_strip_key_facts_prefix(sentence) for sentence in cleaned_sentences]
+    cleaned_sentences = [
+        _strip_key_facts_prefix(sentence) for sentence in cleaned_sentences
+    ]
     cleaned_sentences = [sentence for sentence in cleaned_sentences if sentence]
     if not cleaned_sentences:
         base = _clean_text_for_display(fallback or "")
@@ -1678,11 +1683,54 @@ def _maybe_localize_summary_answer(
     return new_answer or answer_text, new_units
 
 
+def _non_answer_reason_message(question: str) -> str:
+    if _is_japanese_text(question):
+        return "提示された根拠からは確認できません。"
+    return "I can't confirm from the provided sources."
+
+
+_NON_ANSWER_PATTERNS = (
+    r"\bi don't know\b",
+    r"\bcan't confirm\b",
+    r"\bcan't answer\b",
+    r"\bno supporting sources\b",
+    r"\bnot (?:in|from) the provided (?:sources|materials|references)\b",
+    r"\bnot included in the provided (?:sources|materials|references)\b",
+    r"(提供|提示)(?:された)?(?:資料|根拠|情報源|ソース|参照資料).*(わかりません|分かりません|判断できません|確認できません|不明)",
+    r"(提供|提示)(?:された)?(?:資料|根拠|情報源|ソース|参照資料).*(記載がない|含まれていない).*(提示|示|回答|要約)できません",
+    r"(提供|提示)(?:された)?(?:資料|根拠|情報源|ソース|参照資料).*(確認|判断)できませんでした",
+    r"(提供|提示)(?:された)?(?:資料|根拠|情報源|ソース|参照資料).*(含まれていないため|記載がないため).*(できません|不明)",
+    r"(提供|提示)(?:された)?(?:資料|根拠|情報源|ソース|参照資料|出典).*(回答できません|要約は提供できません|要約できません|出典を示しての回答はできません)",
+    r"(提供|提示)(?:された)?根拠.*(ない|見当たらない)",
+    r"^\s*不明\s*[:：].*(提供|提示)(?:された)?(?:資料|根拠|情報源|ソース|参照資料).*(記載がありません|記載がない|言及がありません|含まれていません)",
+    r"(提供|提示)(?:された)?(?:資料|根拠|情報源|ソース|参照資料).*(記載がありません|記載がない|言及がありません|含まれていません)",
+)
+
+
+def _looks_like_non_answer(text: str) -> bool:
+    cleaned = re.sub(r"\s+", " ", (text or "")).strip()
+    if not cleaned:
+        return False
+    for pattern in _NON_ANSWER_PATTERNS:
+        if re.search(pattern, cleaned, flags=re.IGNORECASE):
+            return True
+    return False
+
+
 def determine_answerability(
     question: str,
     source_evidence: list[dict[str, Any]],
     answer_units: list[AnswerUnit],
+    answer_text: str = "",
 ) -> Answerability:
+    if _looks_like_non_answer(answer_text) or any(
+        _looks_like_non_answer(unit.text or "") for unit in answer_units
+    ):
+        return Answerability(
+            answerable=False,
+            reason_code="INSUFFICIENT_EVIDENCE",
+            reason_message=_non_answer_reason_message(question),
+        )
     if not source_evidence:
         return Answerability(
             answerable=False,
@@ -1709,55 +1757,8 @@ def determine_answerability(
     )
 
 
-_CANONICAL_NO_ANSWER = (
-    "i don't know based on the provided sources",
-    "i do not know based on the provided sources",
-)
-_CANNOT_DO_SIGNALS = (
-    "i don't know",
-    "i do not know",
-    "cannot answer",
-    "can't answer",
-    "unable to",
-    "cannot determine",
-    "cannot summarize",
-    "unable to summarize",
-    "わかりません",
-    "判断できません",
-    "要約できません",
-    "回答できません",
-)
-_MISSING_IN_SOURCES_SIGNALS = (
-    "provided sources",
-    "provided materials",
-    "provided references",
-    "based on the provided",
-    "not included",
-    "not mentioned",
-    "情報が含まれていない",
-    "記述が含まれていない",
-    "提供された",
-    "参照資料",
-    "資料には含まれていない",
-)
-
-
 def _is_cannot_answer_message(answer: str) -> bool:
-    text = (answer or "").strip()
-    if not text:
-        return False
-    lower = re.sub(r"\s+", " ", text.lower())
-    if any(pat in lower for pat in _CANONICAL_NO_ANSWER):
-        return True
-
-    def _contains_signal(signal: str) -> bool:
-        if re.search(r"[A-Za-z]", signal):
-            return signal in lower
-        return signal in text
-
-    has_cannot = any(_contains_signal(sig) for sig in _CANNOT_DO_SIGNALS)
-    has_missing = any(_contains_signal(sig) for sig in _MISSING_IN_SOURCES_SIGNALS)
-    return has_cannot and has_missing
+    return _looks_like_non_answer(answer)
 
 
 def _apply_cannot_answer_override(
@@ -1804,6 +1805,8 @@ ENABLE_TRGM = os.getenv("ENABLE_TRGM", "1") == "1"
 TRGM_K = max(1, int(os.getenv("TRGM_K", "30") or "30"))
 APP_ENV = (os.getenv("APP_ENV", "dev") or "dev").strip().lower()
 _ALLOW_PROD_DEBUG = os.getenv("ALLOW_PROD_DEBUG", "0") == "1"
+
+
 def _parse_admin_debug_token_hashes(raw: str | None) -> set[str]:
     hashes: set[str] = set()
     for part in (raw or "").split(","):
@@ -2053,8 +2056,6 @@ def _detect_trgm_available(request: Request) -> bool:
     if not getattr(cap_obj, "checked_ok", False):
         return False
     return bool(getattr(cap_obj, "pg_trgm_available", False))
-
-
 
 
 def _ensure_document_scope(
@@ -2578,7 +2579,9 @@ def _score_summary_chunk(row: dict[str, Any]) -> float:
     return score
 
 
-def _prefer_summary_chunks(rows: list[dict[str, Any]], keep: int) -> list[dict[str, Any]]:
+def _prefer_summary_chunks(
+    rows: list[dict[str, Any]], keep: int
+) -> list[dict[str, Any]]:
     if not rows:
         return []
     ranked = [(-_score_summary_chunk(row), idx, row) for idx, row in enumerate(rows)]
@@ -2689,9 +2692,7 @@ def _hybrid_hits_to_rows(hits: list[HybridHit]) -> list[dict[str, Any]]:
     return rows
 
 
-def _preview_hits_by_rank(
-    hits: list[HybridHit], *, attr: str
-) -> list[dict[str, Any]]:
+def _preview_hits_by_rank(hits: list[HybridHit], *, attr: str) -> list[dict[str, Any]]:
     ranked: list[tuple[int, dict[str, Any]]] = []
     for hit in hits:
         rank = getattr(hit, attr, None)
@@ -3000,7 +3001,9 @@ def fetch_chunks(
             if pattern not in trgm_patterns:
                 trgm_patterns.append(pattern)
     force_trgm_pattern_filter = bool(use_trgm_final and email_query)
-    strategy = "hybrid_rrf_all_docs_admin" if is_admin(p) else "hybrid_rrf_all_docs_user"
+    strategy = (
+        "hybrid_rrf_all_docs_admin" if is_admin(p) else "hybrid_rrf_all_docs_user"
+    )
     if run_id:
         strategy = (
             "hybrid_rrf_by_run_admin" if is_admin(p) else "hybrid_rrf_by_run_user"
@@ -3058,6 +3061,7 @@ def fetch_chunks(
         k=k,
         debug=debug,
     )
+
 
 # ============================================================
 # Embedding helpers (lazy init)
@@ -3292,8 +3296,198 @@ def _offline_embedding(text: str) -> list[float]:
     return vec[:EMBED_DIM]
 
 
+_OFFLINE_LINE_NOISE_RE = re.compile(
+    r"^(?:page|ページ)\s*\d+(?:\s*/\s*\d+)?$|^\d+\s*/\s*\d+$",
+    re.IGNORECASE,
+)
+
+
+def _normalize_offline_line(line: str) -> str:
+    return _SPACE_RE.sub(" ", line.strip())
+
+
+def _collect_repeated_lines(texts: list[str]) -> set[str]:
+    counts: dict[str, int] = {}
+    for text in texts:
+        for raw_line in (text or "").splitlines():
+            normalized = _normalize_offline_line(raw_line)
+            if not normalized:
+                continue
+            counts[normalized] = counts.get(normalized, 0) + 1
+    repeated: set[str] = set()
+    for line, count in counts.items():
+        if count < 2:
+            continue
+        if len(line) <= 60 or line.replace(" ", "").isdigit():
+            repeated.add(line)
+    return repeated
+
+
+def _is_offline_noise_line(line: str, repeated_lines: set[str]) -> bool:
+    if not line:
+        return True
+    if line in repeated_lines:
+        return True
+    if _OFFLINE_LINE_NOISE_RE.match(line):
+        return True
+    if line.isdigit():
+        return True
+    if len(line) <= 2:
+        return True
+    return False
+
+
+def _clean_offline_text(text: str, repeated_lines: set[str]) -> str:
+    if not text:
+        return ""
+    lines: list[str] = []
+    for raw_line in text.splitlines():
+        normalized = _normalize_offline_line(raw_line)
+        if _is_offline_noise_line(normalized, repeated_lines):
+            continue
+        lines.append(normalized)
+    collapsed = " ".join(lines)
+    collapsed = re.sub(r"\s{2,}", " ", collapsed).strip()
+    return collapsed
+
+
+def _normalize_offline_sentence(sentence: str) -> str:
+    cleaned = _clean_text_for_display(sentence)
+    cleaned = _strip_key_facts_prefix(cleaned)
+    cleaned = _strip_citation_artifacts(cleaned)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
+    return cleaned
+
+
+def _ensure_offline_sentence_end(sentence: str, *, use_cjk: bool) -> str:
+    text = sentence.strip()
+    if not text:
+        return ""
+    if text[-1] in ".!?。！？":
+        return text
+    return f"{text}{'。' if use_cjk else '.'}"
+
+
+def _select_offline_sentences(
+    question: str,
+    texts: list[str],
+    source_ids: list[str],
+    *,
+    max_sentences: int = 5,
+    min_sentences: int = 2,
+) -> tuple[list[str], list[str]]:
+    tokens = _extract_query_tokens(question)
+    repeated_lines = _collect_repeated_lines(texts)
+    candidates: list[dict[str, Any]] = []
+    for idx, text in enumerate(texts):
+        cleaned = _clean_offline_text(text, repeated_lines)
+        if not cleaned:
+            continue
+        sentences = _split_sentences(cleaned)
+        for sentence in sentences:
+            normalized = _normalize_offline_sentence(sentence)
+            if not normalized:
+                continue
+            hits, ratio = _count_token_hits(tokens, normalized) if tokens else (0, 0.0)
+            score = float(hits) + ratio
+            candidates.append(
+                {
+                    "sentence": normalized,
+                    "sid": source_ids[idx] if idx < len(source_ids) else f"S{idx + 1}",
+                    "score": score,
+                    "order": idx,
+                }
+            )
+    if not candidates:
+        return [], []
+    candidates.sort(
+        key=lambda item: (
+            -round(item["score"], 6),
+            -len(item["sentence"]),
+            item["order"],
+        )
+    )
+    selected: list[str] = []
+    used_ids: list[str] = []
+    seen: set[str] = set()
+    for cand in candidates:
+        sentence = cand["sentence"]
+        key = sentence.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        selected.append(sentence)
+        if cand["sid"] not in used_ids:
+            used_ids.append(cand["sid"])
+        if len(selected) >= max_sentences:
+            break
+    if len(selected) < min_sentences and len(candidates) > len(selected):
+        for cand in candidates:
+            sentence = cand["sentence"]
+            key = sentence.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            selected.append(sentence)
+            if cand["sid"] not in used_ids:
+                used_ids.append(cand["sid"])
+            if len(selected) >= min_sentences:
+                break
+    return selected, used_ids
+
+
+def _build_offline_paragraph(
+    question: str,
+    texts: list[str],
+    source_ids: list[str],
+    *,
+    max_sentences: int = 5,
+    min_sentences: int = 2,
+) -> tuple[str, list[str]]:
+    sentences, used_ids = _select_offline_sentences(
+        question,
+        texts,
+        source_ids,
+        max_sentences=max_sentences,
+        min_sentences=min_sentences,
+    )
+    if not sentences:
+        fallback = _fallback_unknown_message(question, "INSUFFICIENT_EVIDENCE")
+        return fallback, source_ids[:1] if source_ids else []
+    use_cjk = contains_cjk(question) or any(contains_cjk(s) for s in sentences)
+    formatted = [
+        _ensure_offline_sentence_end(sentence, use_cjk=use_cjk)
+        for sentence in sentences
+    ]
+    joiner = "" if use_cjk else " "
+    return joiner.join(formatted), used_ids or (source_ids[:1] if source_ids else [])
+
+
+def _parse_sources_context(sources_context: str) -> tuple[list[str], list[str]]:
+    if not sources_context:
+        return [], []
+    chunks = [chunk for chunk in sources_context.split("\n\n---\n\n") if chunk.strip()]
+    texts: list[str] = []
+    source_ids: list[str] = []
+    for chunk in chunks:
+        header, _, body = chunk.partition("\n")
+        header = header.strip()
+        if header.startswith("[") and header.endswith("]"):
+            sid = header.strip("[]")
+            if sid:
+                source_ids.append(sid)
+            else:
+                source_ids.append(f"S{len(source_ids) + 1}")
+        else:
+            source_ids.append(f"S{len(source_ids) + 1}")
+            body = chunk
+        texts.append(body.strip())
+    return texts, source_ids
+
+
 def _offline_answer(question: str, sources_context: str) -> tuple[str, list[str]]:
-    return "OFFLINE_MODE: stub response", []
+    texts, source_ids = _parse_sources_context(sources_context)
+    return _build_offline_paragraph(question, texts, source_ids)
 
 
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?。！？])\s+")
@@ -3381,14 +3575,18 @@ def _best_sentence_index(question: str, sentences: list[str]) -> int:
 def _extract_country_from_question(question: str) -> str | None:
     if not question:
         return None
-    match = re.search(r"capital\s+of\s+([A-Za-z][A-Za-z\s\-']*)", question, re.IGNORECASE)
+    match = re.search(
+        r"capital\s+of\s+([A-Za-z][A-Za-z\s\-']*)", question, re.IGNORECASE
+    )
     if not match:
         return None
     country = match.group(1).strip(" ?.")
     return country if country else None
 
 
-def _extract_city_candidate(text: str, *, exclude: set[str] | None = None) -> str | None:
+def _extract_city_candidate(
+    text: str, *, exclude: set[str] | None = None
+) -> str | None:
     if not text:
         return None
     cleaned = re.sub(r"\[[^\]]+\]", " ", text)
@@ -3509,9 +3707,10 @@ def _maybe_override_selected_docs_answer(
         lines.append(f"- [{sid}] The capital of {country} is {city}.")
     elif intent == "quality":
         quality_phrase = "quality answers require precise sources"
-        if quality_phrase not in joined_lower and quality_phrase not in (
-            question or ""
-        ).lower():
+        if (
+            quality_phrase not in joined_lower
+            and quality_phrase not in (question or "").lower()
+        ):
             return answer, False
         quality_row = _find_row_with_phrase(rows, quality_phrase)
         if not quality_row:
@@ -3617,8 +3816,17 @@ def _offline_answer_from_rows(
 ) -> tuple[str, list[str]]:
     if not rows:
         return "Offline mode answer unavailable.", []
-    return _build_extractive_answer(
-        rows, sources, summary_hint=summary_hint, question=question
+    texts = [str(row.get("text") or "") for row in rows]
+    source_ids = [
+        str(src.get("source_id") or f"S{idx + 1}") for idx, src in enumerate(sources)
+    ]
+    max_sentences = 3 if summary_hint else 5
+    return _build_offline_paragraph(
+        question,
+        texts,
+        source_ids,
+        max_sentences=max_sentences,
+        min_sentences=2,
     )
 
 
@@ -4374,7 +4582,9 @@ def ask(
                         exc.detail = _finalize_debug_sections(
                             exc.detail,
                             include_debug=include_debug,
-                            debug_meta_payload=debug_meta_for_errors if include_debug else None,
+                            debug_meta_payload=debug_meta_for_errors
+                            if include_debug
+                            else None,
                         )
                         raise
 
@@ -4596,7 +4806,9 @@ def ask(
                 vec_count=vec_count_raw,
                 trgm_count=trgm_count_raw,
                 llm_called=(
-                    llm_called_override if llm_called_override is not None else llm_called
+                    llm_called_override
+                    if llm_called_override is not None
+                    else llm_called
                 ),
                 llm_error=llm_error_override if llm_error_override else llm_error,
                 guardrail_reason=guardrail_reason,
@@ -4688,11 +4900,16 @@ def ask(
                 debug_payload_extra: dict[str, Any] | None = None
                 debug_meta_payload_extra: dict[str, Any] | None = None
                 if include_debug:
-                    debug_payload_extra, debug_meta_payload_extra = _prepare_debug_payload(
-                        citations_count=len(fallback_sources),
-                        guardrail_reason="low_relevance",
-                        llm_called_override=False,
-                        extra_debug={"early_abort": "low_relevance", "best_vec_dist": best},
+                    debug_payload_extra, debug_meta_payload_extra = (
+                        _prepare_debug_payload(
+                            citations_count=len(fallback_sources),
+                            guardrail_reason="low_relevance",
+                            llm_called_override=False,
+                            extra_debug={
+                                "early_abort": "low_relevance",
+                                "best_vec_dist": best,
+                            },
+                        )
                     )
                     if retrieval_debug_allowed:
                         resp["retrieval_debug"] = debug_payload_extra or {}
@@ -4842,7 +5059,10 @@ def ask(
 
             if offline_mode:
                 answer, used_ids = _offline_answer_from_rows(
-                    rows, sources, summary_hint=summary_request, question=payload.question or ""
+                    rows,
+                    sources,
+                    summary_hint=summary_request,
+                    question=payload.question or "",
                 )
                 llm_answer_used = False
             else:
@@ -4968,7 +5188,7 @@ def ask(
             payload.question or "", answer_units
         )
         answerability = determine_answerability(
-            payload.question or "", source_evidence, answer_units
+            payload.question or "", source_evidence, answer_units, answer
         )
         answer = _build_display_answer(
             payload.question or "",
@@ -5016,9 +5236,7 @@ def ask(
             salvage_duration = _elapsed_ms_since(salvage_start)
         stage_timings["salvage"] = salvage_duration
         if not answerability.answerable and not preserve_answer_text:
-            answer, answer_units = _build_insufficient_answer(
-                payload.question or ""
-            )
+            answer, answer_units = _build_insufficient_answer(payload.question or "")
             citation_sources = used_sources[:1] if used_sources else []
 
         citations_out = (
@@ -5058,12 +5276,8 @@ def ask(
         resp = _finalize_debug_sections(
             resp,
             include_debug=include_debug,
-            debug_meta_payload=(
-                debug_meta_payload_extra if include_debug else None
-            ),
-            retrieval_debug_payload=(
-                debug_payload_extra if include_debug else None
-            ),
+            debug_meta_payload=(debug_meta_payload_extra if include_debug else None),
+            retrieval_debug_payload=(debug_payload_extra if include_debug else None),
             debug_requested_flag=payload_debug_requested,
             debug_enabled_flag=include_debug,
             force_debug_placeholders=retrieval_debug_allowed,
@@ -5112,9 +5326,7 @@ def ask(
         exc.detail = _finalize_debug_sections(
             exc.detail,
             include_debug=include_debug,
-            debug_meta_payload=(
-                debug_meta_for_errors if include_debug else None
-            ),
+            debug_meta_payload=(debug_meta_for_errors if include_debug else None),
             debug_requested_flag=payload_debug_requested,
             debug_enabled_flag=include_debug,
             force_debug_placeholders=retrieval_debug_allowed,
@@ -5163,6 +5375,8 @@ def ask(
             status_code=500,
             detail=detail,
         )
+
+
 def _retrieve_selected_docs_email_answer(
     db: Session, doc_ids: list[str], principal: Principal, question: str
 ) -> dict[str, Any] | None:
