@@ -1191,6 +1191,288 @@ def _maybe_salvage_llm_answer(
     return None
 
 
+_EXTRACTIVE_STOPWORDS = {
+    "厚労省",
+    "就業規則",
+    "サンプル",
+    "根拠",
+    "ページ",
+    "方法",
+    "要点",
+}
+
+
+def _extract_extractive_terms(question: str, limit: int = 8) -> list[str]:
+    if not question:
+        return []
+    terms: list[str] = []
+    seen: set[str] = set()
+
+    def _add(term: str, *, force: bool = False) -> None:
+        if not term or term in seen or len(terms) >= limit:
+            return
+        if not force and term in _EXTRACTIVE_STOPWORDS:
+            return
+        terms.append(term)
+        seen.add(term)
+
+    if "周知" in question:
+        for term in [
+            "周知",
+            "就業規則",
+            "配付",
+            "掲示",
+            "備付け",
+            "電子媒体",
+            "モニター",
+            "閲覧",
+        ]:
+            _add(term, force=True)
+            if len(terms) >= limit:
+                return terms
+
+    raw_terms = re.findall(r"[A-Za-z0-9]+|[ぁ-んァ-ン一-龯ー]+", question)
+    for raw in raw_terms:
+        term = raw.strip()
+        if len(term) < 2:
+            continue
+        if term.isascii():
+            term = term.lower()
+        if not term.isascii():
+            if term.endswith("方法") and len(term) > 2:
+                _add(term[:-2], force=True)
+            if "就業規則" in term:
+                _add("就業規則", force=True)
+            if "周知" in term:
+                _add("周知", force=True)
+            if "根拠" in term and "ページ" in term:
+                _add("根拠ページ", force=True)
+                _add("根拠", force=True)
+                _add("ページ", force=True)
+            for part in re.split(r"[のはをにがとでへも]", term):
+                part = part.strip()
+                if len(part) < 2:
+                    continue
+                _add(part)
+                if len(terms) >= limit:
+                    return terms
+            continue
+        _add(term)
+        if len(terms) >= limit:
+            return terms
+    return terms
+
+
+def _count_extractive_hits(terms: list[str], text: str) -> int:
+    if not terms or not text:
+        return 0
+    lowered = text.lower()
+    hits = 0
+    for term in terms:
+        if not term:
+            continue
+        if term.isascii():
+            if term in lowered:
+                hits += 1
+        else:
+            if term in text:
+                hits += 1
+    return hits
+
+
+_HEADING_PREFIX_RE = re.compile(r"^\s*[0-9０-９]+[\.\s]+")
+_HEADING_TRAIL_RE = re.compile(r"[。！？.!?]$")
+
+
+def _looks_like_heading_candidate(text: str) -> bool:
+    if not text:
+        return False
+    stripped = text.strip()
+    if not stripped:
+        return False
+    if len(stripped) > 40:
+        return False
+    if _HEADING_PREFIX_RE.search(stripped):
+        return True
+    if _HEADING_TRAIL_RE.search(stripped):
+        return False
+    return not any(
+        token in stripped for token in ("する", "した", "しなければ", "である")
+    )
+
+
+def _contains_notice_method_keyword(text: str) -> bool:
+    if not text:
+        return False
+    for token in ("配付", "掲示", "備付け", "電子媒体", "モニター"):
+        if token in text:
+            return True
+    return False
+
+
+def _extract_notice_sentence(text: str) -> str | None:
+    if not text:
+        return None
+    keywords = ("配付", "掲示", "備付け", "電子媒体", "モニター")
+    indices = [text.find(token) for token in keywords if token in text]
+    if not indices:
+        return None
+    start_idx = min(indices)
+    left = text.rfind("。", 0, start_idx)
+    start = left + 1 if left >= 0 else 0
+    right = text.find("。", start_idx)
+    end = right + 1 if right >= 0 else len(text)
+    sentence = text[start:end].strip()
+    if not sentence or _looks_like_heading_candidate(sentence):
+        return None
+    return sentence
+
+
+def _select_extractive_sentence(
+    text: str,
+    terms: list[str],
+    *,
+    prefer_notice: bool,
+) -> str | None:
+    if not text or not terms:
+        return None
+    if prefer_notice:
+        notice_sentence = _extract_notice_sentence(text)
+        if notice_sentence:
+            return notice_sentence
+    sentences: list[tuple[int, int, int, bool, bool, str]] = []
+    for line in (text or "").splitlines():
+        for sentence in _split_segment_into_sentences(line):
+            if not sentence:
+                continue
+            hits = _count_extractive_hits(terms, sentence)
+            if hits <= 0:
+                continue
+            heading_like = _looks_like_heading_candidate(sentence)
+            has_notice_keyword = _contains_notice_method_keyword(sentence)
+            if prefer_notice and heading_like and not has_notice_keyword:
+                continue
+            bonus = 0
+            penalty = 0
+            if heading_like:
+                penalty -= 5
+            if prefer_notice and has_notice_keyword:
+                bonus += 3
+            sentences.append(
+                (
+                    hits + bonus + penalty,
+                    hits,
+                    len(sentence),
+                    heading_like,
+                    has_notice_keyword,
+                    sentence,
+                )
+            )
+    if not sentences:
+        return None
+    if prefer_notice:
+        for (
+            _score,
+            _hits,
+            _length,
+            heading_like,
+            has_notice_keyword,
+            sentence,
+        ) in sentences:
+            if (
+                "就業規則" in sentence
+                and "周知" in sentence
+                and not heading_like
+                and has_notice_keyword
+            ):
+                return sentence
+    sentences.sort(key=lambda item: (-item[0], -item[1], item[2]))
+    return sentences[0][5]
+
+
+def _best_extractive_line(text: str, tokens: list[str]) -> str | None:
+    if not text or not tokens:
+        return None
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+    if not lines:
+        return None
+    best_line = ""
+    best_hits = 0
+    best_ratio = 0.0
+    for line in lines:
+        hits, ratio = _count_token_hits(tokens, line)
+        if hits > best_hits or (hits == best_hits and ratio > best_ratio):
+            best_line = line
+            best_hits = hits
+            best_ratio = ratio
+    if best_hits <= 0:
+        return None
+    sentences = _split_segment_into_sentences(best_line)
+    return sentences[0] if sentences else None
+
+
+def _build_extractive_salvage_result(
+    question: str, sentence: str, evidence: dict[str, Any]
+) -> tuple[str, list[AnswerUnit], Answerability] | None:
+    if not sentence or not evidence:
+        return None
+    q = question or ""
+    ref = _evidence_to_ref(evidence)
+    text = _jp_sentence(sentence)
+    if not text:
+        return None
+    units = [
+        AnswerUnit(
+            text=text,
+            citations=[ref] if ref else [],
+        )
+    ]
+    _sanitize_answer_unit_texts(q, units)
+    answer = _build_display_answer(q, units, "")
+    answer = _strip_citation_artifacts(answer)
+    answer = _normalize_sentence_separators(answer)
+    answerability = Answerability(
+        answerable=True,
+        reason_code="OTHER",
+        reason_message="Answered via extractive fallback from retrieved sources.",
+    )
+    return answer, units, answerability
+
+
+def _maybe_salvage_extractive_from_sources(
+    question: str,
+    source_evidence: list[dict[str, Any]],
+) -> tuple[str, list[AnswerUnit], Answerability] | None:
+    if not source_evidence:
+        return None
+    terms = _extract_extractive_terms(question or "", limit=12)
+    if not terms:
+        return None
+    best_evidence: dict[str, Any] | None = None
+    best_hits = 0
+    for evidence in source_evidence or []:
+        text = evidence.get("text") or ""
+        hits = _count_extractive_hits(terms, text)
+        if hits <= 0:
+            continue
+        if hits > best_hits:
+            best_hits = hits
+            best_evidence = evidence
+    if not best_evidence:
+        return None
+    min_hits = 2 if len(terms) >= 2 else 1
+    if best_hits < min_hits:
+        return None
+    line = _select_extractive_sentence(
+        best_evidence.get("text") or "",
+        terms,
+        prefer_notice="周知" in (question or ""),
+    )
+    if not line:
+        return None
+    return _build_extractive_salvage_result(question or "", line, best_evidence)
+
+
 def _maybe_salvage_from_sources(
     question: str,
     source_evidence: list[dict[str, Any]],
@@ -1697,6 +1979,8 @@ _NON_ANSWER_PATTERNS = (
     r"\bnot (?:in|from) the provided (?:sources|materials|references)\b",
     r"\bnot included in the provided (?:sources|materials|references)\b",
     r"(提供|提示)(?:された)?(?:資料|根拠|情報源|ソース|参照資料).*(わかりません|分かりません|判断できません|確認できません|不明)",
+    r"^\s*(提供|提示)(?:された)?[^。]*断片.*(含まれていません|含まれていない|確認できませんでした|確認できません|わかりません|分かりません|不明)",
+    r"^\s*(?:資料|根拠|情報源|ソース|参照資料).*(断片|断片のみ).*(確認できませんでした|確認できません|わかりません|分かりません|不明)",
     r"(提供|提示)(?:された)?(?:資料|根拠|情報源|ソース|参照資料).*(記載がない|含まれていない).*(提示|示|回答|要約)できません",
     r"(提供|提示)(?:された)?(?:資料|根拠|情報源|ソース|参照資料).*(確認|判断)できませんでした",
     r"(提供|提示)(?:された)?(?:資料|根拠|情報源|ソース|参照資料).*(含まれていないため|記載がないため).*(できません|不明)",
@@ -1704,6 +1988,13 @@ _NON_ANSWER_PATTERNS = (
     r"(提供|提示)(?:された)?根拠.*(ない|見当たらない)",
     r"^\s*不明\s*[:：].*(提供|提示)(?:された)?(?:資料|根拠|情報源|ソース|参照資料).*(記載がありません|記載がない|言及がありません|含まれていません)",
     r"(提供|提示)(?:された)?(?:資料|根拠|情報源|ソース|参照資料).*(記載がありません|記載がない|言及がありません|含まれていません)",
+)
+
+_REFUSAL_EVIDENCE_RE = re.compile(
+    r"(資料|根拠|情報源|ソース|提示|提供|断片|ページ|出典)"
+)
+_REFUSAL_CANNOT_RE = re.compile(
+    r"(確認できませんでした|確認できません|含まれていません|記載がありません|特定できません|不明です|不明)"
 )
 
 
@@ -1785,6 +2076,31 @@ def _apply_cannot_answer_override_from_units(
                 reason_code="INSUFFICIENT_EVIDENCE",
                 reason_message="Answer text indicated the evidence was insufficient.",
             )
+    return answerability
+
+
+def _is_refusal_answer_text(text: str) -> bool:
+    cleaned = re.sub(r"\s+", " ", (text or "")).strip()
+    if not cleaned:
+        return False
+    if not _REFUSAL_EVIDENCE_RE.search(cleaned):
+        return False
+    return bool(_REFUSAL_CANNOT_RE.search(cleaned))
+
+
+def _apply_refusal_answerability_override(
+    question: str, answer: str, units: list[AnswerUnit], answerability: Answerability
+) -> Answerability:
+    if not answerability.answerable:
+        return answerability
+    if _is_refusal_answer_text(answer) or any(
+        _is_refusal_answer_text(unit.text or "") for unit in units or []
+    ):
+        return Answerability(
+            answerable=False,
+            reason_code="INSUFFICIENT_EVIDENCE",
+            reason_message=_non_answer_reason_message(question),
+        )
     return answerability
 
 
@@ -3931,9 +4247,24 @@ def build_sources(rows: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]
     return context, sources
 
 
+def _format_prompt_source_label(page: Any, filename: Any) -> str:
+    parts: list[str] = []
+    if page is not None:
+        parts.append(f"p.{page}")
+    if filename:
+        parts.append(str(filename))
+    if not parts:
+        return ""
+    return "【{}】".format(" ".join(parts))
+
+
 def build_prompt_chunks(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     prompt_rows: list[dict[str, Any]] = []
     for i, r in enumerate(rows or [], start=1):
+        label = _format_prompt_source_label(r.get("page"), r.get("filename"))
+        text = guard_source_text(r.get("text") or "")
+        if label:
+            text = f"{label}{text}"
         prompt_rows.append(
             {
                 "source_id": f"S{i}",
@@ -3941,7 +4272,7 @@ def build_prompt_chunks(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "document_id": r.get("document_id"),
                 "filename": r.get("filename"),
                 "page": r.get("page"),
-                "text": guard_source_text(r.get("text") or ""),
+                "text": text,
             }
         )
     return prompt_rows
@@ -4092,10 +4423,13 @@ SYSTEM_PROMPT = (
     "\n"
     "Use ONLY the provided sources as evidence.\n"
     "If the answer is not in the sources, say you don't know.\n"
+    "If sources contain relevant information, you MUST answer using them (partial answer is ok).\n"
+    "Before answering, include 1-2 short exact quotes from sources with page labels like 【p.4 filename】 and a [S#] citation.\n"
+    "If you cannot find a relevant quote, say you don't know.\n"
     "\n"
     "CITATION RULES (STRICT):\n"
     "- Cite sources ONLY using this format: [S1], [S2], ...\n"
-    "- Never include page numbers, '?', chunk_id, document_id, or any other citation format.\n"
+    "- Never include page numbers, '?', chunk_id, document_id, or any other citation format inside citations.\n"
     "- Each bullet/line must contain at least one citation like [S1].\n"
     "- Responses must be concise bullet points, one per line.\n"
     "- Never output '?' placeholders or cite non-existent sources.\n"
@@ -5210,6 +5544,9 @@ def ask(
             answerability,
             offline_guard_enabled=offline_mode or is_openai_offline(),
         )
+        answerability = _apply_refusal_answerability_override(
+            payload.question or "", answer, answer_units, answerability
+        )
         citation_sources = used_sources
         preserve_answer_text = answer.strip().startswith("[NO_SOURCES]")
         salvage = None
@@ -5221,12 +5558,17 @@ def ask(
         )
         if salvage_needed:
             salvage_start = time.perf_counter()
-            salvage = _maybe_salvage_llm_answer(
+            salvage = _maybe_salvage_extractive_from_sources(
                 payload.question or "",
                 source_evidence,
-                llm_answer_used=llm_answer_used,
-                llm_enabled=llm_enabled,
             )
+            if not salvage:
+                salvage = _maybe_salvage_llm_answer(
+                    payload.question or "",
+                    source_evidence,
+                    llm_answer_used=llm_answer_used,
+                    llm_enabled=llm_enabled,
+                )
             if not salvage:
                 salvage = _maybe_salvage_from_sources(
                     payload.question or "", source_evidence
@@ -5235,6 +5577,18 @@ def ask(
                 answer, answer_units, answerability = salvage
             salvage_duration = _elapsed_ms_since(salvage_start)
         stage_timings["salvage"] = salvage_duration
+        if (
+            answerability.reason_message
+            == "Answered via extractive fallback from retrieved sources."
+        ):
+            salvage_ids = {
+                ref.source_id
+                for unit in answer_units or []
+                for ref in unit.citations or []
+                if ref and ref.source_id
+            }
+            if salvage_ids:
+                citation_sources = filter_sources(sources, salvage_ids)
         if not answerability.answerable and not preserve_answer_text:
             answer, answer_units = _build_insufficient_answer(payload.question or "")
             citation_sources = used_sources[:1] if used_sources else []

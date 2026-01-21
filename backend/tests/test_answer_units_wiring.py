@@ -9,6 +9,7 @@ from app.api.routes.chat import (
     _apply_cannot_answer_override,
     _apply_cannot_answer_override_from_units,
     _apply_offline_overlap_guard,
+    _apply_refusal_answerability_override,
     _build_display_answer,
     _build_insufficient_answer,
     _compact_evidence_for_prompt,
@@ -16,6 +17,9 @@ from app.api.routes.chat import (
     _recover_answer_units_with_citations,
     _ensure_debug_meta_app_env,
     _sanitize_answer_unit_texts,
+    _extract_extractive_terms,
+    _looks_like_heading_candidate,
+    _maybe_salvage_extractive_from_sources,
     _maybe_salvage_llm_answer,
     _maybe_salvage_from_sources,
     _strip_citation_artifacts,
@@ -28,7 +32,7 @@ from app.api.routes.chat import (
     determine_answerability,
     inline_annotation_from_refs,
 )
-from app.schemas.api_contract import AnswerUnit, AnswerUnitEvidenceRef
+from app.schemas.api_contract import AnswerUnit, AnswerUnitEvidenceRef, Answerability
 
 
 def _sample_evidence():
@@ -260,6 +264,147 @@ def test_unknown_answer_forces_answerability_false_ja_variant():
     )
     assert updated.answerable is False
     assert updated.reason_code == "INSUFFICIENT_EVIDENCE"
+
+
+def test_unknown_answer_forces_answerability_false_ja_fragment_variant():
+    answerability = Answerability(
+        answerable=True,
+        reason_code="OTHER",
+        reason_message="Answer is supported by the provided sources.",
+    )
+    updated = _apply_cannot_answer_override(
+        "提供された就業規則の断片には就業規則の周知方法は含まれていません。",
+        answerability,
+    )
+    assert updated.answerable is False
+    assert updated.reason_code == "INSUFFICIENT_EVIDENCE"
+
+
+def test_refusal_answerability_override_flips_for_refusal_answer():
+    evidence = _sample_evidence()
+    units = build_answer_units_for_response("- 有効 [S1]", evidence)
+    answerability = determine_answerability("質問です", evidence, units)
+    updated = _apply_refusal_answerability_override(
+        "質問です",
+        "提供された資料の断片には該当する記載がありません。確認できませんでした。",
+        units,
+        answerability,
+    )
+    assert updated.answerable is False
+    assert updated.reason_code == "INSUFFICIENT_EVIDENCE"
+    assert updated.reason_message == "提示された根拠からは確認できません。"
+
+
+def test_refusal_answerability_override_flips_for_refusal_unit():
+    evidence = _sample_evidence()
+    units = [
+        AnswerUnit(
+            text="資料の断片のみでは特定できません。",
+            citations=[
+                AnswerUnitEvidenceRef(
+                    source_id="S1",
+                    page=1,
+                    line_start=1,
+                    line_end=2,
+                    filename="alpha.pdf",
+                    document_id="doc-1",
+                )
+            ],
+        )
+    ]
+    answerability = determine_answerability("質問です", evidence, units)
+    updated = _apply_refusal_answerability_override(
+        "質問です",
+        "回答文は別の内容です。",
+        units,
+        answerability,
+    )
+    assert updated.answerable is False
+    assert updated.reason_code == "INSUFFICIENT_EVIDENCE"
+
+
+def test_extractive_salvage_returns_answer_when_overlap():
+    evidence = [
+        {
+            "source_id": "S1",
+            "page": 4,
+            "line_start": 1,
+            "line_end": 3,
+            "filename": "labor.pdf",
+            "document_id": "doc-1",
+            "chunk_id": "chunk-1",
+            "text": (
+                "４ 就業規則の周知。\n"
+                "作成した就業規則は、配付、掲示、備付け、電子媒体、モニター等で周知しなければならない。"
+            ),
+        }
+    ]
+    result = _maybe_salvage_extractive_from_sources(
+        "厚労省就業規則サンプルの周知方法は？根拠ページも。",
+        evidence,
+    )
+    assert result is not None
+    answer, units, answerability = result
+    assert answerability.answerable is True
+    assert "配付" in answer
+    assert "掲示" in answer
+    assert "電子媒体" in answer
+    assert "備付け" in answer
+    assert "モニター" in answer
+    assert "４ 就業規則の周知" not in answer
+    assert len(units) == 1
+    assert units[0].citations and units[0].citations[0].page == 4
+
+
+def test_extractive_salvage_skips_when_no_overlap():
+    evidence = [
+        {
+            "source_id": "S1",
+            "page": 2,
+            "line_start": 1,
+            "line_end": 2,
+            "filename": "labor.pdf",
+            "document_id": "doc-1",
+            "chunk_id": "chunk-1",
+            "text": "会社概要と沿革の説明。",
+        }
+    ]
+    result = _maybe_salvage_extractive_from_sources("就業規則の周知方法は？", evidence)
+    assert result is None
+
+
+def test_extract_extractive_terms_decompounds_notice_method():
+    terms = _extract_extractive_terms(
+        "厚労省就業規則サンプルの周知方法の根拠ページは？",
+        limit=12,
+    )
+    assert "周知" in terms
+    assert "根拠ページ" in terms
+    assert "根拠ペ" not in terms
+
+
+def test_heading_candidate_detection():
+    assert _looks_like_heading_candidate("４ 就業規則の周知")
+    assert not _looks_like_heading_candidate(
+        "作成した就業規則は、配付、掲示で周知する。"
+    )
+
+
+def test_notice_heading_only_is_not_returned():
+    evidence = [
+        {
+            "source_id": "S1",
+            "page": 4,
+            "line_start": 1,
+            "line_end": 1,
+            "filename": "labor.pdf",
+            "document_id": "doc-1",
+            "chunk_id": "chunk-1",
+            "text": "４ 就業規則の周知。",
+        }
+    ]
+    result = _maybe_salvage_extractive_from_sources("周知方法は？", evidence)
+    assert result is None
 
 
 def test_missing_info_without_cannot_signal_does_not_flip():
@@ -964,6 +1109,71 @@ def test_chat_ask_endpoint_includes_timing_when_debug(monkeypatch):
     no_debug_data = no_debug_resp.json()
     for key in ("retrieval_ms", "llm_ms", "salvage_ms", "post_ms", "total_ms"):
         assert key not in no_debug_data
+
+
+def test_chat_prompt_includes_question_and_sources(monkeypatch):
+    captured: dict[str, list[dict[str, str]]] = {}
+
+    class FakeDB:
+        def commit(self):
+            return None
+
+        def close(self):
+            return None
+
+        def query(self, *args, **kwargs):
+            return self
+
+        def filter(self, *args, **kwargs):
+            return self
+
+        def all(self):
+            return []
+
+        def get(self, *args, **kwargs):
+            return None
+
+    class FakePrincipal:
+        sub = "tester"
+
+    rows = [
+        {
+            "id": "chunk-1",
+            "document_id": "doc-1",
+            "filename": "japan.pdf",
+            "page": 4,
+            "text": "投票、挙手等の方法によって選出されること。",
+        }
+    ]
+
+    def _fake_call_llm(*args, **_kwargs):
+        captured["messages"] = list(args[2]) if len(args) > 2 else []
+        return "- 回答 [S1]"
+
+    monkeypatch.setattr(chat_module, "call_llm", _fake_call_llm)
+    monkeypatch.setattr(chat_module, "embed_query", lambda *_a, **_k: [0.0])
+    monkeypatch.setattr(chat_module, "fetch_chunks", lambda *_a, **_k: (rows, {}))
+    monkeypatch.setattr(
+        chat_module, "filter_noise_candidates", lambda rows, *_a, **_k: rows
+    )
+    monkeypatch.setattr(chat_module, "is_llm_enabled", lambda: True)
+    monkeypatch.setattr(chat_module, "is_openai_offline", lambda: False)
+
+    app = FastAPI()
+
+    @app.post("/api/chat/ask")
+    def ask_route(payload: chat_module.AskPayload, request: Request):
+        return chat_module.ask(payload, request, db=FakeDB(), p=FakePrincipal())
+
+    client = TestClient(app)
+    question = "労働者代表はどう選出する？"
+    resp = client.post("/api/chat/ask", json={"question": question})
+    assert resp.status_code == 200
+    messages = captured.get("messages", [])
+    assert messages
+    assert any(question in msg.get("content", "") for msg in messages)
+    assert any("投票" in msg.get("content", "") for msg in messages)
+    assert any("【p.4" in msg.get("content", "") for msg in messages)
 
 
 def test_chat_ask_debug_query_returns_placeholders_when_disabled(monkeypatch):

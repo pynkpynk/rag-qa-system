@@ -63,6 +63,102 @@ function buildUpstreamUrl(path: string[], search: string): string {
   return `${backend}/api${suffix}${search}`;
 }
 
+function sanitizeUpstreamUrl(value: string): string {
+  try {
+    const url = new URL(value);
+    url.username = "";
+    url.password = "";
+    url.search = "";
+    return url.toString();
+  } catch {
+    return value.split("?")[0] || value;
+  }
+}
+
+function buildDevSubCookie(value: string): string {
+  const encoded = encodeURIComponent(value);
+  return `ragqa_dev_sub=${encoded}; Path=/; SameSite=Lax; HttpOnly`;
+}
+
+function decodeDevSub(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+function getEffectiveDevSub(request: NextRequest, headers: Headers): string {
+  const headerValue = (headers.get("x-dev-sub") || request.headers.get("x-dev-sub") || "").trim();
+  if (headerValue) {
+    return headerValue;
+  }
+  const authHeader = (headers.get("authorization") || request.headers.get("authorization") || "").trim();
+  if (authHeader) {
+    return "";
+  }
+  const backendBase = getBackendBase();
+  const nodeEnv = (process.env.NODE_ENV || "").toLowerCase();
+  const cookieAllowed =
+    process.env.RAGQA_ALLOW_DEV_SUB_COOKIE === "1" &&
+    nodeEnv !== "production" &&
+    isLocalBackend(backendBase);
+  if (!cookieAllowed) {
+    return "";
+  }
+  const cookieValue = request.cookies.get("ragqa_dev_sub")?.value?.trim() || "";
+  if (!cookieValue) {
+    return "";
+  }
+  return decodeDevSub(cookieValue);
+}
+
+function encodeRFC5987Value(value: string): string {
+  return encodeURIComponent(value).replace(/[!'()*]/g, (char) =>
+    `%${char.charCodeAt(0).toString(16).toUpperCase()}`,
+  );
+}
+
+function extractFilenameFromContentDisposition(value: string): string | null {
+  const parts = value.split(";").map((part) => part.trim());
+  for (const part of parts) {
+    const lower = part.toLowerCase();
+    if (lower.startsWith("filename*=")) {
+      let raw = part.slice("filename*=".length).trim();
+      if (raw.startsWith("UTF-8''") || raw.startsWith("utf-8''")) {
+        raw = raw.slice("UTF-8''".length);
+      } else if (raw.includes("''")) {
+        raw = raw.slice(raw.indexOf("''") + 2);
+      }
+      try {
+        return decodeURIComponent(raw);
+      } catch {
+        return raw;
+      }
+    }
+  }
+  for (const part of parts) {
+    const lower = part.toLowerCase();
+    if (lower.startsWith("filename=")) {
+      let raw = part.slice("filename=".length).trim();
+      if (raw.startsWith('"') && raw.endsWith('"') && raw.length >= 2) {
+        raw = raw.slice(1, -1);
+      }
+      return raw;
+    }
+  }
+  return null;
+}
+
+function buildSafeContentDisposition(filename: string): string {
+  const name = filename || "document.pdf";
+  const encoded = encodeRFC5987Value(name);
+  return `inline; filename="document.pdf"; filename*=UTF-8''${encoded}`.replace(
+    /[\r\n]/g,
+    "",
+  );
+}
+
 function collectRequestHeaders(request: NextRequest): Headers {
   const headers = new Headers();
 
@@ -75,10 +171,15 @@ function collectRequestHeaders(request: NextRequest): Headers {
     headers.set("accept-encoding", "identity");
   }
 
+  const effectiveDevSub = getEffectiveDevSub(request, headers);
+  if (effectiveDevSub && !headers.get("x-dev-sub")) {
+    headers.set("x-dev-sub", effectiveDevSub);
+  }
+
   let auth = (headers.get("authorization") || "").trim();
   if (!auth) {
     const backendBase = getBackendBase();
-    const devSub = (request.headers.get("x-dev-sub") || "").trim();
+    const devSub = (headers.get("x-dev-sub") || "").trim();
     const nodeEnv = (process.env.NODE_ENV || "").toLowerCase();
     const allowDevInjection =
       isLocalBackend(backendBase) && (devSub || nodeEnv !== "production");
@@ -100,11 +201,16 @@ function collectRequestHeaders(request: NextRequest): Headers {
 
 function filterResponseHeaders(
   upstream: Headers,
-  opts?: { addContentTypeFallback?: boolean },
+  opts?: { addContentTypeFallback?: boolean; stripContentDisposition?: boolean },
 ): Headers {
   const headers = new Headers();
+  const stripContentDisposition = Boolean(opts?.stripContentDisposition);
   upstream.forEach((value, name) => {
-    if (!HOP_BY_HOP_HEADERS.has(name.toLowerCase())) {
+    const normalized = name.toLowerCase();
+    if (stripContentDisposition && normalized === "content-disposition") {
+      return;
+    }
+    if (!HOP_BY_HOP_HEADERS.has(normalized)) {
       headers.set(name, value);
     }
   });
@@ -135,6 +241,34 @@ async function handleProxy(
     return new Response(null, { status: 204 });
   }
 
+  const requestPath = context.params.path ?? [];
+  if (requestPath.length === 1 && requestPath[0] === "dev-sub") {
+    if (request.method.toUpperCase() !== "POST") {
+      return new Response(null, { status: 405 });
+    }
+    let payload: { dev_sub?: string } | null = null;
+    try {
+      payload = await request.json();
+    } catch {
+      payload = null;
+    }
+    const raw = (payload?.dev_sub || "").trim();
+    if (!raw) {
+      return new Response(JSON.stringify({ ok: false, error: "dev_sub is required" }), {
+        status: 400,
+        headers: { "Content-Type": "application/json; charset=utf-8" },
+      });
+    }
+    const isProd = (process.env.NODE_ENV || "").toLowerCase() === "production";
+    const cookie = `ragqa_dev_sub=${encodeURIComponent(raw)}; Path=/; SameSite=Lax; HttpOnly${
+      isProd ? "; Secure" : ""
+    }`;
+    return new Response(JSON.stringify({ ok: true, dev_sub: raw }), {
+      status: 200,
+      headers: { "Content-Type": "application/json; charset=utf-8", "Set-Cookie": cookie },
+    });
+  }
+
   let upstreamUrl: string;
   try {
     upstreamUrl = buildUpstreamUrl(context.params.path ?? [], request.nextUrl.search || "");
@@ -151,6 +285,11 @@ async function handleProxy(
   }
 
   const headers = collectRequestHeaders(request);
+  const effectiveDevSub = getEffectiveDevSub(request, headers);
+  const isContentRequest =
+    requestPath.length >= 3 &&
+    requestPath[0] === "docs" &&
+    requestPath[2] === "content";
 
   const init: RequestInit = {
     method: request.method,
@@ -163,10 +302,33 @@ async function handleProxy(
     init.body = await request.arrayBuffer();
   }
 
+  const timeoutMs = Number(process.env.RAGQA_UPSTREAM_TIMEOUT_MS || "120000");
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  init.signal = controller.signal;
+
   let upstreamResponse: Response;
   try {
     upstreamResponse = await fetch(upstreamUrl, init);
   } catch (err) {
+    if (err instanceof Error && err.name === "AbortError") {
+      return new Response(
+        JSON.stringify({
+          error: {
+            code: "UPSTREAM_TIMEOUT",
+            message: `Upstream request timed out after ${timeoutMs}ms.`,
+            upstream_url: sanitizeUpstreamUrl(upstreamUrl),
+          },
+        }),
+        {
+          status: 504,
+          headers: {
+            "Content-Type": "application/json; charset=utf-8",
+            "x-ragqa-proxy-timeout": "1",
+          },
+        },
+      );
+    }
     return new Response(
       JSON.stringify({
         error: {
@@ -176,13 +338,41 @@ async function handleProxy(
       }),
       { status: 502, headers: { "Content-Type": "application/json; charset=utf-8" } },
     );
+  } finally {
+    clearTimeout(timeoutId);
   }
 
   const isNoContent =
     upstreamResponse.status === 204 || upstreamResponse.status === 205;
+  const upstreamContentDisposition = isContentRequest
+    ? upstreamResponse.headers.get("content-disposition") || ""
+    : "";
   const responseHeaders = filterResponseHeaders(upstreamResponse.headers, {
     addContentTypeFallback: !isNoContent,
+    stripContentDisposition: isContentRequest,
   });
+  if (isContentRequest && upstreamResponse.ok) {
+    const upstreamFilename = upstreamContentDisposition
+      ? extractFilenameFromContentDisposition(upstreamContentDisposition)
+      : null;
+    responseHeaders.set(
+      "content-disposition",
+      buildSafeContentDisposition(upstreamFilename || "document.pdf"),
+    );
+  }
+  const nodeEnv = (process.env.NODE_ENV || "").toLowerCase();
+  const cookieAllowed =
+    process.env.RAGQA_ALLOW_DEV_SUB_COOKIE === "1" && nodeEnv !== "production";
+  const existingCookieRaw = request.cookies.get("ragqa_dev_sub")?.value?.trim() || "";
+  const existingCookie = existingCookieRaw ? decodeDevSub(existingCookieRaw) : "";
+  const shouldSetCookie =
+    cookieAllowed &&
+    upstreamResponse.ok &&
+    effectiveDevSub &&
+    effectiveDevSub !== existingCookie;
+  if (shouldSetCookie) {
+    responseHeaders.append("set-cookie", buildDevSubCookie(effectiveDevSub));
+  }
 
   // Debug markers (remove later if you want)
   responseHeaders.set("x-ragqa-proxy", "1");
@@ -202,7 +392,7 @@ async function handleProxy(
   const contentType = upstreamResponse.headers.get("content-type");
   const jsonish = isJsonLike(contentType);
 
-  if (jsonish) {
+  if (jsonish && upstreamResponse.ok) {
     const textBody = decoder.decode(buf);
 
     // If upstream returns broken JSON, never pass broken JSON to clients.
